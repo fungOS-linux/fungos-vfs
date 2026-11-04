@@ -59,13 +59,24 @@ unibus.content.error.v1
 unibus.content.available.v1
 ```
 
-The actual Unibus client adapter must live outside this public crate until
-Unibus is public/published.
+The Unibus client adapter is `crates/fungos-vfs-unibus`. It sends bounded
+`unibus.content.fetch.v1` frames and reconstructs from correlated
+`unibus.content.data.v1` ranges:
+
+```rust
+use std::sync::Arc;
+use fungos_vfs_unibus::UnibusHydrator;
+use unibus::client::Client;
+
+let client = Arc::new(Client::connect(config)?);
+let source = UnibusHydrator::new(client, Some("content-node".into()));
+let bytes = vfs.get_or_hydrate("big.bin", &source)?;
+```
 
 ## Next
 
 1. File Provider / Cloud Files / FUSE adapters.
-2. Unibus client adapter in the Unibus repository.
+2. Unibus provider/serving loop and end-to-end router test.
 3. Range hydration and sparse files.
 4. Blob provider adapters: local CAS, Kubo, iroh-blobs.
 5. Conflict/version UI.

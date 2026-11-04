@@ -25,6 +25,8 @@ pub enum VfsError {
     Leased { owner: String, expires_at_ms: i64 },
     #[error("node is a pull-through cache; writes are disabled")]
     ReadOnly,
+    #[error("transport error: {0}")]
+    Transport(String),
     #[error("workspace role mismatch: expected {expected}, found {found}")]
     RoleMismatch { expected: NodeRole, found: NodeRole },
     #[error(transparent)]
