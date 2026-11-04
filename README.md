@@ -41,10 +41,31 @@ cargo run -- --root /tmp/cache --role cache hydrate big.bin ./big.bin
 cargo run -- --root /tmp/cache --role cache lease big.bin --owner app --ttl-ms 60000
 ```
 
+## Pull-through hydration
+
+`Hydrator` is the transport seam for cache nodes:
+
+```rust
+vfs.get_or_hydrate("big.bin", &source)?;
+```
+
+The VFS verifies the fetched bytes against the registered `ContentId` before
+marking the file present. The first Unibus L2 wire types are included:
+
+```text
+unibus.content.fetch.v1
+unibus.content.data.v1
+unibus.content.error.v1
+unibus.content.available.v1
+```
+
+The actual Unibus client adapter must live outside this public crate until
+Unibus is public/published.
+
 ## Next
 
 1. File Provider / Cloud Files / FUSE adapters.
-2. Unibus content request/response transport.
+2. Unibus client adapter in the Unibus repository.
 3. Range hydration and sparse files.
 4. Blob provider adapters: local CAS, Kubo, iroh-blobs.
 5. Conflict/version UI.
