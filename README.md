@@ -85,3 +85,5 @@ let bytes = vfs.get_or_hydrate("big.bin", &source)?;
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
+
+Deployment notes for studio and agora-one are in [`docs/deployment.md`](docs/deployment.md).

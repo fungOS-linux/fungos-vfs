@@ -3,6 +3,10 @@
 //! This is an L2 user of Unibus's L1 transport. It sends bounded content fetch
 //! requests and reconstructs the file from correlated data frames.
 
+mod provider;
+
+pub use provider::ContentService;
+
 use std::{
     sync::Arc,
     thread,
@@ -52,13 +56,14 @@ impl UnibusHydrator {
         fetch.validate()?;
         let body = serde_json::to_value(&fetch)
             .map_err(|error| VfsError::Transport(format!("encode content request: {error}")))?;
-        let envelope = self
+        let mut envelope = self
             .client
             .envelope(
                 self.destination.as_deref(),
                 Message::new(CONTENT_FETCH_KIND, body),
             )
             .map_err(|error| VfsError::Transport(format!("build content request: {error:#}")))?;
+        envelope.payload_bytes = 0;
         self.client
             .send(&envelope, &[])
             .map_err(|error| VfsError::Transport(format!("send content request: {error:#}")))?;

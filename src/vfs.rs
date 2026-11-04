@@ -321,6 +321,18 @@ impl Vfs {
             .map_err(VfsError::from)
     }
 
+    pub fn find_by_content(&self, content_id: &ContentId) -> Result<Option<FileEntry>, VfsError> {
+        self.db
+            .query_row(
+                "SELECT path,content_id,size,media_type,version,hydration,pinned,updated_at_ms
+                 FROM files WHERE content_id=?1 LIMIT 1",
+                params![content_id.to_string()],
+                row_to_entry,
+            )
+            .optional()
+            .map_err(VfsError::from)
+    }
+
     pub fn list(&self, prefix: &str) -> Result<Vec<FileEntry>, VfsError> {
         let prefix = if prefix.is_empty() {
             String::new()
