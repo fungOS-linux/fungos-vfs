@@ -1,0 +1,24 @@
+[package]
+name = "fungos-vfs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "GPL-3.0-or-later"
+description = "Local-first content-addressed VFS for fungOS"
+repository = "https://github.com/fungOS-linux/fungos-vfs"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.41", default-features = false, features = ["bundled", "cache"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "fungos-vfs"
+path = "src/main.rs"
