@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/fungos-vfs-unibus"]
+members = [".", "crates/fungos-vfs-unibus", "crates/fungos-vfs-fuse"]
 resolver = "2"
 
 [package]

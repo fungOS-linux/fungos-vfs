@@ -108,9 +108,10 @@ impl ContentService {
                     Vec::new(),
                 ),
             };
-            let reply = client
+            let mut reply = client
                 .envelope(Some(&envelope.producer_id), Message::new(kind, body))
                 .map_err(|error| format!("build content reply: {error:#}"))?;
+            reply.payload_bytes = bytes.len();
             client
                 .send(&reply, &bytes)
                 .map_err(|error| format!("send content reply: {error:#}"))?;

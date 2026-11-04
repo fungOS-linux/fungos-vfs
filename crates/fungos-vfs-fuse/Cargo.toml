@@ -1,0 +1,25 @@
+[package]
+name = "fungos-vfs-fuse"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/fungOS-linux/fungos-vfs"
+
+[features]
+default = []
+fuse = ["dep:fuser"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+fungos-vfs = { path = "../.." }
+fungos-vfs-unibus = { path = "../fungos-vfs-unibus" }
+libc = "0.2"
+serde_json = "1"
+unibus = { git = "https://github.com/fungOS-linux/unibus.git", rev = "89f7e5eda8426c13d6e7d71a433b0d82d2c37392" }
+fuser = { version = "0.18", optional = true }
+
+[[bin]]
+name = "fungos-vfs-fuse"
+path = "src/main.rs"
+required-features = ["fuse"]

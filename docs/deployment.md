@@ -83,3 +83,43 @@ let bytes = vfs.get_or_hydrate("docs/report.pdf", &source)?;
 ```
 
 Leases prevent eviction while an app has a file open.
+
+## Current deployment
+
+As of 2026-11-04:
+
+- **studio** (`100.108.9.93`) runs `dev.fungos.vfs-content` as a launchd job.
+- **agora-one** (`100.80.85.86`) runs `fungos-vfs-content.service` as a systemd
+  user service.
+- Both providers connect through the existing SSH tunnel to the home-pi
+  `unibus-router` on `127.0.0.1:18790`.
+- Central router nodes: `studio-content`, `agora-content`, `studio-cache`,
+  `agora-cache`.
+- Routes: `unibus.content.{fetch,data,error,available}.v1` all use
+  `{"mode":"producer"}`. Clients name the provider explicitly.
+
+Full-node roots:
+
+```text
+studio:   /Users/ajmwagar/fungos-node
+agora:    /home/ajmwagar/fungos-node
+```
+
+Cache roots:
+
+```text
+studio:   /Users/ajmwagar/fungos-cache
+agora:    /home/ajmwagar/fungos-cache
+```
+
+Verified cross-node fetches:
+
+```text
+studio cache <- agora-content   65567 bytes   sha256 83d10e18...
+agora cache  <- studio-content  65567 bytes   sha256 83d10e18...
+agora cache  <- studio-content  16407 bytes   sha256 e9b998e3...
+```
+
+The Agora native mount is `~/fungOS`, served by `fungos-vfs-fuse.service`.
+The Studio native mount is `~/fungOS`, served by `dev.fungos.vfs-fuse`; it
+requires macFUSE to be loaded and approved by macOS.

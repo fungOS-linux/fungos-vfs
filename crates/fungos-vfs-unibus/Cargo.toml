@@ -25,3 +25,7 @@ unibus-iroh = { git = "https://github.com/fungOS-linux/unibus.git", rev = "89f7e
 [[bin]]
 name = "fungos-vfs-provider"
 path = "src/bin/fungos-vfs-provider.rs"
+
+[[bin]]
+name = "fungos-vfs-fetch"
+path = "src/bin/fungos-vfs-fetch.rs"

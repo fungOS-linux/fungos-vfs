@@ -5,9 +5,10 @@
 A workspace is a SQLite namespace plus a content-addressed blob store. The
 filesystem is local and fast; distribution is a separate sync/transport layer.
 
-Status: **first slice.** Local full-node and pull-through cache behavior is
-implemented. Network mounts, File Provider, Cloud Files, FUSE, and Unibus
-transport are not.
+Status: **working slice.** Local full-node and pull-through cache behavior is
+implemented. Unibus ranged fetching and serving work over the TCP hub and
+authenticated Iroh peer sessions. A FUSE adapter exposes the VFS as a native
+filesystem on macOS and Linux.
 
 ## Model
 
@@ -73,14 +74,23 @@ let source = UnibusHydrator::new(client, Some("content-node".into()));
 let bytes = vfs.get_or_hydrate("big.bin", &source)?;
 ```
 
+## Native filesystem
+
+```sh
+cargo build --release -p fungos-vfs-fuse --features fuse
+~/.local/bin/fungos-vfs-fuse --root ~/fungos-node --mount ~/fungOS
+```
+
+See [`docs/native-fs.md`](docs/native-fs.md). macOS uses macFUSE; Linux uses
+FUSE3.
+
 ## Next
 
-1. File Provider / Cloud Files / FUSE adapters.
-2. Unibus provider/serving loop and end-to-end router test.
-3. Range hydration and sparse files.
-4. Blob provider adapters: local CAS, Kubo, iroh-blobs.
-5. Conflict/version UI.
-6. LOD-aware sync policy.
+1. File Provider / Cloud Files adapter for a signed macOS app.
+2. Sparse and page-granular hydration.
+3. Blob provider adapters: local CAS, Kubo, iroh-blobs.
+4. Conflict/version UI.
+5. LOD-aware sync policy.
 
 ## License
 
