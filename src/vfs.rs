@@ -19,6 +19,8 @@ pub enum VfsError {
     NotFound(String),
     #[error("already exists: {0}")]
     AlreadyExists(String),
+    #[error("directory is not empty: {0}")]
+    NotEmpty(String),
     #[error("not hydrated: {0}")]
     NotHydrated(String),
     #[error("version conflict: expected {expected}, current {current}")]
@@ -95,6 +97,8 @@ pub struct Lease {
 pub enum SyncOpKind {
     Upsert,
     Remove,
+    Mkdir,
+    Rmdir,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -177,6 +181,10 @@ impl Vfs {
                hydration TEXT NOT NULL,
                pinned INTEGER NOT NULL,
                updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS directories(
+               path TEXT PRIMARY KEY,
+               created_at_ms INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS versions(
                path TEXT NOT NULL,
@@ -383,6 +391,95 @@ impl Vfs {
         Ok(())
     }
 
+    /// Create an explicit directory. Directories are namespace nodes with no
+    /// content; they exist so empty directories survive a round trip.
+    pub fn mkdir(&mut self, path: &str) -> Result<(), VfsError> {
+        if self.role == NodeRole::Cache {
+            return Err(VfsError::ReadOnly);
+        }
+        let path = normalize_path(path)?;
+        if path.is_empty() || self.file(&path)?.is_some() || self.is_directory(&path)? {
+            return Err(VfsError::AlreadyExists(path));
+        }
+        let parent = path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .unwrap_or("");
+        if !self.is_directory(parent)? {
+            return Err(VfsError::NotFound(parent.to_string()));
+        }
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "INSERT INTO directories(path,created_at_ms) VALUES(?1,?2)",
+            params![path, now_ms()],
+        )?;
+        tx.execute(
+            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms) VALUES('mkdir',?1,1,NULL,?2)",
+            params![path, now_ms()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Remove an empty explicit directory. Implicit directories disappear when
+    /// their last descendant file is removed.
+    pub fn rmdir(&mut self, path: &str) -> Result<(), VfsError> {
+        if self.role == NodeRole::Cache {
+            return Err(VfsError::ReadOnly);
+        }
+        let path = normalize_path(path)?;
+        if path.is_empty() || !self.is_directory(&path)? {
+            return Err(VfsError::NotFound(path));
+        }
+        let exists: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE path LIKE ?1
+              UNION ALL SELECT 1 FROM directories WHERE path LIKE ?1)",
+            params![format!("{path}/%")],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Err(VfsError::NotEmpty(path));
+        }
+        let tx = self.db.transaction()?;
+        tx.execute("DELETE FROM directories WHERE path=?1", params![path])?;
+        tx.execute(
+            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms) VALUES('rmdir',?1,1,NULL,?2)",
+            params![path, now_ms()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn is_directory(&self, path: &str) -> Result<bool, VfsError> {
+        if path.is_empty() {
+            return Ok(true);
+        }
+        let path = normalize_path(path)?;
+        let exists: bool = self.db.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM directories WHERE path=?1
+               UNION ALL SELECT 1 FROM files WHERE path LIKE ?2
+             )",
+            params![path, format!("{path}/%")],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+
+    /// Explicit directory entries. Implicit ancestors of files are not included.
+    pub fn directories(&self, prefix: &str) -> Result<Vec<String>, VfsError> {
+        let prefix = if prefix.is_empty() {
+            String::new()
+        } else {
+            normalize_path(prefix)?
+        };
+        let mut statement = self
+            .db
+            .prepare("SELECT path FROM directories WHERE path LIKE ?1 ORDER BY path")?;
+        let rows = statement.query_map(params![format!("{prefix}%")], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(VfsError::from)
+    }
+
     /// Move one namespace entry and its history. Content is not rewritten:
     /// the ContentId is unchanged and removal/addition are queued for sync.
     pub fn rename(&mut self, from: &str, to: &str) -> Result<FileEntry, VfsError> {
@@ -484,6 +581,8 @@ impl Vfs {
                 kind: match op.as_str() {
                     "upsert" => SyncOpKind::Upsert,
                     "remove" => SyncOpKind::Remove,
+                    "mkdir" => SyncOpKind::Mkdir,
+                    "rmdir" => SyncOpKind::Rmdir,
                     _ => return Err(rusqlite::Error::InvalidQuery),
                 },
                 path: row.get(2)?,
@@ -660,6 +759,25 @@ mod tests {
             cache.get("big.bin"),
             Err(VfsError::NotHydrated(_))
         ));
+    }
+
+    #[test]
+    fn explicit_directories_round_trip() {
+        let (_temp, mut vfs) = workspace();
+        vfs.mkdir("projects").unwrap();
+        vfs.mkdir("projects/soil").unwrap();
+        assert!(vfs.is_directory("projects").unwrap());
+        assert_eq!(
+            vfs.directories("").unwrap(),
+            vec!["projects".to_string(), "projects/soil".to_string()]
+        );
+        assert!(matches!(vfs.rmdir("projects"), Err(VfsError::NotEmpty(_))));
+        vfs.rmdir("projects/soil").unwrap();
+        vfs.rmdir("projects").unwrap();
+        assert!(!vfs.is_directory("projects").unwrap());
+        let ops = vfs.pending(10).unwrap();
+        assert_eq!(ops[0].kind, SyncOpKind::Mkdir);
+        assert_eq!(ops[3].kind, SyncOpKind::Rmdir);
     }
 
     #[test]
