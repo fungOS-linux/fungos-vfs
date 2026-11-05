@@ -267,7 +267,7 @@ fn errno(error: &VfsError) -> Errno {
         VfsError::ReadOnly => Errno::EROFS,
         VfsError::InvalidPath(_) => Errno::EINVAL,
         VfsError::InvalidContentId(_) => Errno::EIO,
-        VfsError::Conflict { .. } => Errno::EEXIST,
+        VfsError::Conflict { .. } | VfsError::AlreadyExists(_) => Errno::EEXIST,
         VfsError::Leased { .. } => Errno::EBUSY,
         VfsError::RoleMismatch { .. } | VfsError::Io(_) | VfsError::Sql(_) => Errno::EIO,
     }

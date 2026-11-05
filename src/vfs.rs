@@ -17,6 +17,8 @@ pub enum VfsError {
     InvalidContentId(String),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("already exists: {0}")]
+    AlreadyExists(String),
     #[error("not hydrated: {0}")]
     NotHydrated(String),
     #[error("version conflict: expected {expected}, current {current}")]
@@ -381,6 +383,48 @@ impl Vfs {
         Ok(())
     }
 
+    /// Move one namespace entry and its history. Content is not rewritten:
+    /// the ContentId is unchanged and removal/addition are queued for sync.
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<FileEntry, VfsError> {
+        if self.role == NodeRole::Cache {
+            return Err(VfsError::ReadOnly);
+        }
+        let from = normalize_path(from)?;
+        let to = normalize_path(to)?;
+        if from == to {
+            return self
+                .file(&from)?
+                .ok_or_else(|| VfsError::NotFound(from.clone()));
+        }
+        let current = self
+            .file(&from)?
+            .ok_or_else(|| VfsError::NotFound(from.clone()))?;
+        if self.file(&to)?.is_some() {
+            return Err(VfsError::AlreadyExists(to));
+        }
+        let now = now_ms();
+        let tx = self.db.transaction()?;
+        tx.execute("UPDATE files SET path=?1 WHERE path=?2", params![to, from])?;
+        tx.execute(
+            "UPDATE versions SET path=?1 WHERE path=?2",
+            params![to, from],
+        )?;
+        tx.execute(
+            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms)
+             VALUES('remove',?1,?2,NULL,?3)",
+            params![from, current.version as i64, now],
+        )?;
+        tx.execute(
+            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms)
+             VALUES('upsert',?1,?2,?3,?4)",
+            params![to, current.version as i64, current.content_id.0, now],
+        )?;
+        tx.commit()?;
+        let mut entry = current;
+        entry.path = to;
+        Ok(entry)
+    }
+
     pub fn set_pinned(&self, path: &str, pinned: bool) -> Result<(), VfsError> {
         let path = normalize_path(path)?;
         self.db.execute(
@@ -550,6 +594,19 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let vfs = Vfs::open(temp.path()).unwrap();
         (temp, vfs)
+    }
+
+    #[test]
+    fn rename_preserves_identity_and_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut vfs = Vfs::open(temp.path()).unwrap();
+        let entry = vfs.put("a.txt", b"same bytes", "text/plain", None).unwrap();
+        let renamed = vfs.rename("a.txt", "b.txt").unwrap();
+        assert_eq!(renamed.path, "b.txt");
+        assert_eq!(renamed.content_id, entry.content_id);
+        assert!(vfs.file("a.txt").unwrap().is_none());
+        assert_eq!(vfs.get("b.txt").unwrap(), b"same bytes");
+        assert_eq!(vfs.history("b.txt").unwrap().len(), 1);
     }
 
     #[test]
