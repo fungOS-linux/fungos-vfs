@@ -268,6 +268,7 @@ fn errno(error: &VfsError) -> Errno {
         VfsError::InvalidPath(_) => Errno::EINVAL,
         VfsError::InvalidContentId(_) => Errno::EIO,
         VfsError::Conflict { .. } | VfsError::AlreadyExists(_) => Errno::EEXIST,
+        VfsError::NotEmpty(_) => Errno::ENOTEMPTY,
         VfsError::Leased { .. } => Errno::EBUSY,
         VfsError::RoleMismatch { .. } | VfsError::Io(_) | VfsError::Sql(_) => Errno::EIO,
     }
