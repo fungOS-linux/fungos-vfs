@@ -7,7 +7,8 @@
 
 use std::{
     collections::HashMap,
-    ffi::OsStr,
+    ffi::{CString, OsStr},
+    os::unix::ffi::OsStrExt,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
@@ -303,14 +304,25 @@ impl Filesystem for FungosFs {
             );
             return;
         }
-        // A path is a directory if anything lives under it. Testing instead
-        // whether a *direct child* is a directory reports leaf-ish directories
-        // (one that holds only files, such as a docs/ folder) as missing, which
-        // surfaces as a confusing ENOENT on `ls docs/` and on reading anything
-        // three levels down.
-        let is_dir = state.dirs.get(&path).copied().unwrap_or(false)
-            || !state.direct_children(&path).is_empty();
-        if is_dir {
+        // A freshly created file has no namespace entry until its first flush,
+        // so consult the write buffer before declaring it missing.
+        if let Some(ino) = state.inodes.get(&path).copied() {
+            if let Some(bytes) = state.pending.get(&ino) {
+                reply.entry(
+                    &ttl(),
+                    &FungosFs::attr(ino, bytes.len() as u64, false),
+                    Generation(0),
+                );
+                return;
+            }
+        }
+        // Directories are namespace entries in their own right, so ask the VFS
+        // rather than inferring from children. Inferring made an empty
+        // directory unresolvable; git needs a .vfskeep placeholder for the same
+        // reason, and here we have real entries instead.
+        if state.dirs.get(&path).copied().unwrap_or(false)
+            || state.vfs.is_directory(&path).unwrap_or(false)
+        {
             let ino = state.ino_for(&path, true);
             reply.entry(&ttl(), &FungosFs::attr(ino, 4096, true), Generation(0));
         } else {
@@ -554,20 +566,18 @@ impl Filesystem for FungosFs {
             return;
         };
         let path = join_path(&parent_path, &name.to_string_lossy());
-        match state.vfs.put(&path, &[], "application/octet-stream", None) {
-            Ok(entry) => {
-                let ino = state.ino_for(&path, false);
-                state.pending.insert(ino, Vec::new());
-                reply.created(
-                    &ttl(),
-                    &FungosFs::attr(ino, entry.size, false),
-                    Generation(0),
-                    FileHandle(0),
-                    FopenFlags::empty(),
-                );
-            }
-            Err(error) => reply.error(errno(&error)),
-        }
+        // Buffer the new file instead of writing an empty version now. `release`
+        // flushes once, so a file that is created and written lands as a single
+        // version instead of an empty v1 followed by the real v2.
+        let ino = state.ino_for(&path, false);
+        state.pending.insert(ino, Vec::new());
+        reply.created(
+            &ttl(),
+            &FungosFs::attr(ino, 0, false),
+            Generation(0),
+            FileHandle(0),
+            FopenFlags::empty(),
+        );
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
@@ -597,7 +607,36 @@ impl Filesystem for FungosFs {
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-        reply.statfs(0, 0, 0, 0, 0, 4096, 255, 0);
+        // The blobs live on the host filesystem under the VFS root, so that
+        // filesystem is the real capacity constraint. Reporting zeros made
+        // `df` and anything that checks free space before writing misbehave.
+        let Ok(state) = self.state.lock() else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        let root = state.vfs.root();
+        let Ok(c_path) = CString::new(root.as_os_str().as_bytes()) else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        // SAFETY: `c_path` is a valid NUL-terminated string and `st` is a
+        // properly sized, zeroed statvfs that libc fills on success.
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
+            reply.error(Errno::EIO);
+            return;
+        }
+        let block = st.f_frsize as u64;
+        reply.statfs(
+            st.f_blocks as u64,
+            st.f_bfree as u64,
+            st.f_bavail as u64,
+            st.f_files as u64,
+            st.f_ffree as u64,
+            block as u32,
+            st.f_namemax as u32,
+            block as u32,
+        );
     }
 }
 
