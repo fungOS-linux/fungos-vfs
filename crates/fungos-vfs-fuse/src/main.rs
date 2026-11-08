@@ -303,8 +303,13 @@ impl Filesystem for FungosFs {
             );
             return;
         }
-        let is_dir = state.direct_children(&path).iter().any(|(_, dir)| *dir)
-            || state.dirs.get(&path).copied().unwrap_or(false);
+        // A path is a directory if anything lives under it. Testing instead
+        // whether a *direct child* is a directory reports leaf-ish directories
+        // (one that holds only files, such as a docs/ folder) as missing, which
+        // surfaces as a confusing ENOENT on `ls docs/` and on reading anything
+        // three levels down.
+        let is_dir = state.dirs.get(&path).copied().unwrap_or(false)
+            || !state.direct_children(&path).is_empty();
         if is_dir {
             let ino = state.ino_for(&path, true);
             reply.entry(&ttl(), &FungosFs::attr(ino, 4096, true), Generation(0));
