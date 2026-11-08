@@ -9,6 +9,7 @@ mod content;
 mod hydrate;
 mod path;
 mod store;
+mod transfer;
 mod vfs;
 
 pub use bus::{
@@ -18,6 +19,7 @@ pub use bus::{
 pub use content::ContentId;
 pub use hydrate::Hydrator;
 pub use path::normalize_path;
+pub use transfer::{ExportReport, IngestReport, SourceMode, export_dir, ingest_dir};
 pub use vfs::{
     FileEntry, Hydration, Lease, LodPolicy, NodeRole, SyncOp, SyncOpKind, Vfs, VfsError,
 };

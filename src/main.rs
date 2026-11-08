@@ -1,7 +1,7 @@
 use std::{fs, path::PathBuf};
 
 use clap::{Parser, Subcommand};
-use fungos_vfs::{ContentId, NodeRole, Vfs};
+use fungos_vfs::{ContentId, NodeRole, SourceMode, Vfs, export_dir, ingest_dir};
 
 #[derive(Parser)]
 #[command(version, about = "Local-first content-addressed VFS for fungOS")]
@@ -103,6 +103,21 @@ enum Command {
     Hydrate {
         path: String,
         file: PathBuf,
+    },
+    /// Copy a directory tree into the namespace under `prefix`.
+    Ingest {
+        source: PathBuf,
+        #[arg(long, default_value = "")]
+        prefix: String,
+        #[arg(long, default_value = "git")]
+        mode: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Materialize everything under `prefix` into a directory.
+    Export {
+        prefix: String,
+        dest: PathBuf,
     },
 }
 
@@ -216,6 +231,20 @@ fn run() -> anyhow::Result<()> {
             let bytes = fs::read(file)?;
             let entry = vfs.hydrate(&path, &bytes)?;
             println!("{}", serde_json::to_string_pretty(&entry)?);
+        }
+        Command::Ingest {
+            source,
+            prefix,
+            mode,
+            dry_run,
+        } => {
+            let mode = SourceMode::parse(&mode)?;
+            let report = ingest_dir(&mut vfs, &source, &prefix, mode, dry_run)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::Export { prefix, dest } => {
+            let report = export_dir(&mut vfs, &prefix, &dest)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
     }
     Ok(())
