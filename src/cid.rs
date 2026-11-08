@@ -59,12 +59,12 @@ fn push_varint(mut value: u64, out: &mut Vec<u8>) {
 }
 
 fn decode_hex(hex: &str) -> Result<Vec<u8>, VfsError> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err(VfsError::InvalidContentId(hex.to_string()));
     }
     let bytes = hex.as_bytes();
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let hi = hex_value(pair[0])?;
         let lo = hex_value(pair[1])?;
         out.push((hi << 4) | lo);

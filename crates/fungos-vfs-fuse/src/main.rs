@@ -409,15 +409,15 @@ impl Filesystem for FungosFs {
         }
         // A freshly created file has no namespace entry until its first flush,
         // so consult the write buffer before declaring it missing.
-        if let Some(ino) = state.inodes.get(&path).copied() {
-            if let Some(bytes) = state.pending.get(&ino) {
-                reply.entry(
-                    &ttl(),
-                    &FungosFs::attr(ino, bytes.len() as u64, false),
-                    generation_for_path(&path),
-                );
-                return;
-            }
+        if let Some(ino) = state.inodes.get(&path).copied()
+            && let Some(bytes) = state.pending.get(&ino)
+        {
+            reply.entry(
+                &ttl(),
+                &FungosFs::attr(ino, bytes.len() as u64, false),
+                generation_for_path(&path),
+            );
+            return;
         }
         // Directories are namespace entries in their own right, so ask the VFS
         // rather than inferring from children. Inferring made an empty
