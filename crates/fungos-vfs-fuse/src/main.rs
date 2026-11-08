@@ -20,13 +20,57 @@ use fungos_vfs::{NodeRole, Vfs, VfsError, normalize_path};
 use fungos_vfs_unibus::UnibusHydrator;
 use fuser::{
     AccessFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, MountOption, OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, SessionACL, TimeOrNow, WriteFlags,
-    mount,
+    INodeNo, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
+    SessionACL, TimeOrNow, WriteFlags, mount,
 };
 use unibus::client::{Client, ClientConfig};
 
+/// The root is the only inode number fixed by convention; every other inode is
+/// derived from its namespace path.
 const ROOT: u64 = 1;
+const FIRST_DERIVED_INO: u64 = 2;
+
+/// 64-bit FNV-1a with a salt, finished with a finalizer.
+///
+/// `DefaultHasher` is documented as unspecified across Rust releases, so it
+/// cannot back an inode number: a toolchain upgrade would renumber the
+/// filesystem. This is a fixed, self-contained hash instead.
+fn hash_path(path: &str, salt: u64) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325 ^ salt;
+    for byte in path.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    hash ^= hash >> 29;
+    hash
+}
+
+/// Inode numbers are a hash of the namespace path, not a runtime counter.
+///
+/// A counter renumbers every inode on each restart. NFS clients — and the kernel
+/// NFS server sitting in front of this mount — cache file handles built from
+/// inode numbers, so after a remount every cached handle resolved to a different
+/// file or to nothing: the client got `ESTALE` until it remounted. Deriving the
+/// inode from the path keeps it stable across restarts, so handles survive a
+/// mount restart and only go stale when the path itself disappears.
+fn inode_for_path(path: &str) -> u64 {
+    const SPAN: u64 = u64::MAX - FIRST_DERIVED_INO;
+    FIRST_DERIVED_INO + hash_path(path, 0) % SPAN
+}
+
+/// The per-path generation reported alongside an inode.
+///
+/// The kernel copies this into `inode->i_generation` and the NFS server mixes it
+/// into file handles, so it must stay constant for as long as a path exists:
+/// deriving it from content version would make every open client handle stale
+/// on the next write. A different salt keeps it independent of the inode number
+/// itself, and it is never zero so it cannot be mistaken for an unset value.
+fn generation_for_path(path: &str) -> Generation {
+    Generation(hash_path(path, 0x9e37_79b9_7f4a_7c15) | 1)
+}
 
 #[derive(Clone, Copy, ValueEnum)]
 enum RoleArg {
@@ -117,33 +161,70 @@ struct State {
     inodes: HashMap<String, u64>,
     paths: HashMap<u64, String>,
     dirs: HashMap<String, bool>,
-    next_ino: u64,
     pending: HashMap<u64, Vec<u8>>,
 }
 
 impl State {
     fn new(vfs: Vfs, hydrator: Option<Arc<UnibusHydrator>>) -> Self {
-        let mut inodes = HashMap::new();
-        let mut paths = HashMap::new();
-        inodes.insert(String::new(), ROOT);
-        paths.insert(ROOT, String::new());
-        Self {
+        let mut state = Self {
             vfs,
             hydrator,
-            inodes,
-            paths,
+            inodes: HashMap::from([(String::new(), ROOT)]),
+            paths: HashMap::from([(ROOT, String::new())]),
             dirs: HashMap::from([(String::new(), true)]),
-            next_ino: ROOT + 1,
             pending: HashMap::new(),
+        };
+        state.seed_namespace();
+        state
+    }
+
+    /// Register every path already in the namespace up front.
+    ///
+    /// Inodes are recomputed identically after a restart, but the reverse map
+    /// (inode -> path, used by `getattr`, `open`, `readdir` and friends) cannot
+    /// be inverted out of a hash. Seeding it means a client that arrives with a
+    /// pre-restart file handle resolves to the same path without an intervening
+    /// lookup.
+    fn seed_namespace(&mut self) {
+        for entry in self.vfs.list("").unwrap_or_default() {
+            self.seed_path(&entry.path, false);
+        }
+        for directory in self.vfs.directories("").unwrap_or_default() {
+            self.seed_path(&directory, true);
+        }
+    }
+
+    fn seed_path(&mut self, path: &str, is_dir: bool) {
+        let segments: Vec<&str> = path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        let mut current = String::new();
+        for (index, segment) in segments.iter().enumerate() {
+            current = join_path(&current, segment);
+            let last = index + 1 == segments.len();
+            self.ino_for(&current, is_dir || !last);
         }
     }
 
     fn ino_for(&mut self, path: &str, is_dir: bool) -> u64 {
-        if let Some(ino) = self.inodes.get(path) {
-            return *ino;
+        if let Some(ino) = self.inodes.get(path).copied() {
+            if is_dir {
+                self.dirs.entry(path.to_string()).or_insert(true);
+            }
+            return ino;
         }
-        let ino = self.next_ino;
-        self.next_ino += 1;
+        let mut ino = inode_for_path(path);
+        // A collision would alias two paths onto one inode, so probe forward.
+        // Deterministic for a given set of paths, and effectively never taken.
+        while self
+            .paths
+            .get(&ino)
+            .is_some_and(|existing| existing != path)
+        {
+            const SPAN: u64 = u64::MAX - FIRST_DERIVED_INO;
+            ino = FIRST_DERIVED_INO + (ino - FIRST_DERIVED_INO + 1) % SPAN;
+        }
         self.inodes.insert(path.to_string(), ino);
         self.paths.insert(ino, path.to_string());
         self.dirs.insert(path.to_string(), is_dir);
@@ -160,6 +241,28 @@ impl State {
             .and_then(|path| self.dirs.get(path))
             .copied()
             .unwrap_or(false)
+    }
+
+    /// Forget a path and everything under it.
+    ///
+    /// Inodes are derived from the path, so a path that no longer exists must
+    /// stop resolving: after an unlink or rename the old inode would otherwise
+    /// keep answering `getattr` for content the namespace no longer has.
+    fn forget(&mut self, path: &str) {
+        let prefix = format!("{path}/");
+        let stale: Vec<String> = self
+            .inodes
+            .keys()
+            .filter(|candidate| candidate.as_str() == path || candidate.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for candidate in stale {
+            if let Some(ino) = self.inodes.remove(&candidate) {
+                self.paths.remove(&ino);
+                self.pending.remove(&ino);
+            }
+            self.dirs.remove(&candidate);
+        }
     }
 
     fn entry(&self, path: &str) -> Option<fungos_vfs::FileEntry> {
@@ -300,7 +403,7 @@ impl Filesystem for FungosFs {
             reply.entry(
                 &ttl(),
                 &FungosFs::attr(ino, entry.size, false),
-                Generation(0),
+                generation_for_path(&path),
             );
             return;
         }
@@ -311,7 +414,7 @@ impl Filesystem for FungosFs {
                 reply.entry(
                     &ttl(),
                     &FungosFs::attr(ino, bytes.len() as u64, false),
-                    Generation(0),
+                    generation_for_path(&path),
                 );
                 return;
             }
@@ -324,7 +427,11 @@ impl Filesystem for FungosFs {
             || state.vfs.is_directory(&path).unwrap_or(false)
         {
             let ino = state.ino_for(&path, true);
-            reply.entry(&ttl(), &FungosFs::attr(ino, 4096, true), Generation(0));
+            reply.entry(
+                &ttl(),
+                &FungosFs::attr(ino, 4096, true),
+                generation_for_path(&path),
+            );
         } else {
             reply.error(Errno::ENOENT);
         }
@@ -574,7 +681,7 @@ impl Filesystem for FungosFs {
         reply.created(
             &ttl(),
             &FungosFs::attr(ino, 0, false),
-            Generation(0),
+            generation_for_path(&path),
             FileHandle(0),
             FopenFlags::empty(),
         );
@@ -590,12 +697,176 @@ impl Filesystem for FungosFs {
             return;
         };
         let path = join_path(&parent_path, &name.to_string_lossy());
-        match state.vfs.remove(&path) {
+        // A file that exists only in the write buffer — created but not yet
+        // released — has no namespace entry to remove; dropping the buffer is the
+        // whole deletion. Falling through to `remove` reported ENOENT for a file
+        // the caller had just created and could read.
+        let removed = match state.entry(&path) {
+            Some(_) => state.vfs.remove(&path),
+            None => Ok(()),
+        };
+        match removed {
             Ok(()) => {
-                if let Some(ino) = state.inodes.remove(&path) {
-                    state.paths.remove(&ino);
-                    state.pending.remove(&ino);
-                }
+                state.forget(&path);
+                reply.ok();
+            }
+            Err(error) => reply.error(errno(&error)),
+        }
+    }
+
+    fn mkdir(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let Ok(mut state) = self.state.lock() else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        let Some(parent_path) = state.path_for(parent.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let path = join_path(&parent_path, &name.to_string_lossy());
+        match state.vfs.mkdir(&path) {
+            Ok(()) => {
+                let ino = state.ino_for(&path, true);
+                reply.entry(
+                    &ttl(),
+                    &FungosFs::attr(ino, 4096, true),
+                    generation_for_path(&path),
+                );
+            }
+            Err(error) => reply.error(errno(&error)),
+        }
+    }
+
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let Ok(mut state) = self.state.lock() else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        let Some(parent_path) = state.path_for(parent.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let path = join_path(&parent_path, &name.to_string_lossy());
+        match state.vfs.rmdir(&path) {
+            Ok(()) => {
+                state.forget(&path);
+                reply.ok();
+            }
+            Err(error) => reply.error(errno(&error)),
+        }
+    }
+
+    /// `mknod` is what the kernel uses when a filesystem is asked to create a
+    /// file *without* opening it — which is exactly how the kernel NFS server
+    /// creates files (`vfs_create`). Only a local `open(O_CREAT)` takes the
+    /// atomic `create` path. Without this handler every `touch` through the
+    /// export failed with EIO, because `ENOSYS` here reaches the client as a
+    /// generic I/O error.
+    fn mknod(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        let Ok(mut state) = self.state.lock() else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        let Some(parent_path) = state.path_for(parent.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let path = join_path(&parent_path, &name.to_string_lossy());
+        if state.entry(&path).is_some() || state.vfs.is_directory(&path).unwrap_or(false) {
+            reply.error(Errno::EEXIST);
+            return;
+        }
+        // Commit an empty version here rather than buffering like `create` does.
+        // `create` is always followed by an open, so `release` flushes the
+        // buffer; `mknod` is a create with no open — which is how the kernel NFS
+        // server creates files — so a buffered file would never be flushed and
+        // would stay invisible in `readdir` while `lookup` still answered for it.
+        // A write that follows lands as the next version.
+        match state.vfs.put(&path, &[], "application/octet-stream", None) {
+            Ok(_) => {}
+            Err(error) => {
+                reply.error(errno(&error));
+                return;
+            }
+        }
+        let ino = state.ino_for(&path, false);
+        reply.entry(
+            &ttl(),
+            &FungosFs::attr(ino, 0, false),
+            generation_for_path(&path),
+        );
+    }
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        _flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        let Ok(mut state) = self.state.lock() else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        let (Some(parent_path), Some(new_parent_path)) =
+            (state.path_for(parent.0), state.path_for(newparent.0))
+        else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let from = join_path(&parent_path, &name.to_string_lossy());
+        let to = join_path(&new_parent_path, &newname.to_string_lossy());
+        // `Vfs::rename` moves one namespace entry, so directories are not
+        // renamable yet; say so instead of failing as if the source vanished.
+        if state.vfs.is_directory(&from).unwrap_or(false) {
+            reply.error(Errno::EOPNOTSUPP);
+            return;
+        }
+        if state.entry(&from).is_none() {
+            // The file exists only as a write buffer (created and not yet
+            // released). Commit it at the new path so a rename cannot leave a
+            // buffer that has no namespace entry left to flush it.
+            let buffered = state
+                .inodes
+                .get(&from)
+                .copied()
+                .and_then(|ino| state.pending.remove(&ino));
+            match buffered {
+                Some(bytes) => match state.vfs.put(&to, &bytes, "application/octet-stream", None) {
+                    Ok(_) => {
+                        state.ino_for(&to, false);
+                        state.forget(&from);
+                        reply.ok();
+                    }
+                    Err(error) => reply.error(errno(&error)),
+                },
+                None => reply.error(Errno::ENOENT),
+            }
+            return;
+        }
+        match state.vfs.rename(&from, &to) {
+            Ok(_) => {
+                state.forget(&from);
                 reply.ok();
             }
             Err(error) => reply.error(errno(&error)),
@@ -660,5 +931,19 @@ mod tests {
     fn joins_root_and_nested_paths() {
         assert_eq!(join_path("", "a"), "a");
         assert_eq!(join_path("docs", "a.txt"), "docs/a.txt");
+    }
+
+    #[test]
+    fn inodes_are_derived_from_the_path() {
+        // Same path, same inode, in any process: this is what stops NFS file
+        // handles from going stale across a remount.
+        assert_eq!(inode_for_path("docs/a.txt"), inode_for_path("docs/a.txt"));
+        assert_ne!(inode_for_path("docs/a.txt"), inode_for_path("docs/b.txt"));
+        // Reserved numbers stay reserved.
+        for path in ["", "a", "b", "docs/a.txt", "ä"] {
+            let ino = inode_for_path(path);
+            assert!(ino > ROOT, "{path} mapped to {ino}");
+        }
+        assert_eq!(generation_for_path("docs/a.txt").0 % 2, 1);
     }
 }

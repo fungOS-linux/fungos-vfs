@@ -123,3 +123,8 @@ agora cache  <- studio-content  16407 bytes   sha256 e9b998e3...
 The Agora native mount is `~/fungOS`, served by `fungos-vfs-fuse.service`.
 The Studio native mount is `~/fungOS`, served by `dev.fungos.vfs-fuse`; it
 requires macFUSE to be loaded and approved by macOS.
+
+Agora also exports its three Desktop mounts to macOS over NFS (no Mac-side
+install): `/srv/fungos-export/{personal,fpl,puget-audio}`, kept bound to the live
+FUSE mounts by `fungos-nfs-export.service`. See
+[`deploy/agora-one/`](../deploy/agora-one/README.md).
