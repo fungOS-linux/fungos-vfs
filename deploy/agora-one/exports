@@ -1,0 +1,14 @@
+# fungOS VFS desktops, served from bind mounts of the Desktop FUSE mounts
+# (kept in place by fungos-nfs-export.service).
+#
+# fsid= is mandatory here: a FUSE mount has no stable st_dev across remounts, so
+# knfsd cannot derive a filesystem id for it. Without an explicit fsid the export
+# is rejected, and clients get ESTALE/EXDEV across a remount.
+#
+# all_squash + anonuid collapses every client identity onto ajmwagar (1000), who
+# owns the FUSE mount; with allow_other that is the only identity the FUSE
+# filesystem will serve with write access.
+/srv/fungos-export/personal     *(rw,sync,no_subtree_check,fsid=101,all_squash,anonuid=1000,anongid=1000)
+/srv/fungos-export/fpl          *(rw,sync,no_subtree_check,fsid=102,all_squash,anonuid=1000,anongid=1000)
+/srv/fungos-export/puget-audio  *(rw,sync,no_subtree_check,fsid=103,all_squash,anonuid=1000,anongid=1000)
+/srv/fungos-export              *(ro,sync,no_subtree_check,fsid=0,crossmnt,all_squash,anonuid=1000,anongid=1000)

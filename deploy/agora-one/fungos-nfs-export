@@ -1,0 +1,89 @@
+#!/bin/sh
+# Keep the fungOS NFS export pointed at the *live* FUSE mounts.
+#
+# A bind mount pins the mount it was created from. When a fungos-vfs-fuse unit
+# restarts, the bind mount under /srv/fungos-export keeps pointing at the old,
+# detached FUSE superblock, and every NFS request on it fails with EIO even
+# though the new mount is healthy. Rebinding is what makes a FUSE restart
+# invisible to clients, whose file handles stay valid because the adapter
+# derives inodes from the path.
+#
+# Health is probed rather than compared: mount ids and anonymous FUSE device
+# numbers are both recycled, so they can match across a restart. A bind mount of
+# a live FUSE mount reports the same device as its source and answers `stat`; a
+# dead one answers ENOTCONN.
+#
+# Run by fungos-nfs-export.service as root.
+
+set -u
+
+export_root=/srv/fungos-export
+home=/home/ajmwagar
+desktops="personal fpl puget-audio"
+interval=5
+
+# Device number of a path, or empty (non-zero exit) if it does not answer.
+probe() {
+	timeout 10 stat -c %d "$1" 2>/dev/null
+}
+
+healthy() {
+	local src dst
+	src=$(probe "$1") || return 1
+	dst=$(probe "$2") || return 1
+	[ -n "$src" ] && [ "$src" = "$dst" ]
+}
+
+# Number of mounts stacked on a path. `mountpoint` cannot see the ones buried
+# under a dead mount (stat fails, so it reports "not a mountpoint"), and binding
+# over them quietly adds a layer per FUSE restart.
+layer_count() {
+	awk -v target="$1" '$5 == target' /proc/self/mountinfo | wc -l
+}
+
+rebind() {
+	local src=$1 dst=$2 layers
+	# Un-export first: knfsd holds a reference to the old mount, and an eager
+	# umount would block until it lets go.
+	exportfs -u "$dst" >/dev/null 2>&1 || true
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		[ "$(layer_count "$dst")" -eq 0 ] && break
+		umount "$dst" 2>/dev/null || umount -l "$dst" 2>/dev/null || break
+	done
+	layers=$(layer_count "$dst")
+	if [ "$layers" -ne 0 ]; then
+		# Refuse to stack. Retry on the next tick rather than bury a layer that
+		# may still be the one knfsd has exported.
+		return 1
+	fi
+	mount --bind "$src" "$dst"
+}
+
+reconcile() {
+	local desktop src dst changed=0
+	for desktop in $desktops; do
+		src="$home/Desktop/$desktop"
+		dst="$export_root/$desktop"
+		if [ -z "$(probe "$src")" ]; then
+			echo "$desktop: waiting for $src to be mounted" >&2
+			continue
+		fi
+		if healthy "$src" "$dst"; then
+			continue
+		fi
+		if rebind "$src" "$dst"; then
+			echo "$desktop: bound $src"
+			changed=1
+		else
+			echo "$desktop: bind of $src failed" >&2
+		fi
+	done
+	if [ "$changed" = 1 ]; then
+		exportfs -ra
+	fi
+}
+
+while :; do
+	reconcile
+	sleep "$interval"
+done

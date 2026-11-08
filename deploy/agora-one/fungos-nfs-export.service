@@ -1,0 +1,17 @@
+[Unit]
+Description=fungOS VFS NFS export (binds Desktop FUSE mounts under /srv/fungos-export)
+Documentation=https://github.com/fungOS-linux/fungos-vfs/blob/main/deploy/agora-one/README.md
+After=network-online.target nfs-server.service
+Wants=network-online.target nfs-server.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/fungos-nfs-export
+Restart=always
+RestartSec=5
+# The FUSE mounts belong to a systemd *user* manager, so this unit cannot order
+# itself after them; the script waits for each mount and re-binds when a mount id
+# changes instead.
+
+[Install]
+WantedBy=multi-user.target
