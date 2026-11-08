@@ -6,8 +6,7 @@
 //! files Git tracks plus untracked files Git does not ignore.
 
 use std::{
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -80,10 +79,13 @@ pub fn ingest_dir(
             Ok(files) => files,
             // Not a repository, or git is unavailable: a plain walk is the
             // honest fallback rather than refusing to import anything.
-            Err(_) => walk_files(source)
-                .with_context(|| format!("walking {}", source.display()))?,
+            Err(_) => {
+                walk_files(source).with_context(|| format!("walking {}", source.display()))?
+            }
         },
-        SourceMode::All => walk_files(source).with_context(|| format!("walking {}", source.display()))?,
+        SourceMode::All => {
+            walk_files(source).with_context(|| format!("walking {}", source.display()))?
+        }
     };
     files.sort();
 
@@ -93,13 +95,16 @@ pub fn ingest_dir(
         } else {
             format!("{prefix}/{rel}")
         };
-        let virtual_path = normalize_path(&virtual_path)
-            .with_context(|| format!("normalizing {virtual_path}"))?;
+        let virtual_path =
+            normalize_path(&virtual_path).with_context(|| format!("normalizing {virtual_path}"))?;
 
         let absolute = source.join(&rel);
         // A symlink is not content: following it would import bytes from
         // outside the tree and make the result depend on this machine.
-        if fs::symlink_metadata(&absolute).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+        if fs::symlink_metadata(&absolute)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
             report.skipped += 1;
             continue;
         }
@@ -161,8 +166,7 @@ pub fn export_dir(vfs: &mut Vfs, prefix: &str, dest: &Path) -> Result<ExportRepo
         let bytes = vfs.get(&entry.path)?;
         let out = dest.join(&rel);
         if let Some(parent) = out.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
         fs::write(&out, &bytes).with_context(|| format!("writing {}", out.display()))?;
         report.written += 1;
@@ -205,8 +209,8 @@ fn walk_files(dir: &Path) -> Result<Vec<String>> {
     let mut files = Vec::new();
     let mut stack: Vec<PathBuf> = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
-        for entry in fs::read_dir(&current)
-            .with_context(|| format!("reading {}", current.display()))?
+        for entry in
+            fs::read_dir(&current).with_context(|| format!("reading {}", current.display()))?
         {
             let entry = entry?;
             let file_type = entry.file_type()?;
@@ -235,7 +239,8 @@ fn walk_files(dir: &Path) -> Result<Vec<String>> {
 
 /// Media types are a display hint here, not an authority: the VFS keys on the
 /// content id. Unknown extensions stay opaque rather than guessing.
-fn media_type_for(path: &str) -> &'static str {    let ext = path.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
+fn media_type_for(path: &str) -> &'static str {
+    let ext = path.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
     match ext.to_ascii_lowercase().as_str() {
         "md" | "markdown" => "text/markdown",
         "txt" | "log" => "text/plain",
@@ -310,10 +315,7 @@ mod tests {
         let dest = base.join("out");
         let report = export_dir(&mut vfs, "projects/x", &dest).unwrap();
         assert_eq!(report.written, 3);
-        assert_eq!(
-            fs::read(dest.join("docs/a.txt")).unwrap(),
-            b"hello cid\n"
-        );
+        assert_eq!(fs::read(dest.join("docs/a.txt")).unwrap(), b"hello cid\n");
         assert_eq!(fs::read(dest.join("top.txt")).unwrap(), b"top changed\n");
         assert!(dest.join("docs/nested/b.md").is_file());
     }
@@ -324,8 +326,10 @@ mod tests {
         let mut vfs = Vfs::open(base.join("vfs")).unwrap();
         vfs.register_placeholder(
             "projects/p/big.bin",
-            ContentId::parse("blake3:0000000000000000000000000000000000000000000000000000000000000000")
-                .unwrap(),
+            ContentId::parse(
+                "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap(),
             4096,
             "application/octet-stream",
         )
