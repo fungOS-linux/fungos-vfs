@@ -63,6 +63,12 @@ enum Command {
     Rm {
         path: String,
     },
+    Mkdir {
+        path: String,
+    },
+    Rmdir {
+        path: String,
+    },
     Pin {
         path: String,
     },
@@ -193,6 +199,13 @@ fn run() -> anyhow::Result<()> {
         }
         Command::Rm { path } => {
             vfs.remove(&path)?;
+        }
+        Command::Mkdir { path } => {
+            vfs.mkdir(&path)?;
+            println!("{path}");
+        }
+        Command::Rmdir { path } => {
+            vfs.rmdir(&path)?;
         }
         Command::Pin { path } => vfs.set_pinned(&path, true)?,
         Command::Unpin { path } => vfs.set_pinned(&path, false)?,
