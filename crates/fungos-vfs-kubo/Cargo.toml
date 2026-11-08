@@ -1,0 +1,17 @@
+[package]
+name = "fungos-vfs-kubo"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "GPL-3.0-or-later"
+description = "Kubo/IPFS content provider for fungOS VFS"
+
+[dependencies]
+fungos-vfs = { path = "../.." }
+serde_json = "1"
+reqwest = { version = "0.13", default-features = false, features = [
+    "blocking",
+    "multipart",
+    "query",
+    "rustls",
+] }

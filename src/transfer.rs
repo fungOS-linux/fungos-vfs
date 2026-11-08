@@ -6,15 +6,16 @@
 //! files Git tracks plus untracked files Git does not ignore.
 
 use std::{
+    collections::HashSet,
     fs, io,
     path::{Path, PathBuf},
     process::Command,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use crate::{ContentId, Hydration, Vfs, normalize_path};
+use crate::{ContentId, Hydration, PathClass, PathPolicy, Vfs, normalize_path};
 
 /// How to decide which files under a directory belong to the tree.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -44,7 +45,22 @@ pub struct IngestReport {
     pub changed: usize,
     pub unchanged: usize,
     pub skipped: usize,
+    pub excluded: usize,
+    /// Paths covered by a Git tree id instead of being copied.
+    pub git_skipped: usize,
+    /// Present when the source is a Git repository and the policy asked for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitPointer>,
     pub bytes_written: u64,
+}
+
+/// The Git identity that stands in for a whole tree of files.
+#[derive(Clone, Debug, Serialize)]
+pub struct GitPointer {
+    pub commit: String,
+    pub tree: String,
+    /// A dirty checkout's tree id does not describe the files on disk.
+    pub dirty: bool,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -68,6 +84,31 @@ pub fn ingest_dir(
     mode: SourceMode,
     dry_run: bool,
 ) -> Result<IngestReport> {
+    ingest_dir_with_policy(
+        vfs,
+        source,
+        prefix,
+        mode,
+        dry_run,
+        &PathPolicy::store_everything(),
+    )
+}
+
+/// Ingest, classifying each path before deciding how to store it.
+///
+/// The payoff is the Git class: a clean checkout is represented by one
+/// `(commit, tree)` pointer rather than one blob per file, because Git's tree
+/// object already names every file by content hash. Copying them again
+/// duplicates work Git has done and is what makes a 97k-file checkout cost 97k
+/// transactions.
+pub fn ingest_dir_with_policy(
+    vfs: &mut Vfs,
+    source: &Path,
+    prefix: &str,
+    mode: SourceMode,
+    dry_run: bool,
+    policy: &PathPolicy,
+) -> Result<IngestReport> {
     let prefix = prefix.trim_matches('/');
     let mut report = IngestReport {
         prefix: prefix.to_string(),
@@ -89,6 +130,24 @@ pub fn ingest_dir(
     };
     files.sort();
 
+    // A Git-class path is recorded by its tree id rather than copied. That only
+    // holds for a clean checkout: an uncommitted change makes the tree id
+    // describe something the files no longer match, so a dirty checkout must
+    // fall back to storing blobs.
+    if policy.has_git_rules() {
+        report.git = git_pointer(source);
+    }
+    let trust_git_tree = matches!(&report.git, Some(pointer) if !pointer.dirty);
+
+    // An explicit `cid:` rule on a path Git already tracks means two stores own
+    // the same bytes. Accepting that silently hides a divergence that only
+    // shows up later as a stale read, so it is an error naming the path.
+    let tracked: HashSet<String> = if policy.has_blob_rules() {
+        git_tracked_files(source).unwrap_or_default()
+    } else {
+        HashSet::new()
+    };
+
     for rel in files {
         let virtual_path = if prefix.is_empty() {
             rel.clone()
@@ -97,6 +156,25 @@ pub fn ingest_dir(
         };
         let virtual_path =
             normalize_path(&virtual_path).with_context(|| format!("normalizing {virtual_path}"))?;
+
+        if matches!(policy.explicit_class(&rel), Some(PathClass::Blob)) && tracked.contains(&rel) {
+            bail!(
+                "{rel} is classified `cid:` but Git already tracks it; \
+                 remove the rule or let Git own the path"
+            );
+        }
+
+        match policy.classify(&rel) {
+            PathClass::Exclude => {
+                report.excluded += 1;
+                continue;
+            }
+            PathClass::Git if trust_git_tree => {
+                report.git_skipped += 1;
+                continue;
+            }
+            _ => {}
+        }
 
         let absolute = source.join(&rel);
         // A symlink is not content: following it would import bytes from
@@ -189,10 +267,22 @@ fn strip_prefix(path: &str, prefix: &str) -> String {
 /// includes tracked files even when a later ignore rule matches them — the same
 /// set Delta imports.
 fn git_files(dir: &Path) -> io::Result<Vec<String>> {
+    git_ls_files(dir, &["-c", "-o", "--exclude-standard"])
+}
+
+/// Tracked paths only. The conflict check needs this narrower set: an
+/// *untracked* path is exactly the case where a `cid:` rule is correct.
+fn git_tracked_files(dir: &Path) -> io::Result<HashSet<String>> {
+    Ok(git_ls_files(dir, &["-c"])?.into_iter().collect())
+}
+
+fn git_ls_files(dir: &Path, selectors: &[&str]) -> io::Result<Vec<String>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(dir)
-        .args(["ls-files", "-z", "-c", "-o", "--exclude-standard"])
+        .arg("ls-files")
+        .arg("-z")
+        .args(selectors)
         .output()?;
     if !output.status.success() {
         return Err(io::Error::other("git ls-files failed"));
@@ -203,6 +293,43 @@ fn git_files(dir: &Path) -> io::Result<Vec<String>> {
         .filter(|chunk| !chunk.is_empty())
         .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
         .collect())
+}
+
+/// The `(commit, tree)` identity that stands in for a whole clean checkout.
+///
+/// `tree` names every file in the commit by content hash, so recording it is
+/// equivalent to recording each file, without the per-file work. `dirty`
+/// reports whether the working tree still matches that commit: when it does
+/// not, the tree id describes something other than the files on disk.
+fn git_pointer(dir: &Path) -> Option<GitPointer> {
+    let rev_parse = |spec: &str| -> Option<String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", spec])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+
+    let commit = rev_parse("HEAD")?;
+    let tree = rev_parse("HEAD^{tree}")?;
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .output()
+        .ok()?;
+    Some(GitPointer {
+        commit,
+        tree,
+        // A failed status check must not be read as "clean": that would let a
+        // dirty checkout be recorded as the commit tree.
+        dirty: !status.status.success() || !status.stdout.is_empty(),
+    })
 }
 
 fn walk_files(dir: &Path) -> Result<Vec<String>> {
@@ -340,6 +467,119 @@ mod tests {
         assert_eq!(report.written, 0);
         assert_eq!(report.skipped_placeholders, 1);
         assert!(!dest.join("big.bin").exists());
+    }
+
+    #[test]
+    fn policy_routes_excluded_paths_away_from_the_namespace() {
+        let base = scratch("policy-exclude");
+        let source = base.join("source");
+        write(&source.join("src/main.rs"), "fn main() {}\n");
+        write(&source.join("target/debug/blob.o"), "junk\n");
+        write(&source.join("node_modules/dep/index.js"), "module\n");
+        write(&source.join("huge.iso"), "bytes\n");
+
+        let policy = PathPolicy::parse("target/\nnode_modules/\nexclude: *.iso\n");
+        let mut vfs = Vfs::open(base.join("vfs")).unwrap();
+        let report =
+            ingest_dir_with_policy(&mut vfs, &source, "p", SourceMode::All, false, &policy)
+                .unwrap();
+
+        assert_eq!(report.added, 1);
+        assert_eq!(report.excluded, 3);
+        assert!(vfs.file("p/src/main.rs").unwrap().is_some());
+        assert!(vfs.file("p/target/debug/blob.o").unwrap().is_none());
+        assert!(vfs.file("p/huge.iso").unwrap().is_none());
+    }
+
+    #[test]
+    fn git_class_paths_cost_one_tree_pointer_instead_of_blobs() {
+        let base = scratch("policy-git");
+        let source = base.join("source");
+        write(&source.join("src/a.rs"), "fn a() {}\n");
+        write(&source.join("src/b.rs"), "fn b() {}\n");
+        commit_all(&source);
+
+        // Every source file belongs to the commit's tree, so the whole checkout
+        // costs one pointer and zero blobs.
+        let policy = PathPolicy::parse("git: **/*.rs\n");
+        let mut vfs = Vfs::open(base.join("vfs")).unwrap();
+        let report =
+            ingest_dir_with_policy(&mut vfs, &source, "p", SourceMode::Git, false, &policy)
+                .unwrap();
+
+        assert_eq!(report.git_skipped, 2);
+        assert_eq!(report.added, 0);
+        let pointer = report.git.expect("a git-class policy must record the tree");
+        assert!(!pointer.dirty);
+        assert_eq!(pointer.commit.len(), 40);
+        assert_eq!(pointer.tree.len(), 40);
+    }
+
+    #[test]
+    fn a_dirty_checkout_stores_blobs_because_the_tree_id_would_be_a_lie() {
+        let base = scratch("policy-dirty");
+        let source = base.join("source");
+        write(&source.join("src/a.rs"), "fn a() {}\n");
+        commit_all(&source);
+        // Uncommitted edit: HEAD's tree describes the old bytes, not these.
+        write(&source.join("src/a.rs"), "fn a() { /* changed */ }\n");
+
+        let policy = PathPolicy::parse("git: **/*.rs\n");
+        let mut vfs = Vfs::open(base.join("vfs")).unwrap();
+        let report =
+            ingest_dir_with_policy(&mut vfs, &source, "p", SourceMode::Git, false, &policy)
+                .unwrap();
+
+        assert!(report.git.expect("pointer is still reported").dirty);
+        assert_eq!(report.git_skipped, 0);
+        assert_eq!(report.added, 1);
+        assert_eq!(
+            vfs.get("p/src/a.rs").unwrap(),
+            b"fn a() { /* changed */ }\n"
+        );
+    }
+
+    fn commit_all(source: &Path) {
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "-A"],
+            vec![
+                "-c",
+                "user.email=vfs@example.test",
+                "-c",
+                "user.name=vfs",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(source)
+                    .args(&args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_cid_rule_on_a_git_tracked_path_is_an_error() {
+        let base = scratch("policy-conflict");
+        let source = base.join("source");
+        write(&source.join("notes.md"), "# notes\n");
+        write(&source.join("diagram.png"), "png\n");
+        commit_all(&source);
+
+        // `notes.md` is tracked and also demanded as a blob: two stores would own
+        // the same bytes, so ingestion refuses rather than diverging later.
+        let policy = PathPolicy::parse("cid: *.md\n");
+        let mut vfs = Vfs::open(base.join("vfs")).unwrap();
+        let error = ingest_dir_with_policy(&mut vfs, &source, "p", SourceMode::Git, false, &policy)
+            .unwrap_err();
+        assert!(format!("{error}").contains("notes.md"), "{error}");
     }
 
     #[cfg(unix)]

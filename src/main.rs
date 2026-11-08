@@ -1,7 +1,9 @@
 use std::{fs, path::PathBuf};
 
 use clap::{Parser, Subcommand};
-use fungos_vfs::{ContentId, NodeRole, SourceMode, Vfs, export_dir, ingest_dir};
+use fungos_vfs::{
+    ContentId, NodeRole, PathPolicy, SourceMode, Vfs, export_dir, ingest_dir_with_policy,
+};
 
 #[derive(Parser)]
 #[command(version, about = "Local-first content-addressed VFS for fungOS")]
@@ -119,6 +121,12 @@ enum Command {
         mode: String,
         #[arg(long)]
         dry_run: bool,
+        /// A policy file to use instead of `<source>/.vfsignore`.
+        #[arg(long)]
+        policy: Option<PathBuf>,
+        /// Ingest every path as a blob, ignoring any policy.
+        #[arg(long)]
+        no_policy: bool,
     },
     /// Materialize everything under `prefix` into a directory.
     Export {
@@ -250,9 +258,20 @@ fn run() -> anyhow::Result<()> {
             prefix,
             mode,
             dry_run,
+            policy,
+            no_policy,
         } => {
             let mode = SourceMode::parse(&mode)?;
-            let report = ingest_dir(&mut vfs, &source, &prefix, mode, dry_run)?;
+            let policy = if no_policy {
+                PathPolicy::store_everything()
+            } else {
+                match policy {
+                    Some(path) => PathPolicy::parse(&fs::read_to_string(&path)?),
+                    None => PathPolicy::load(&source)?,
+                }
+            };
+            let report =
+                ingest_dir_with_policy(&mut vfs, &source, &prefix, mode, dry_run, &policy)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Export { prefix, dest } => {
