@@ -5,10 +5,16 @@
 # knfsd cannot derive a filesystem id for it. Without an explicit fsid the export
 # is rejected, and clients get ESTALE/EXDEV across a remount.
 #
+# The client list is the owner's Studio by tailnet address, not `*`. These are
+# rw mounts of private Desktop content on a host with no packet filter, so a
+# wildcard export would let anything that can reach port 2049 rename and delete
+# real files. Mount by tailnet address, not by LAN name: the tailnet source
+# address is what matches here.
+#
 # all_squash + anonuid collapses every client identity onto ajmwagar (1000), who
 # owns the FUSE mount; with allow_other that is the only identity the FUSE
 # filesystem will serve with write access.
-/srv/fungos-export/personal     *(rw,sync,no_subtree_check,fsid=101,all_squash,anonuid=1000,anongid=1000)
-/srv/fungos-export/fpl          *(rw,sync,no_subtree_check,fsid=102,all_squash,anonuid=1000,anongid=1000)
-/srv/fungos-export/puget-audio  *(rw,sync,no_subtree_check,fsid=103,all_squash,anonuid=1000,anongid=1000)
-/srv/fungos-export              *(ro,sync,no_subtree_check,fsid=0,crossmnt,all_squash,anonuid=1000,anongid=1000)
+/srv/fungos-export/personal     100.108.9.93(rw,sync,no_subtree_check,fsid=101,all_squash,anonuid=1000,anongid=1000)
+/srv/fungos-export/fpl          100.108.9.93(rw,sync,no_subtree_check,fsid=102,all_squash,anonuid=1000,anongid=1000)
+/srv/fungos-export/puget-audio  100.108.9.93(rw,sync,no_subtree_check,fsid=103,all_squash,anonuid=1000,anongid=1000)
+/srv/fungos-export              100.108.9.93(ro,sync,no_subtree_check,fsid=0,crossmnt,all_squash,anonuid=1000,anongid=1000)
