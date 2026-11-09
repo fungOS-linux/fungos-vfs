@@ -114,6 +114,14 @@ pub struct SyncOp {
     pub actor: String,
     /// Where it came from: host, device or process.
     pub origin: String,
+    /// Total order across writers, not just within one.
+    pub hlc: Hlc,
+    /// The head this write replaced, when the write produced content.
+    ///
+    /// Without it a peer can see that a path changed, but not what the writer
+    /// believed it was changing — which is the difference between replaying a
+    /// change and guessing at one.
+    pub base_content_id: Option<ContentId>,
 }
 
 /// One revision in a file's history.
@@ -125,6 +133,33 @@ pub struct Version {
     pub created_at_ms: i64,
     pub actor: String,
     pub origin: String,
+}
+
+/// A hybrid logical clock reading.
+///
+/// Wall-clock milliseconds alone are not ordered: two writers in the same
+/// millisecond tie, and a clock that steps backwards makes a later write sort
+/// earlier. Pairing the millisecond with a counter that increments on every
+/// reading gives a total order that still means something in wall-clock terms,
+/// which is what a log a human reads needs. Fields are ordered the way the sort
+/// must be, so `Ord` is the log order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Hlc {
+    pub ms: i64,
+    pub counter: u32,
+}
+
+impl Hlc {
+    /// Advance past `now_ms`, never going backwards, and return the new reading.
+    fn observe(&mut self, now_ms: i64) -> Hlc {
+        if now_ms > self.ms {
+            self.ms = now_ms;
+            self.counter = 0;
+        } else {
+            self.counter = self.counter.saturating_add(1);
+        }
+        *self
+    }
 }
 
 /// The identity stamped on every write this process makes.
@@ -229,12 +264,20 @@ impl Default for LodPolicy {
     }
 }
 
+/// The identity and clock reading stamped on one write.
+struct Stamp {
+    actor: String,
+    origin: String,
+    hlc: Hlc,
+}
+
 pub struct Vfs {
     root: PathBuf,
     role: NodeRole,
     db: Connection,
     blobs: BlobStore,
     writer: Writer,
+    hlc: Hlc,
 }
 
 impl Vfs {
@@ -253,6 +296,7 @@ impl Vfs {
             db,
             blobs,
             writer: Writer::from_environment(),
+            hlc: Hlc::default(),
         };
         vfs.migrate()?;
         let stored = vfs.stored_role()?;
@@ -289,8 +333,12 @@ impl Vfs {
         self.writer.actor = actor.into();
     }
 
-    fn stamp(&self) -> (String, String) {
-        (self.writer.actor.clone(), self.writer.origin.clone())
+    fn stamp(&mut self) -> Stamp {
+        Stamp {
+            actor: self.writer.actor.clone(),
+            origin: self.writer.origin.clone(),
+            hlc: self.hlc.observe(now_ms()),
+        }
     }
 
     fn migrate(&self) -> Result<(), VfsError> {
@@ -329,7 +377,10 @@ impl Vfs {
                content_id TEXT,
                created_at_ms INTEGER NOT NULL,
                actor TEXT NOT NULL DEFAULT 'unattributed',
-               origin TEXT NOT NULL DEFAULT 'unattributed'
+               origin TEXT NOT NULL DEFAULT 'unattributed',
+               hlc_ms INTEGER NOT NULL DEFAULT 0,
+               hlc_counter INTEGER NOT NULL DEFAULT 0,
+               base_content_id TEXT
              );
              CREATE TABLE IF NOT EXISTS leases(
                path TEXT PRIMARY KEY,
@@ -356,6 +407,9 @@ impl Vfs {
             "origin",
             "TEXT NOT NULL DEFAULT 'unattributed'",
         )?;
+        self.ensure_column("sync_queue", "hlc_ms", "INTEGER NOT NULL DEFAULT 0")?;
+        self.ensure_column("sync_queue", "hlc_counter", "INTEGER NOT NULL DEFAULT 0")?;
+        self.ensure_column("sync_queue", "base_content_id", "TEXT")?;
         Ok(())
     }
 
@@ -415,7 +469,8 @@ impl Vfs {
         let content_id = self.blobs.put(bytes)?;
         let version = current.as_ref().map_or(1, |entry| entry.version + 1);
         let now = now_ms();
-        let (actor, origin) = self.stamp();
+        let stamp = self.stamp();
+        let base = current.as_ref().map(|entry| entry.content_id.0.clone());
         let tx = self.db.transaction()?;
         tx.execute(
             "INSERT INTO files(path,content_id,size,media_type,version,hydration,pinned,updated_at_ms)
@@ -434,20 +489,24 @@ impl Vfs {
                 content_id.to_string(),
                 bytes.len() as i64,
                 now,
-                actor,
-                origin
+                stamp.actor,
+                stamp.origin
             ],
         )?;
         tx.execute(
-            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin)
-             VALUES('upsert',?1,?2,?3,?4,?5,?6)",
+            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin,
+                                    hlc_ms,hlc_counter,base_content_id)
+             VALUES('upsert',?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 path,
                 version as i64,
                 content_id.to_string(),
                 now,
-                actor,
-                origin
+                stamp.actor,
+                stamp.origin,
+                stamp.hlc.ms,
+                i64::from(stamp.hlc.counter),
+                base
             ],
         )?;
         tx.commit()?;
@@ -565,13 +624,22 @@ impl Vfs {
         let current = self
             .file(&path)?
             .ok_or_else(|| VfsError::NotFound(path.clone()))?;
-        let (actor, origin) = self.stamp();
+        let stamp = self.stamp();
         let tx = self.db.transaction()?;
         tx.execute("DELETE FROM files WHERE path=?1", params![path])?;
         tx.execute(
-            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin)
-             VALUES('remove',?1,?2,NULL,?3,?4,?5)",
-            params![path, current.version as i64, now_ms(), actor, origin],
+            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin,
+                                    hlc_ms,hlc_counter)
+             VALUES('remove',?1,?2,NULL,?3,?4,?5,?6,?7)",
+            params![
+                path,
+                current.version as i64,
+                now_ms(),
+                stamp.actor,
+                stamp.origin,
+                stamp.hlc.ms,
+                i64::from(stamp.hlc.counter)
+            ],
         )?;
         tx.commit()?;
         Ok(())
@@ -594,16 +662,24 @@ impl Vfs {
         if !self.is_directory(parent)? {
             return Err(VfsError::NotFound(parent.to_string()));
         }
-        let (actor, origin) = self.stamp();
+        let stamp = self.stamp();
         let tx = self.db.transaction()?;
         tx.execute(
             "INSERT INTO directories(path,created_at_ms) VALUES(?1,?2)",
             params![path, now_ms()],
         )?;
         tx.execute(
-            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin)
-             VALUES('mkdir',?1,1,NULL,?2,?3,?4)",
-            params![path, now_ms(), actor, origin],
+            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin,
+                                    hlc_ms,hlc_counter)
+             VALUES('mkdir',?1,1,NULL,?2,?3,?4,?5,?6)",
+            params![
+                path,
+                now_ms(),
+                stamp.actor,
+                stamp.origin,
+                stamp.hlc.ms,
+                i64::from(stamp.hlc.counter)
+            ],
         )?;
         tx.commit()?;
         Ok(())
@@ -628,13 +704,21 @@ impl Vfs {
         if exists {
             return Err(VfsError::NotEmpty(path));
         }
-        let (actor, origin) = self.stamp();
+        let stamp = self.stamp();
         let tx = self.db.transaction()?;
         tx.execute("DELETE FROM directories WHERE path=?1", params![path])?;
         tx.execute(
-            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin)
-             VALUES('rmdir',?1,1,NULL,?2,?3,?4)",
-            params![path, now_ms(), actor, origin],
+            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin,
+                                    hlc_ms,hlc_counter)
+             VALUES('rmdir',?1,1,NULL,?2,?3,?4,?5,?6)",
+            params![
+                path,
+                now_ms(),
+                stamp.actor,
+                stamp.origin,
+                stamp.hlc.ms,
+                i64::from(stamp.hlc.counter)
+            ],
         )?;
         tx.commit()?;
         Ok(())
@@ -690,7 +774,7 @@ impl Vfs {
             return Err(VfsError::AlreadyExists(to));
         }
         let now = now_ms();
-        let (actor, origin) = self.stamp();
+        let stamp = self.stamp();
         let tx = self.db.transaction()?;
         tx.execute("UPDATE files SET path=?1 WHERE path=?2", params![to, from])?;
         tx.execute(
@@ -698,20 +782,32 @@ impl Vfs {
             params![to, from],
         )?;
         tx.execute(
-            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin)
-             VALUES('remove',?1,?2,NULL,?3,?4,?5)",
-            params![from, current.version as i64, now, actor, origin],
+            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin,
+                                    hlc_ms,hlc_counter)
+             VALUES('remove',?1,?2,NULL,?3,?4,?5,?6,?7)",
+            params![
+                from,
+                current.version as i64,
+                now,
+                stamp.actor,
+                stamp.origin,
+                stamp.hlc.ms,
+                i64::from(stamp.hlc.counter)
+            ],
         )?;
         tx.execute(
-            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin)
-             VALUES('upsert',?1,?2,?3,?4,?5,?6)",
+            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin,
+                                    hlc_ms,hlc_counter)
+             VALUES('upsert',?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
                 to,
                 current.version as i64,
                 current.content_id.0,
                 now,
-                actor,
-                origin
+                stamp.actor,
+                stamp.origin,
+                stamp.hlc.ms,
+                i64::from(stamp.hlc.counter)
             ],
         )?;
         tx.commit()?;
@@ -770,8 +866,9 @@ impl Vfs {
 
     pub fn pending(&self, limit: usize) -> Result<Vec<SyncOp>, VfsError> {
         let mut statement = self.db.prepare(
-            "SELECT id,op,path,version,content_id,created_at_ms,actor,origin
-             FROM sync_queue ORDER BY id LIMIT ?1",
+            "SELECT id,op,path,version,content_id,created_at_ms,actor,origin,
+                    hlc_ms,hlc_counter,base_content_id
+             FROM sync_queue ORDER BY hlc_ms, hlc_counter, id LIMIT ?1",
         )?;
         let rows = statement.query_map(params![limit as i64], |row| {
             let op: String = row.get(1)?;
@@ -790,6 +887,11 @@ impl Vfs {
                 created_at_ms: row.get(5)?,
                 actor: row.get(6)?,
                 origin: row.get(7)?,
+                hlc: Hlc {
+                    ms: row.get(8)?,
+                    counter: row.get::<_, i64>(9)? as u32,
+                },
+                base_content_id: row.get::<_, Option<String>>(10)?.map(ContentId),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(VfsError::from)
@@ -925,6 +1027,45 @@ mod tests {
     }
 
     #[test]
+    fn the_op_log_is_totally_ordered_across_writers() {
+        let (_temp, mut vfs) = workspace();
+        vfs.set_writer(Writer::new("a", "studio"));
+        vfs.put("f.txt", b"1", "text/plain", None).unwrap();
+        vfs.put("f.txt", b"2", "text/plain", None).unwrap();
+        vfs.set_writer(Writer::new("b", "agora-one"));
+        vfs.put("f.txt", b"3", "text/plain", None).unwrap();
+
+        let ops = vfs.pending(10).unwrap();
+        assert_eq!(ops.len(), 3);
+        // Writes inside one millisecond still order, and a later write never
+        // sorts before an earlier one.
+        for pair in ops.windows(2) {
+            assert!(
+                pair[0].hlc < pair[1].hlc,
+                "{:?} !< {:?}",
+                pair[0].hlc,
+                pair[1].hlc
+            );
+        }
+        assert_eq!(ops[2].actor, "b");
+    }
+
+    #[test]
+    fn a_write_records_the_head_it_replaced() {
+        let (_temp, mut vfs) = workspace();
+        let first = vfs.put("d.txt", b"one", "text/plain", None).unwrap();
+        assert_eq!(
+            vfs.pending(10).unwrap()[0].base_content_id,
+            None,
+            "a create replaces nothing"
+        );
+
+        vfs.put("d.txt", b"two", "text/plain", None).unwrap();
+        let ops = vfs.pending(10).unwrap();
+        assert_eq!(ops[1].base_content_id.as_ref(), Some(&first.content_id));
+    }
+
+    #[test]
     fn structural_ops_are_attributed_too() {
         let (_temp, mut vfs) = workspace();
         vfs.set_writer(Writer::new("ajmwagar", "studio"));
@@ -970,6 +1111,10 @@ mod tests {
         let ops = vfs.pending(10).unwrap();
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].origin, "unattributed");
+        // The clock and base columns arrive with defaults too, rather than the
+        // migration having to invent a reading for old rows.
+        assert_eq!(ops[0].hlc, Hlc::default());
+        assert_eq!(ops[0].base_content_id, None);
     }
 
     #[test]
