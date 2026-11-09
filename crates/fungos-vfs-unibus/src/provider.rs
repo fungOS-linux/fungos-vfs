@@ -187,7 +187,7 @@ fn service_error(fetch: &ContentFetch) -> impl FnOnce(VfsError) -> ContentError 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fungos_vfs::{ContentId, NodeRole, Vfs};
+    use fungos_vfs::{ContentId, Expect, NodeRole, Vfs};
 
     #[test]
     fn serves_bounded_ranges_from_a_full_node() {
@@ -195,7 +195,7 @@ mod tests {
         let mut vfs = Vfs::open(temp.path()).unwrap();
         let bytes: Vec<u8> = (0..4096).map(|value| (value % 251) as u8).collect();
         let entry = vfs
-            .put("asset.bin", &bytes, "application/octet-stream", None)
+            .put("asset.bin", &bytes, "application/octet-stream", Expect::Any)
             .unwrap();
         let service = ContentService::new(vfs);
         let fetch = ContentFetch {

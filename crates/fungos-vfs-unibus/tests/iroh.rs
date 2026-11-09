@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use fungos_vfs::{CONTENT_DATA_KIND, CONTENT_FETCH_KIND, ContentData, ContentFetch, Vfs};
+use fungos_vfs::{CONTENT_DATA_KIND, CONTENT_FETCH_KIND, ContentData, ContentFetch, Expect, Vfs};
 use fungos_vfs_unibus::ContentService;
 use iroh::{Endpoint, endpoint::presets};
 use unibus::{
@@ -77,7 +77,7 @@ async fn content_service_serves_a_range_over_iroh() {
     let mut vfs = Vfs::open(temp.path()).unwrap();
     let bytes: Vec<u8> = (0..4096).map(|value| (value % 251) as u8).collect();
     let entry = vfs
-        .put("asset.bin", &bytes, "application/octet-stream", None)
+        .put("asset.bin", &bytes, "application/octet-stream", Expect::Any)
         .unwrap();
     let service = ContentService::new(vfs);
 
