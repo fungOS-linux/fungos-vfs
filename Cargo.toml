@@ -25,6 +25,22 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 
+# The QUIC carrier (`src/quic.rs`). `quinn` brings its own rustls, and it is
+# re-exported as `quinn::rustls`, so there is no second rustls to keep in step.
+# Ring is already what rustls hashes and signs with; asking for it here keeps
+# `aws-lc-rs` (and its C build) out of the tree.
+quinn = { version = "0.11", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-ring",
+] }
+# A self-signed certificate has no CA to be issued by, so one is generated.
+# `rcgen` is the generator; its `ring` backend reuses what quinn already pulls.
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
+# Writing and reading the PEM identity file: already in the tree through
+# rcgen's own dependency, and rustls does not parse keys itself.
+pem = "3"
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time"] }
+
 # Only for `gethostname`: std has no hostname API, and the environment variable
 # that would substitute for it is not exported by default on macOS.
 [target.'cfg(unix)'.dependencies]

@@ -10,6 +10,7 @@ mod content;
 mod hydrate;
 mod path;
 mod policy;
+mod quic;
 mod store;
 mod sync;
 mod transfer;
@@ -24,6 +25,7 @@ pub use content::ContentId;
 pub use hydrate::Hydrator;
 pub use path::normalize_path;
 pub use policy::{PathClass, PathPolicy};
+pub use quic::{SyncServer, pull_over_quic};
 pub use sync::{
     ApplyOutcome, CompactionReport, ContentBlob, Divergence, Snapshot, SnapshotEntry, SnapshotKind,
     SyncBatch, SyncCursor, SyncRequest, SyncResponse, pull_over_ssh,
