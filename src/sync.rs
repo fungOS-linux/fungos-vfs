@@ -21,6 +21,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{ContentId, Hlc, SyncOpKind, Vfs, VfsError};
 
 /// The highest clock reading this store has seen from each peer store.
@@ -32,7 +34,7 @@ use crate::{ContentId, Hlc, SyncOpKind, Vfs, VfsError};
 ///
 /// Keyed by store identity, not by origin: origin names the machine, so two
 /// stores on one host share it and would mask each other's newer ops.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncCursor {
     seen: BTreeMap<String, Hlc>,
 }
@@ -65,6 +67,44 @@ impl SyncCursor {
     }
 }
 
+/// A sync request, as it travels.
+///
+/// The wire is deliberately plain: a carrier only has to move these bytes, so
+/// ssh today and a peer session later are the same protocol over a different
+/// pipe.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SyncRequest {
+    pub cursor: SyncCursor,
+    pub limit: usize,
+}
+
+/// A responder's answer, with the content the requester cannot supply itself.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SyncResponse {
+    pub ops: Vec<crate::SyncOp>,
+    pub content: Vec<ContentBlob>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContentBlob {
+    pub id: String,
+    /// Hex, not base64: this crate has no encoder and hex needs no dependency.
+    pub data: String,
+}
+
+impl ContentBlob {
+    pub fn from_bytes(id: &ContentId, bytes: &[u8]) -> Self {
+        Self {
+            id: id.to_string(),
+            data: hex_encode(bytes),
+        }
+    }
+
+    pub fn decode(&self) -> Result<Vec<u8>, VfsError> {
+        hex_decode(&self.data)
+    }
+}
+
 /// What happened to one remote op.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApplyOutcome {
@@ -84,6 +124,46 @@ pub struct SyncBatch {
 }
 
 impl Vfs {
+    /// Build the answer a carrier sends back: the ops the requester lacks, and
+    /// the bytes they carry.
+    pub fn serve_sync(&mut self, request: &SyncRequest) -> Result<SyncResponse, VfsError> {
+        let batch = self.answer_sync(&request.cursor, request.limit)?;
+        let mut content = Vec::new();
+        for op in &batch.ops {
+            let Some(content_id) = &op.content_id else {
+                continue;
+            };
+            // Read by content id, not by path: the path may have moved on since
+            // the op was written, but the blob it names has not.
+            match self.content(content_id) {
+                Ok(bytes) => content.push(ContentBlob::from_bytes(content_id, &bytes)),
+                Err(_) => continue,
+            }
+        }
+        Ok(SyncResponse {
+            ops: batch.ops,
+            content,
+        })
+    }
+
+    /// Apply a response, returning one outcome per op in order.
+    pub fn apply_sync(&mut self, response: &SyncResponse) -> Result<Vec<ApplyOutcome>, VfsError> {
+        let mut blobs = BTreeMap::new();
+        for blob in &response.content {
+            blobs.insert(blob.id.clone(), blob.decode()?);
+        }
+        let mut outcomes = Vec::with_capacity(response.ops.len());
+        for op in &response.ops {
+            let bytes = op
+                .content_id
+                .as_ref()
+                .and_then(|id| blobs.get(&id.to_string()))
+                .map(Vec::as_slice);
+            outcomes.push(self.apply_remote(op, bytes)?);
+        }
+        Ok(outcomes)
+    }
+
     /// Everything this store has seen, expressed as a cursor.
     pub fn sync_cursor(&self) -> Result<SyncCursor, VfsError> {
         let mut cursor = SyncCursor::new();
@@ -206,6 +286,33 @@ impl Vfs {
     }
 }
 
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
+        out.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
+    }
+    out
+}
+
+fn hex_decode(text: &str) -> Result<Vec<u8>, VfsError> {
+    if !text.len().is_multiple_of(2) {
+        return Err(VfsError::InvalidContentId(text.to_string()));
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.as_chunks::<2>().0 {
+        let hi = (pair[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| VfsError::InvalidContentId(text.to_string()))?;
+        let lo = (pair[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| VfsError::InvalidContentId(text.to_string()))?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +325,44 @@ mod tests {
             Vfs::open(dir.join("a")).unwrap(),
             Vfs::open(dir.join("b")).unwrap(),
         )
+    }
+
+    /// The carrier only moves bytes: everything that matters has to survive
+    /// being serialised, because that is what crosses the wire.
+    #[test]
+    fn a_request_and_response_survive_the_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, mut b) = pair(dir.path());
+        a.put("notes/one.md", b"one", "text/markdown", Expect::Any)
+            .unwrap();
+        a.put("notes/two.md", b"two", "text/markdown", Expect::Any)
+            .unwrap();
+
+        let request = SyncRequest {
+            cursor: b.sync_cursor().unwrap(),
+            limit: 100,
+        };
+        let wire = serde_json::to_string(&request).unwrap();
+        let decoded: SyncRequest = serde_json::from_str(&wire).unwrap();
+
+        let response = a.serve_sync(&decoded).unwrap();
+        assert_eq!(response.ops.len(), 2);
+        assert_eq!(response.content.len(), 2);
+
+        let wire = serde_json::to_string(&response).unwrap();
+        let decoded: SyncResponse = serde_json::from_str(&wire).unwrap();
+        let outcomes = b.apply_sync(&decoded).unwrap();
+        assert_eq!(outcomes, vec![ApplyOutcome::Applied; 2]);
+        assert_eq!(b.get("notes/one.md").unwrap(), b"one");
+        assert_eq!(b.get("notes/two.md").unwrap(), b"two");
+
+        // The second round trip has nothing left to send.
+        let request = SyncRequest {
+            cursor: b.sync_cursor().unwrap(),
+            limit: 100,
+        };
+        let response = a.serve_sync(&request).unwrap();
+        assert!(response.ops.is_empty());
     }
 
     #[test]

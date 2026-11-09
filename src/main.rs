@@ -135,6 +135,22 @@ enum Command {
         #[arg(long)]
         no_policy: bool,
     },
+    /// Exchange ops with a peer store.
+    Sync {
+        /// `serve` answers a request on stdin; `pull` asks a peer.
+        mode: String,
+        /// ssh destination for `pull`, e.g. `agora-one`.
+        #[arg(long)]
+        remote: Option<String>,
+        /// The peer's VFS root.
+        #[arg(long)]
+        remote_root: Option<String>,
+        /// The peer's `fungos-vfs` binary.
+        #[arg(long, default_value = "fungos-vfs")]
+        remote_bin: String,
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+    },
     /// Materialize everything under `prefix` into a directory.
     Export {
         prefix: String,
@@ -303,10 +319,89 @@ fn run() -> anyhow::Result<()> {
                 ingest_dir_with_policy(&mut vfs, &source, &prefix, mode, dry_run, &policy)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        Command::Sync {
+            mode,
+            remote,
+            remote_root,
+            remote_bin,
+            limit,
+        } => match mode.as_str() {
+            "serve" => {
+                let mut input = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+                let request: fungos_vfs::SyncRequest = serde_json::from_str(&input)?;
+                let response = vfs.serve_sync(&request)?;
+                println!("{}", serde_json::to_string(&response)?);
+            }
+            "pull" => {
+                let remote = remote.ok_or_else(|| anyhow::anyhow!("sync pull needs --remote"))?;
+                let remote_root =
+                    remote_root.ok_or_else(|| anyhow::anyhow!("sync pull needs --remote-root"))?;
+                let request = fungos_vfs::SyncRequest {
+                    cursor: vfs.sync_cursor()?,
+                    limit,
+                };
+                // The carrier is one command: the peer answers on stdout.
+                let command = format!(
+                    "{} --root {} sync serve",
+                    remote_bin,
+                    shell_quote(&remote_root)
+                );
+                let mut child = std::process::Command::new("ssh")
+                    .arg("-o")
+                    .arg("BatchMode=yes")
+                    .arg(&remote)
+                    .arg(&command)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()?;
+                {
+                    use std::io::Write;
+                    let stdin = child
+                        .stdin
+                        .as_mut()
+                        .ok_or_else(|| anyhow::anyhow!("no stdin for ssh"))?;
+                    stdin.write_all(serde_json::to_string(&request)?.as_bytes())?;
+                }
+                let output = child.wait_with_output()?;
+                if !output.status.success() {
+                    anyhow::bail!(
+                        "sync pull from {remote} failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+                let response: fungos_vfs::SyncResponse = serde_json::from_slice(&output.stdout)?;
+                let outcomes = vfs.apply_sync(&response)?;
+                let mut applied = 0;
+                let mut duplicate = 0;
+                let mut diverged = 0;
+                for outcome in &outcomes {
+                    match outcome {
+                        fungos_vfs::ApplyOutcome::Applied => applied += 1,
+                        fungos_vfs::ApplyOutcome::Duplicate => duplicate += 1,
+                        fungos_vfs::ApplyOutcome::Diverged => diverged += 1,
+                    }
+                }
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "applied": applied,
+                        "duplicate": duplicate,
+                        "diverged": diverged,
+                    })
+                );
+            }
+            other => anyhow::bail!("sync mode must be serve or pull, not {other}"),
+        },
         Command::Export { prefix, dest } => {
             let report = export_dir(&mut vfs, &prefix, &dest)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
     }
     Ok(())
+}
+
+/// Quote one argument for the remote shell.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
 }

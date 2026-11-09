@@ -1058,6 +1058,11 @@ impl Vfs {
         Ok(self.blobs.get(content_id).is_ok())
     }
 
+    /// Bytes for a content id, independent of any path.
+    pub fn content(&self, content_id: &ContentId) -> Result<Vec<u8>, VfsError> {
+        self.blobs.get(content_id)
+    }
+
     /// Apply a remote write without enqueueing a new local op.
     ///
     /// The op is already in the origin's log; recording it again here would
