@@ -34,6 +34,14 @@ pub enum VfsError {
     },
     #[error("path is leased by {owner} until {expires_at_ms}")]
     Leased { owner: String, expires_at_ms: i64 },
+    /// A snapshot replaces this store's namespace wholesale, so applying one
+    /// while writes are still only local would discard them. Refused rather
+    /// than applied: an empty answer can be retried, a discarded write cannot
+    /// be recovered.
+    #[error(
+        "refusing snapshot: {pending} unsynced local ops would be discarded; sync or ack them first"
+    )]
+    SnapshotRefused { pending: usize },
     #[error("node is a pull-through cache; writes are disabled")]
     ReadOnly,
     #[error("transport error: {0}")]
@@ -306,7 +314,7 @@ pub struct Vfs {
     root: PathBuf,
     role: NodeRole,
     pub(crate) db: Connection,
-    blobs: BlobStore,
+    pub(crate) blobs: BlobStore,
     writer: Writer,
     hlc: Hlc,
     /// The worktree this store's writes belong to, when it serves one.
@@ -453,6 +461,11 @@ impl Vfs {
                hlc_ms INTEGER NOT NULL,
                hlc_counter INTEGER NOT NULL,
                PRIMARY KEY(store, hlc_ms, hlc_counter)
+             );
+             CREATE TABLE IF NOT EXISTS horizon(
+               store TEXT PRIMARY KEY,
+               hlc_ms INTEGER NOT NULL,
+               hlc_counter INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS leases(
                path TEXT PRIMARY KEY,
@@ -1258,7 +1271,7 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileEntry> {
     })
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

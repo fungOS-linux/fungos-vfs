@@ -25,7 +25,8 @@ pub use hydrate::Hydrator;
 pub use path::normalize_path;
 pub use policy::{PathClass, PathPolicy};
 pub use sync::{
-    ApplyOutcome, ContentBlob, SyncBatch, SyncCursor, SyncRequest, SyncResponse, pull_over_ssh,
+    ApplyOutcome, CompactionReport, ContentBlob, Snapshot, SnapshotEntry, SnapshotKind, SyncBatch,
+    SyncCursor, SyncRequest, SyncResponse, pull_over_ssh,
 };
 pub use transfer::{
     ExportReport, GitPointer, IngestReport, SourceMode, export_dir, ingest_dir,
