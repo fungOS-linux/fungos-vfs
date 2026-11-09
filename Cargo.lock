@@ -777,6 +777,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

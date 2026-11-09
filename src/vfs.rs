@@ -109,6 +109,109 @@ pub struct SyncOp {
     pub version: u64,
     pub content_id: Option<ContentId>,
     pub created_at_ms: i64,
+    /// Who produced the write. A write with no author is a write nobody can
+    /// explain later, which is the difference between a history and a list.
+    pub actor: String,
+    /// Where it came from: host, device or process.
+    pub origin: String,
+}
+
+/// One revision in a file's history.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Version {
+    pub version: u64,
+    pub content_id: ContentId,
+    pub size: u64,
+    pub created_at_ms: i64,
+    pub actor: String,
+    pub origin: String,
+}
+
+/// The identity stamped on every write this process makes.
+///
+/// This is deliberately an attribute of the process rather than an argument to
+/// each call: attribution that a caller can forget is attribution that is
+/// missing exactly where it matters. A demultiplexing daemon sets it once.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Writer {
+    pub actor: String,
+    pub origin: String,
+}
+
+impl Writer {
+    /// Infer who and where from the process environment.
+    ///
+    /// Guessing here is better than an argument every caller forgets, but it is
+    /// still a guess: a service should call [`Vfs::set_writer`] with a real
+    /// identity rather than inherit `unknown` from an environment that has none.
+    pub fn from_environment() -> Self {
+        Self {
+            actor: non_empty_env(&["USER", "LOGNAME", "USERNAME"])
+                .unwrap_or_else(|| "unknown".to_string()),
+            origin: host_name().unwrap_or_else(|| "unknown".to_string()),
+        }
+    }
+
+    pub fn new(actor: impl Into<String>, origin: impl Into<String>) -> Self {
+        Self {
+            actor: actor.into(),
+            origin: origin.into(),
+        }
+    }
+}
+
+fn non_empty_env(names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+}
+
+/// The machine this process runs on.
+///
+/// `HOSTNAME` is not exported by default on macOS, so reading the environment
+/// alone reports `unknown` on the platform that matters most. `gethostname` is
+/// the primitive every platform answers; the environment stays as a fallback
+/// for environments where the call is unavailable.
+#[cfg(unix)]
+fn host_name() -> Option<String> {
+    const MAX_HOST_NAME: usize = 255;
+    let mut buffer = [0u8; MAX_HOST_NAME + 1];
+    // SAFETY: `buffer` is a valid, writable slice of `buffer.len()` bytes and
+    // the length passed matches it, which is the contract `gethostname`
+    // requires. The call writes at most that many bytes and NUL-terminates when
+    // the name fits, which is the case no larger than MAX_HOST_NAME.
+    let result =
+        unsafe { libc::gethostname(buffer.as_mut_ptr().cast::<libc::c_char>(), buffer.len()) };
+    if result == 0 {
+        let end = buffer
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(buffer.len());
+        if let Ok(name) = std::str::from_utf8(&buffer[..end])
+            && !name.is_empty()
+        {
+            return Some(name.to_string());
+        }
+    }
+    non_empty_env(&["HOSTNAME", "COMPUTERNAME"])
+}
+
+#[cfg(not(unix))]
+fn host_name() -> Option<String> {
+    non_empty_env(&["HOSTNAME", "COMPUTERNAME"])
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use super::*;
+
+    #[test]
+    fn the_environment_yields_a_usable_identity() {
+        let writer = Writer::from_environment();
+        assert!(!writer.actor.is_empty());
+        // A hostname, not the placeholder: this test runs on a real machine.
+        assert_ne!(writer.origin, "unknown", "origin should be the hostname");
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -131,6 +234,7 @@ pub struct Vfs {
     role: NodeRole,
     db: Connection,
     blobs: BlobStore,
+    writer: Writer,
 }
 
 impl Vfs {
@@ -148,6 +252,7 @@ impl Vfs {
             role,
             db,
             blobs,
+            writer: Writer::from_environment(),
         };
         vfs.migrate()?;
         let stored = vfs.stored_role()?;
@@ -166,6 +271,26 @@ impl Vfs {
 
     pub fn role(&self) -> NodeRole {
         self.role
+    }
+
+    /// The identity stamped on this process's writes.
+    pub fn writer(&self) -> &Writer {
+        &self.writer
+    }
+
+    /// Replace the inferred identity with a real one. A daemon serving several
+    /// principals should set this per request rather than inherit the process
+    /// user.
+    pub fn set_writer(&mut self, writer: Writer) {
+        self.writer = writer;
+    }
+
+    pub fn set_actor(&mut self, actor: impl Into<String>) {
+        self.writer.actor = actor.into();
+    }
+
+    fn stamp(&self) -> (String, String) {
+        (self.writer.actor.clone(), self.writer.origin.clone())
     }
 
     fn migrate(&self) -> Result<(), VfsError> {
@@ -192,6 +317,8 @@ impl Vfs {
                content_id TEXT NOT NULL,
                size INTEGER NOT NULL,
                created_at_ms INTEGER NOT NULL,
+               actor TEXT NOT NULL DEFAULT 'unattributed',
+               origin TEXT NOT NULL DEFAULT 'unattributed',
                PRIMARY KEY(path, version)
              );
              CREATE TABLE IF NOT EXISTS sync_queue(
@@ -200,7 +327,9 @@ impl Vfs {
                path TEXT NOT NULL,
                version INTEGER NOT NULL,
                content_id TEXT,
-               created_at_ms INTEGER NOT NULL
+               created_at_ms INTEGER NOT NULL,
+               actor TEXT NOT NULL DEFAULT 'unattributed',
+               origin TEXT NOT NULL DEFAULT 'unattributed'
              );
              CREATE TABLE IF NOT EXISTS leases(
                path TEXT PRIMARY KEY,
@@ -212,6 +341,40 @@ impl Vfs {
             "INSERT OR IGNORE INTO meta(key,value) VALUES('role', ?1)",
             params![self.role.to_string()],
         )?;
+        // Attribution arrived after the first stores were written. Rows that
+        // predate it keep the `unattributed` default rather than being
+        // backfilled with a guess.
+        self.ensure_column("versions", "actor", "TEXT NOT NULL DEFAULT 'unattributed'")?;
+        self.ensure_column("versions", "origin", "TEXT NOT NULL DEFAULT 'unattributed'")?;
+        self.ensure_column(
+            "sync_queue",
+            "actor",
+            "TEXT NOT NULL DEFAULT 'unattributed'",
+        )?;
+        self.ensure_column(
+            "sync_queue",
+            "origin",
+            "TEXT NOT NULL DEFAULT 'unattributed'",
+        )?;
+        Ok(())
+    }
+
+    /// Add a column to an existing table if it is not there yet.
+    ///
+    /// The table and column names are compile-time constants, never user input.
+    fn ensure_column(&self, table: &str, column: &str, declaration: &str) -> Result<(), VfsError> {
+        let present: bool = self.db.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name='{column}')"
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        if !present {
+            self.db.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+            ))?;
+        }
         Ok(())
     }
 
@@ -252,6 +415,7 @@ impl Vfs {
         let content_id = self.blobs.put(bytes)?;
         let version = current.as_ref().map_or(1, |entry| entry.version + 1);
         let now = now_ms();
+        let (actor, origin) = self.stamp();
         let tx = self.db.transaction()?;
         tx.execute(
             "INSERT INTO files(path,content_id,size,media_type,version,hydration,pinned,updated_at_ms)
@@ -262,12 +426,29 @@ impl Vfs {
             params![path, content_id.to_string(), bytes.len() as i64, media_type, version as i64, now],
         )?;
         tx.execute(
-            "INSERT INTO versions(path,version,content_id,size,created_at_ms) VALUES(?1,?2,?3,?4,?5)",
-            params![path, version as i64, content_id.to_string(), bytes.len() as i64, now],
+            "INSERT INTO versions(path,version,content_id,size,created_at_ms,actor,origin)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                path,
+                version as i64,
+                content_id.to_string(),
+                bytes.len() as i64,
+                now,
+                actor,
+                origin
+            ],
         )?;
         tx.execute(
-            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms) VALUES('upsert',?1,?2,?3,?4)",
-            params![path, version as i64, content_id.to_string(), now],
+            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin)
+             VALUES('upsert',?1,?2,?3,?4,?5,?6)",
+            params![
+                path,
+                version as i64,
+                content_id.to_string(),
+                now,
+                actor,
+                origin
+            ],
         )?;
         tx.commit()?;
         self.file(&path)?.ok_or_else(|| VfsError::NotFound(path))
@@ -357,18 +538,21 @@ impl Vfs {
         rows.collect::<Result<Vec<_>, _>>().map_err(VfsError::from)
     }
 
-    pub fn history(&self, path: &str) -> Result<Vec<(u64, ContentId, u64, i64)>, VfsError> {
+    pub fn history(&self, path: &str) -> Result<Vec<Version>, VfsError> {
         let path = normalize_path(path)?;
         let mut statement = self.db.prepare(
-            "SELECT version,content_id,size,created_at_ms FROM versions WHERE path=?1 ORDER BY version",
+            "SELECT version,content_id,size,created_at_ms,actor,origin
+             FROM versions WHERE path=?1 ORDER BY version",
         )?;
         let rows = statement.query_map(params![path], |row| {
-            Ok((
-                row.get::<_, i64>(0)? as u64,
-                ContentId(row.get(1)?),
-                row.get::<_, i64>(2)? as u64,
-                row.get(3)?,
-            ))
+            Ok(Version {
+                version: row.get::<_, i64>(0)? as u64,
+                content_id: ContentId(row.get(1)?),
+                size: row.get::<_, i64>(2)? as u64,
+                created_at_ms: row.get(3)?,
+                actor: row.get(4)?,
+                origin: row.get(5)?,
+            })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(VfsError::from)
     }
@@ -381,11 +565,13 @@ impl Vfs {
         let current = self
             .file(&path)?
             .ok_or_else(|| VfsError::NotFound(path.clone()))?;
+        let (actor, origin) = self.stamp();
         let tx = self.db.transaction()?;
         tx.execute("DELETE FROM files WHERE path=?1", params![path])?;
         tx.execute(
-            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms) VALUES('remove',?1,?2,NULL,?3)",
-            params![path, current.version as i64, now_ms()],
+            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin)
+             VALUES('remove',?1,?2,NULL,?3,?4,?5)",
+            params![path, current.version as i64, now_ms(), actor, origin],
         )?;
         tx.commit()?;
         Ok(())
@@ -408,14 +594,16 @@ impl Vfs {
         if !self.is_directory(parent)? {
             return Err(VfsError::NotFound(parent.to_string()));
         }
+        let (actor, origin) = self.stamp();
         let tx = self.db.transaction()?;
         tx.execute(
             "INSERT INTO directories(path,created_at_ms) VALUES(?1,?2)",
             params![path, now_ms()],
         )?;
         tx.execute(
-            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms) VALUES('mkdir',?1,1,NULL,?2)",
-            params![path, now_ms()],
+            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin)
+             VALUES('mkdir',?1,1,NULL,?2,?3,?4)",
+            params![path, now_ms(), actor, origin],
         )?;
         tx.commit()?;
         Ok(())
@@ -440,11 +628,13 @@ impl Vfs {
         if exists {
             return Err(VfsError::NotEmpty(path));
         }
+        let (actor, origin) = self.stamp();
         let tx = self.db.transaction()?;
         tx.execute("DELETE FROM directories WHERE path=?1", params![path])?;
         tx.execute(
-            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms) VALUES('rmdir',?1,1,NULL,?2)",
-            params![path, now_ms()],
+            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin)
+             VALUES('rmdir',?1,1,NULL,?2,?3,?4)",
+            params![path, now_ms(), actor, origin],
         )?;
         tx.commit()?;
         Ok(())
@@ -500,6 +690,7 @@ impl Vfs {
             return Err(VfsError::AlreadyExists(to));
         }
         let now = now_ms();
+        let (actor, origin) = self.stamp();
         let tx = self.db.transaction()?;
         tx.execute("UPDATE files SET path=?1 WHERE path=?2", params![to, from])?;
         tx.execute(
@@ -507,14 +698,21 @@ impl Vfs {
             params![to, from],
         )?;
         tx.execute(
-            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms)
-             VALUES('remove',?1,?2,NULL,?3)",
-            params![from, current.version as i64, now],
+            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin)
+             VALUES('remove',?1,?2,NULL,?3,?4,?5)",
+            params![from, current.version as i64, now, actor, origin],
         )?;
         tx.execute(
-            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms)
-             VALUES('upsert',?1,?2,?3,?4)",
-            params![to, current.version as i64, current.content_id.0, now],
+            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin)
+             VALUES('upsert',?1,?2,?3,?4,?5,?6)",
+            params![
+                to,
+                current.version as i64,
+                current.content_id.0,
+                now,
+                actor,
+                origin
+            ],
         )?;
         tx.commit()?;
         let mut entry = current;
@@ -572,7 +770,8 @@ impl Vfs {
 
     pub fn pending(&self, limit: usize) -> Result<Vec<SyncOp>, VfsError> {
         let mut statement = self.db.prepare(
-            "SELECT id,op,path,version,content_id,created_at_ms FROM sync_queue ORDER BY id LIMIT ?1",
+            "SELECT id,op,path,version,content_id,created_at_ms,actor,origin
+             FROM sync_queue ORDER BY id LIMIT ?1",
         )?;
         let rows = statement.query_map(params![limit as i64], |row| {
             let op: String = row.get(1)?;
@@ -589,6 +788,8 @@ impl Vfs {
                 version: row.get::<_, i64>(3)? as u64,
                 content_id: row.get::<_, Option<String>>(4)?.map(ContentId),
                 created_at_ms: row.get(5)?,
+                actor: row.get(6)?,
+                origin: row.get(7)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(VfsError::from)
@@ -693,6 +894,82 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let vfs = Vfs::open(temp.path()).unwrap();
         (temp, vfs)
+    }
+
+    #[test]
+    fn writes_carry_the_actor_and_origin_that_made_them() {
+        let (_temp, mut vfs) = workspace();
+        vfs.set_writer(Writer::new("ajmwagar", "studio"));
+        vfs.put("notes/a.md", b"# a\n", "text/markdown", None)
+            .unwrap();
+        vfs.set_writer(Writer::new("agent:reviewer", "agora-one"));
+        vfs.put("notes/a.md", b"# a again\n", "text/markdown", None)
+            .unwrap();
+
+        let history = vfs.history("notes/a.md").unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            (history[0].actor.as_str(), history[0].origin.as_str()),
+            ("ajmwagar", "studio")
+        );
+        assert_eq!(
+            (history[1].actor.as_str(), history[1].origin.as_str()),
+            ("agent:reviewer", "agora-one")
+        );
+
+        // The replication log carries the same attribution, so a peer can tell
+        // whose write it is applying.
+        let ops = vfs.pending(10).unwrap();
+        assert_eq!(ops[0].actor, "ajmwagar");
+        assert_eq!(ops[1].origin, "agora-one");
+    }
+
+    #[test]
+    fn structural_ops_are_attributed_too() {
+        let (_temp, mut vfs) = workspace();
+        vfs.set_writer(Writer::new("ajmwagar", "studio"));
+        vfs.mkdir("docs").unwrap();
+        vfs.rmdir("docs").unwrap();
+        let ops = vfs.pending(10).unwrap();
+        assert!(ops.iter().all(|op| op.actor == "ajmwagar"));
+        assert!(ops.iter().all(|op| op.origin == "studio"));
+    }
+
+    /// Attribution arrived after the first stores existed. An older database
+    /// must open, gain the columns, and keep its rows — marked honestly rather
+    /// than backfilled with a guess.
+    #[test]
+    fn a_store_from_before_attribution_upgrades_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join(".fungos")).unwrap();
+        {
+            let db = Connection::open(root.join(".fungos/vfs.sqlite3")).unwrap();
+            db.execute_batch(
+                "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta VALUES('role','full');
+                 CREATE TABLE versions(
+                   path TEXT NOT NULL, version INTEGER NOT NULL, content_id TEXT NOT NULL,
+                   size INTEGER NOT NULL, created_at_ms INTEGER NOT NULL,
+                   PRIMARY KEY(path, version));
+                 INSERT INTO versions VALUES('a.txt',1,'blake3:aaaa',7,1);
+                 CREATE TABLE sync_queue(
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, op TEXT NOT NULL, path TEXT NOT NULL,
+                   version INTEGER NOT NULL, content_id TEXT, created_at_ms INTEGER NOT NULL);
+                 INSERT INTO sync_queue(op,path,version,content_id,created_at_ms)
+                   VALUES('upsert','a.txt',1,'blake3:aaaa',1);",
+            )
+            .unwrap();
+        }
+
+        let vfs = Vfs::open(root).unwrap();
+        let history = vfs.history("a.txt").unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].size, 7);
+        assert_eq!(history[0].actor, "unattributed");
+        let ops = vfs.pending(10).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].origin, "unattributed");
     }
 
     #[test]

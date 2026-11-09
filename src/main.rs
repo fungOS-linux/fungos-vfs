@@ -12,6 +12,9 @@ struct Cli {
     root: PathBuf,
     #[arg(long, global = true, value_enum, default_value_t = RoleArg::Full)]
     role: RoleArg,
+    /// Stamp writes with this actor instead of the process user.
+    #[arg(long, global = true)]
+    actor: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -145,6 +148,9 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let mut vfs = Vfs::open_with_role(&cli.root, cli.role.into())?;
+    if let Some(actor) = &cli.actor {
+        vfs.set_actor(actor.clone());
+    }
     match cli.command {
         Command::Put {
             file,
@@ -200,8 +206,16 @@ fn run() -> anyhow::Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&history)?);
             } else {
-                for (version, content_id, size, created) in history {
-                    println!("{version}\t{size}\t{created}\t{content_id}");
+                for entry in history {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}",
+                        entry.version,
+                        entry.size,
+                        entry.created_at_ms,
+                        entry.content_id,
+                        entry.actor,
+                        entry.origin
+                    );
                 }
             }
         }
