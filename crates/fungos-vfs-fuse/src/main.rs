@@ -414,6 +414,10 @@ fn errno(error: &VfsError) -> Errno {
         VfsError::ReadOnly => Errno::EROFS,
         VfsError::InvalidPath(_) => Errno::EINVAL,
         VfsError::Config(_) => Errno::EINVAL,
+        // No content store to resolve is the same class as missing
+        // configuration: the mount cannot work until someone says where the
+        // machine's content lives.
+        VfsError::NoDataDirectory => Errno::EINVAL,
         VfsError::InvalidContentId(_) => Errno::EIO,
         VfsError::Conflict { .. } | VfsError::AlreadyExists(_) => Errno::EEXIST,
         // A fenced write means the caller wrote against a head that has moved;
