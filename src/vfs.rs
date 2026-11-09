@@ -46,6 +46,8 @@ pub enum VfsError {
     ReadOnly,
     #[error("transport error: {0}")]
     Transport(String),
+    #[error("corrupt store metadata: {key} = {value}")]
+    CorruptMeta { key: String, value: String },
     #[error("workspace role mismatch: expected {expected}, found {found}")]
     RoleMismatch { expected: NodeRole, found: NodeRole },
     #[error(transparent)]
@@ -350,6 +352,15 @@ impl Vfs {
         let mut vfs = vfs;
         vfs.migrate()?;
         vfs.store = vfs.ensure_store_id()?;
+        // The clock resumes where the last process left it, and only then
+        // advances to the wall clock if that is ahead. Starting at zero would
+        // make every reading depend on the wall clock being monotonic across
+        // restarts, which it is not: a restored VM, NTP correcting downwards,
+        // or a laptop waking with a skewed RTC all hand a fresh process a
+        // reading below ones this store has already used — and every rule
+        // keyed on "at or below" would then treat a new write as an old one.
+        vfs.hlc = vfs.stored_hlc()?;
+        vfs.hlc.observe(now_ms());
         let stored = vfs.stored_role()?;
         if stored != role {
             return Err(VfsError::RoleMismatch {
@@ -402,14 +413,68 @@ impl Vfs {
         &self.store
     }
 
-    fn stamp(&mut self) -> Stamp {
-        Stamp {
+    /// This store's last clock reading, as the previous process left it.
+    ///
+    /// The pair is written on every stamp, so it is the reading the store can
+    /// guarantee it has used. A missing pair means a store from before the clock
+    /// was persisted, which starts where it used to: at the wall clock.
+    fn stored_hlc(&self) -> Result<Hlc, VfsError> {
+        let read = |key: &str| -> Result<i64, VfsError> {
+            let value: Option<String> = self
+                .db
+                .query_row("SELECT value FROM meta WHERE key=?1", params![key], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            match value {
+                None => Ok(0),
+                Some(value) => value.parse::<i64>().map_err(|_| VfsError::CorruptMeta {
+                    key: key.to_string(),
+                    value,
+                }),
+            }
+        };
+        let counter = u32::try_from(read("hlc_counter")?).map_err(|_| VfsError::CorruptMeta {
+            key: "hlc_counter".to_string(),
+            value: read("hlc_counter").unwrap_or_default().to_string(),
+        })?;
+        Ok(Hlc {
+            ms: read("hlc_ms")?,
+            counter,
+        })
+    }
+
+    /// Write down the reading a stamp used.
+    ///
+    /// Deliberately not a cache and not best-effort: a clock that quietly
+    /// forgets is the defect this recording exists to remove, so a failure here
+    /// is the write's failure.
+    fn persist_hlc(&self, hlc: Hlc) -> Result<(), VfsError> {
+        let tx = self.db.unchecked_transaction()?;
+        for (key, value) in [
+            ("hlc_ms", hlc.ms.to_string()),
+            ("hlc_counter", hlc.counter.to_string()),
+        ] {
+            tx.execute(
+                "INSERT INTO meta(key,value) VALUES(?1,?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![key, value],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn stamp(&mut self) -> Result<Stamp, VfsError> {
+        let hlc = self.hlc.observe(now_ms());
+        self.persist_hlc(hlc)?;
+        Ok(Stamp {
             actor: self.writer.actor.clone(),
             origin: self.writer.origin.clone(),
             store: self.store.clone(),
             worktree: self.worktree.clone(),
-            hlc: self.hlc.observe(now_ms()),
-        }
+            hlc,
+        })
     }
 
     fn migrate(&self) -> Result<(), VfsError> {
@@ -625,7 +690,7 @@ impl Vfs {
         let content_id = self.blobs.put(bytes)?;
         let version = current.as_ref().map_or(1, |entry| entry.version + 1);
         let now = now_ms();
-        let stamp = self.stamp();
+        let stamp = self.stamp()?;
         let base = current.as_ref().map(|entry| entry.content_id.0.clone());
         let tx = self.db.transaction()?;
         tx.execute(
@@ -782,7 +847,7 @@ impl Vfs {
         let current = self
             .file(&path)?
             .ok_or_else(|| VfsError::NotFound(path.clone()))?;
-        let stamp = self.stamp();
+        let stamp = self.stamp()?;
         let tx = self.db.transaction()?;
         tx.execute("DELETE FROM files WHERE path=?1", params![path])?;
         tx.execute(
@@ -822,7 +887,7 @@ impl Vfs {
         if !self.is_directory(parent)? {
             return Err(VfsError::NotFound(parent.to_string()));
         }
-        let stamp = self.stamp();
+        let stamp = self.stamp()?;
         let tx = self.db.transaction()?;
         tx.execute(
             "INSERT INTO directories(path,created_at_ms) VALUES(?1,?2)",
@@ -866,7 +931,7 @@ impl Vfs {
         if exists {
             return Err(VfsError::NotEmpty(path));
         }
-        let stamp = self.stamp();
+        let stamp = self.stamp()?;
         let tx = self.db.transaction()?;
         tx.execute("DELETE FROM directories WHERE path=?1", params![path])?;
         tx.execute(
@@ -938,7 +1003,7 @@ impl Vfs {
             return Err(VfsError::AlreadyExists(to));
         }
         let now = now_ms();
-        let stamp = self.stamp();
+        let stamp = self.stamp()?;
         let tx = self.db.transaction()?;
         tx.execute("UPDATE files SET path=?1 WHERE path=?2", params![to, from])?;
         tx.execute(
@@ -1301,6 +1366,28 @@ pub(crate) fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// Pretend the store's written-down clock reading is ahead of the wall clock.
+///
+/// That is what a step-back looks like from inside the store: an RTC that ran
+/// fast and was corrected, a VM restored from a snapshot, a laptop waking with a
+/// stale clock. A test cannot move the wall clock, so the reading the store must
+/// not fall below is moved instead.
+#[cfg(test)]
+pub(crate) fn set_stored_hlc(root: &Path, hlc: Hlc) {
+    let db = Connection::open(root.join(".fungos/vfs.sqlite3")).unwrap();
+    for (key, value) in [
+        ("hlc_ms", hlc.ms.to_string()),
+        ("hlc_counter", hlc.counter.to_string()),
+    ] {
+        db.execute(
+            "INSERT INTO meta(key,value) VALUES(?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        )
+        .unwrap();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1601,5 +1688,45 @@ mod tests {
         assert_eq!(ops[1].kind, SyncOpKind::Remove);
         vfs.ack(&[ops[0].id]).unwrap();
         assert_eq!(vfs.pending(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_restart_with_a_clock_that_stepped_back_still_stamps_above_the_last_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        let mut a = Vfs::open(root).unwrap();
+        a.put("one.md", b"one", "text/markdown", Expect::Any)
+            .unwrap();
+        let first = a.pending(10).unwrap().last().unwrap().hlc;
+        drop(a);
+
+        // The reading this store has already used is an hour ahead of anything
+        // the reopened process will read from the clock.
+        let ahead = Hlc {
+            ms: first.ms + 3_600_000,
+            counter: 0,
+        };
+        set_stored_hlc(root, ahead);
+
+        let mut a = Vfs::open(root).unwrap();
+        a.put("two.md", b"two", "text/markdown", Expect::Any)
+            .unwrap();
+        let second = a.pending(10).unwrap().last().unwrap().hlc;
+        assert!(second > ahead, "{second:?} must resume above {ahead:?}");
+        assert!(second > first);
+
+        // A peer sees two writes, not a write and a duplicate: a clock that
+        // restarted at zero would have made the second sort under the first.
+        let mut b = Vfs::open(temp.path().join("peer")).unwrap();
+        let ops = a.pending(10).unwrap();
+        let outcomes: Vec<_> = ops
+            .iter()
+            .map(|op| {
+                let bytes = a.get(&op.path).unwrap();
+                b.apply_remote(op, Some(&bytes)).unwrap()
+            })
+            .collect();
+        assert_eq!(outcomes, vec![crate::ApplyOutcome::Applied; 2]);
     }
 }
