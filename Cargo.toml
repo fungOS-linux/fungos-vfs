@@ -39,7 +39,16 @@ rcgen = { version = "0.13", default-features = false, features = ["crypto", "rin
 # Writing and reading the PEM identity file: already in the tree through
 # rcgen's own dependency, and rustls does not parse keys itself.
 pem = "3"
-tokio = { version = "1", default-features = false, features = ["rt", "net", "time"] }
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "net",
+    "time",
+    # The framed exchange in `src/stream.rs` is written against `AsyncRead` and
+    # `AsyncWrite`, so `read_exact` and `write_all` are the calls it makes; the
+    # tests drive both ends of it concurrently, which is what `macros` is for.
+    "io-util",
+    "macros",
+] }
 
 # Only for `gethostname`: std has no hostname API, and the environment variable
 # that would substitute for it is not exported by default on macOS.

@@ -12,6 +12,7 @@ mod path;
 mod policy;
 mod quic;
 mod store;
+mod stream;
 mod sync;
 mod transfer;
 mod vfs;
@@ -26,9 +27,11 @@ pub use hydrate::Hydrator;
 pub use path::normalize_path;
 pub use policy::{PathClass, PathPolicy};
 pub use quic::{SyncServer, pull_over_quic};
+pub use stream::{MAX_FRAME, PullClient, Resume, STREAM_VERSION, SnapshotHeader, StreamRequest};
 pub use sync::{
-    ApplyOutcome, CompactionReport, ContentBlob, Divergence, Snapshot, SnapshotEntry, SnapshotKind,
-    SyncBatch, SyncCursor, SyncRequest, SyncResponse, pull_over_ssh,
+    ApplyOutcome, CompactionReport, ContentBlob, Divergence, MESSAGE_VERSION, SessionId, Snapshot,
+    SnapshotEntry, SnapshotKind, SnapshotStaging, SyncBatch, SyncCursor, SyncRequest, SyncResponse,
+    TransferReport, pull_over_ssh,
 };
 pub use transfer::{
     ExportReport, GitPointer, IngestReport, SourceMode, export_dir, ingest_dir,

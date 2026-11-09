@@ -400,7 +400,7 @@ fn run() -> anyhow::Result<()> {
                 }
             }
             "pull" => {
-                let outcomes = match quic {
+                let (outcomes, report) = match quic {
                     Some(endpoint) => {
                         let fingerprint = fingerprint.ok_or_else(|| {
                             anyhow::anyhow!("sync pull --quic needs --fingerprint")
@@ -415,7 +415,7 @@ fn run() -> anyhow::Result<()> {
                         pull_over_ssh(&mut vfs, &remote, &remote_root, &remote_bin, limit)?
                     }
                 };
-                println!("{}", summarize(&outcomes));
+                println!("{}", summarize(&outcomes, &report));
             }
             "compact" => {
                 let seconds =
@@ -436,7 +436,11 @@ fn run() -> anyhow::Result<()> {
 }
 
 /// What `sync pull` prints, whichever carrier moved the ops.
-fn summarize(outcomes: &[ApplyOutcome]) -> serde_json::Value {
+///
+/// The costs are reported, not just the outcomes: an exchange that moved a
+/// snapshot should be recognisable as one, and the bytes are the number that
+/// says whether the transfer was worth resuming.
+fn summarize(outcomes: &[ApplyOutcome], report: &fungos_vfs::TransferReport) -> serde_json::Value {
     let mut applied = 0;
     let mut duplicate = 0;
     let mut diverged = 0;
@@ -454,5 +458,11 @@ fn summarize(outcomes: &[ApplyOutcome]) -> serde_json::Value {
         "duplicate": duplicate,
         "diverged": diverged,
         "snapshot": snapshot,
+        "session": report.session,
+        "bytes": report.bytes,
+        "entries": report.entries,
+        "content_bytes": report.content_bytes,
+        "resumed_from": report.resumed_from,
+        "attempts": report.attempts,
     })
 }

@@ -111,6 +111,20 @@ fn behind_horizon(cursor: &SyncCursor, horizons: &BTreeMap<String, Hlc>) -> bool
         .any(|(store, seen)| horizons.get(store).is_some_and(|hlc| *hlc > seen))
 }
 
+/// The version of the whole-message exchange: one `SyncRequest` in, one
+/// `SyncResponse` out, each a single JSON document.
+///
+/// This is the format ssh carries, and it stays the format ssh carries: an ssh
+/// pipe is one stdin and one stdout, so it has no way to interleave the frames
+/// [`crate::stream`] uses and no way to resume a transfer that was cut off. The
+/// number is stated rather than assumed so a peer that speaks the framed format
+/// fails with an error that says so, instead of in a deserialiser.
+pub const MESSAGE_VERSION: u16 = 1;
+
+fn message_version() -> u16 {
+    MESSAGE_VERSION
+}
+
 /// A sync request, as it travels.
 ///
 /// The wire is deliberately plain: a carrier only has to move these bytes, so
@@ -118,8 +132,21 @@ fn behind_horizon(cursor: &SyncCursor, horizons: &BTreeMap<String, Hlc>) -> bool
 /// pipe.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SyncRequest {
+    /// The whole-message wire this request is written in.
+    #[serde(default = "message_version")]
+    pub version: u16,
     pub cursor: SyncCursor,
     pub limit: usize,
+}
+
+impl SyncRequest {
+    pub fn new(cursor: SyncCursor, limit: usize) -> Self {
+        Self {
+            version: MESSAGE_VERSION,
+            cursor,
+            limit,
+        }
+    }
 }
 
 /// A responder's answer, with the content the requester cannot supply itself.
@@ -152,6 +179,80 @@ pub struct Snapshot {
     /// A receiver adopts this as its horizon: below it, the entries are the
     /// state; above it, the log still has the ops.
     pub watermark: SyncCursor,
+}
+
+/// The identity of one snapshot transfer.
+///
+/// A digest of the snapshot's watermark and of every entry in it, never a random
+/// id and never a value the peer has to remember. A receiver that was cut off
+/// sends this back; the sender recomputes it from its own store and compares, so
+/// "continue where I left off" is only honoured when the state on both ends is
+/// still the one the first attempt described. A store that changed in the
+/// meantime produces a different session, and the receiver starts from zero
+/// instead of splicing two different states together.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionId(pub String);
+
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// What one exchange cost, whichever carrier moved it.
+///
+/// Reported rather than logged because the numbers are the point: a snapshot's
+/// wire size should be about the content in it, and an exchange that resumed
+/// should cost less than one that started over.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TransferReport {
+    /// Set when this exchange streamed a snapshot, absent for a delta.
+    pub session: Option<SessionId>,
+    /// Bytes the carrier moved, counted at the frame boundary.
+    pub bytes: u64,
+    /// Snapshot entries applied, or ops, depending on what the answer was.
+    pub entries: u64,
+    /// Content bytes those entries carried.
+    pub content_bytes: u64,
+    /// Entries an earlier, interrupted attempt had already delivered and this
+    /// one did not have to send again.
+    pub resumed_from: u64,
+    /// Connections this exchange took.
+    pub attempts: u32,
+}
+
+impl Snapshot {
+    /// This snapshot's transfer identity; see [`SessionId`].
+    pub fn session(&self) -> SessionId {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"fungos-vfs snapshot session\0");
+        for (store, hlc) in self.watermark.origins() {
+            hasher.update(store.as_bytes());
+            hasher.update(&[0]);
+            hasher.update(&hlc.ms.to_be_bytes());
+            hasher.update(&hlc.counter.to_be_bytes());
+            hasher.update(&[0xff]);
+        }
+        for entry in &self.entries {
+            hasher.update(entry.path.as_bytes());
+            hasher.update(&[0]);
+            hasher.update(&[match entry.kind {
+                SnapshotKind::File => b'f',
+                SnapshotKind::Directory => b'd',
+            }]);
+            hasher.update(
+                entry
+                    .content_id
+                    .as_ref()
+                    .map_or("", |id| id.0.as_str())
+                    .as_bytes(),
+            );
+            hasher.update(&[0]);
+            hasher.update(entry.media_type.as_deref().unwrap_or("").as_bytes());
+            hasher.update(&[0xff]);
+        }
+        SessionId(hasher.finalize().to_hex().to_string())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -252,30 +353,50 @@ pub struct SyncBatch {
 impl Vfs {
     /// Build the answer a carrier sends back: the ops the requester lacks, and
     /// the bytes they carry.
+    ///
+    /// This is the whole-message exchange, for a carrier with one pipe and no
+    /// way to resume. It materialises the answer as one value, which is why a
+    /// snapshot that goes through here is bounded by what a single message can
+    /// be; [`crate::stream`] is the framed path that does not.
     pub fn serve_sync(&mut self, request: &SyncRequest) -> Result<SyncResponse, VfsError> {
+        if request.version != MESSAGE_VERSION {
+            return Err(VfsError::Transport(format!(
+                "peer speaks sync wire version {}, this store speaks {MESSAGE_VERSION}",
+                request.version
+            )));
+        }
         let batch = self.answer_sync(&request.cursor, request.limit)?;
-        // One blob may serve several paths, and a snapshot names every path it
-        // has: sending the same bytes twice would make the answer grow with
-        // the namespace rather than with the content in it.
-        let mut wanted: BTreeSet<&ContentId> = BTreeSet::new();
-        wanted.extend(batch.ops.iter().filter_map(|op| op.content_id.as_ref()));
-        if let Some(snapshot) = &batch.snapshot {
-            wanted.extend(
-                snapshot
-                    .entries
-                    .iter()
-                    .filter_map(|entry| entry.content_id.as_ref()),
-            );
-        }
-        let mut content = Vec::new();
-        for content_id in wanted {
-            // Read by content id, not by path: the path may have moved on since
-            // the op was written, but the blob it names has not.
-            match self.content(content_id) {
-                Ok(bytes) => content.push(ContentBlob::from_bytes(content_id, &bytes)),
-                Err(_) => continue,
+        self.pack_content(batch)
+    }
+
+    /// Attach the bytes a batch names, each blob once.
+    ///
+    /// One blob may serve several paths, and a snapshot names every path it
+    /// has: sending the same bytes twice would make the answer grow with
+    /// the namespace rather than with the content in it.
+    pub(crate) fn pack_content(&self, batch: SyncBatch) -> Result<SyncResponse, VfsError> {
+        let content = {
+            let mut wanted: BTreeSet<&ContentId> = BTreeSet::new();
+            wanted.extend(batch.ops.iter().filter_map(|op| op.content_id.as_ref()));
+            if let Some(snapshot) = &batch.snapshot {
+                wanted.extend(
+                    snapshot
+                        .entries
+                        .iter()
+                        .filter_map(|entry| entry.content_id.as_ref()),
+                );
             }
-        }
+            let mut content = Vec::new();
+            for content_id in wanted {
+                // Read by content id, not by path: the path may have moved on since
+                // the op was written, but the blob it names has not.
+                match self.content(content_id) {
+                    Ok(bytes) => content.push(ContentBlob::from_bytes(content_id, &bytes)),
+                    Err(_) => continue,
+                }
+            }
+            content
+        };
         Ok(SyncResponse {
             ops: batch.ops,
             snapshot: batch.snapshot,
@@ -703,6 +824,28 @@ impl Vfs {
     ) -> Result<(), VfsError> {
         // The refusal is checked before anything is written, which is the only
         // moment at which it is still a refusal rather than a repair.
+        let mut staging = self.begin_snapshot(&snapshot.watermark)?;
+        for entry in &snapshot.entries {
+            let content = entry
+                .content_id
+                .as_ref()
+                .and_then(|id| blobs.get(&id.to_string()))
+                .map(Vec::as_slice);
+            staging.stage(self, entry, content)?;
+        }
+        staging.commit(self)
+    }
+
+    /// Decide whether a snapshot may replace this store, before any content is
+    /// written.
+    ///
+    /// A snapshot is destructive by definition — the state is made to match, so
+    /// anything not in it goes — which is why it refuses when the local log
+    /// still holds ops no peer has acknowledged. Those writes exist nowhere else
+    /// yet; dropping them would be the one failure this module cannot report
+    /// after the fact. Separated from the writes so a streaming receiver can
+    /// refuse on the header, before a single byte of content has crossed.
+    pub fn begin_snapshot(&self, watermark: &SyncCursor) -> Result<SnapshotStaging, VfsError> {
         let pending: i64 = self
             .db
             .query_row("SELECT COUNT(*) FROM sync_queue", [], |row| row.get(0))?;
@@ -711,47 +854,108 @@ impl Vfs {
                 pending: pending as usize,
             });
         }
+        Ok(SnapshotStaging {
+            watermark: watermark.clone(),
+            files: Vec::new(),
+            directories: Vec::new(),
+            content_bytes: 0,
+        })
+    }
+}
 
-        // Everything the snapshot names is verified before the namespace is
-        // touched, so a blob that is missing or does not match its id leaves the
-        // store exactly as it was rather than half replaced.
-        let mut files = Vec::new();
-        let mut directories = Vec::new();
-        for entry in &snapshot.entries {
-            let path = normalize_path(&entry.path)?;
-            match entry.kind {
-                SnapshotKind::Directory => directories.push(path),
-                SnapshotKind::File => {
-                    let content_id = entry
-                        .content_id
-                        .clone()
-                        .ok_or_else(|| VfsError::InvalidContentId(path.clone()))?;
-                    let bytes = blobs
-                        .get(&content_id.to_string())
-                        .ok_or_else(|| VfsError::NotHydrated(content_id.to_string()))?;
-                    if ContentId::from_bytes(bytes) != content_id {
-                        return Err(VfsError::InvalidContentId(content_id.to_string()));
-                    }
-                    // Content-addressed and already verified, so storing the
-                    // blob now costs nothing a later failure would have to undo.
-                    self.blobs.put(bytes)?;
-                    files.push((
-                        path,
-                        content_id,
-                        bytes.len() as i64,
-                        entry
-                            .media_type
-                            .clone()
-                            .unwrap_or_else(|| "application/octet-stream".to_string()),
-                    ));
+/// One file in a staged snapshot, with the bytes already verified.
+struct StagedFile {
+    path: String,
+    content_id: ContentId,
+    size: i64,
+    media_type: String,
+}
+
+/// A snapshot's entries, staged as they arrive and committed in one step.
+///
+/// The order matters and is the whole design. The refusal is decided before
+/// this exists, each entry is verified and its blob stored as it arrives, and
+/// the namespace is touched exactly once, at [`SnapshotStaging::commit`]. A
+/// transfer that dies part way through therefore leaves two things behind: a
+/// store whose visible state never changed, and some blobs nobody references
+/// yet. The second is free — content is addressed by hash, so writing a blob is
+/// idempotent and a blob that is never referenced is what `gc` exists for.
+///
+/// Staging also means peak memory follows one entry rather than the store: the
+/// caller hands each entry over as it learns about it and never holds the whole
+/// snapshot.
+pub struct SnapshotStaging {
+    watermark: SyncCursor,
+    files: Vec<StagedFile>,
+    directories: Vec<String>,
+    content_bytes: u64,
+}
+
+impl SnapshotStaging {
+    pub fn entries(&self) -> u64 {
+        (self.files.len() + self.directories.len()) as u64
+    }
+
+    pub fn content_bytes(&self) -> u64 {
+        self.content_bytes
+    }
+
+    /// Verify one entry and store its blob, without touching the namespace.
+    ///
+    /// `content` is `None` when the caller has no bytes for the entry, which is
+    /// an error for a file and the normal case for a directory.
+    pub fn stage(
+        &mut self,
+        vfs: &Vfs,
+        entry: &SnapshotEntry,
+        content: Option<&[u8]>,
+    ) -> Result<(), VfsError> {
+        let path = normalize_path(&entry.path)?;
+        match entry.kind {
+            // A directory has no content of its own; it is here so an empty one
+            // survives the trip.
+            SnapshotKind::Directory => self.directories.push(path),
+            SnapshotKind::File => {
+                let content_id = entry
+                    .content_id
+                    .clone()
+                    .ok_or_else(|| VfsError::InvalidContentId(path.clone()))?;
+                let bytes = content.ok_or_else(|| VfsError::NotHydrated(content_id.to_string()))?;
+                // Verified against the name it travelled under, before anything
+                // is written: a transfer that corrupts a byte is refused here
+                // rather than poisoning the store.
+                if ContentId::from_bytes(bytes) != content_id {
+                    return Err(VfsError::InvalidContentId(content_id.to_string()));
                 }
+                // Content-addressed and already verified, so storing the blob
+                // now costs nothing a later failure would have to undo.
+                vfs.blobs.put(bytes)?;
+                self.content_bytes += bytes.len() as u64;
+                self.files.push(StagedFile {
+                    path,
+                    content_id,
+                    size: bytes.len() as i64,
+                    media_type: entry
+                        .media_type
+                        .clone()
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                });
             }
         }
+        Ok(())
+    }
 
+    /// Replace the namespace, adopt the watermark, and drop what both make
+    /// redundant — in one transaction.
+    ///
+    /// One transaction is the property that survives streaming: a receiver that
+    /// staged ten thousand entries and then died has changed nothing it can
+    /// half-show, because nothing was committed until every entry had arrived.
+    pub fn commit(self, vfs: &mut Vfs) -> Result<(), VfsError> {
         let now = now_ms();
-        let tx = self.db.transaction()?;
-        let keep_files: BTreeSet<&str> = files.iter().map(|(path, ..)| path.as_str()).collect();
-        let keep_dirs: BTreeSet<&str> = directories.iter().map(String::as_str).collect();
+        let tx = vfs.db.transaction()?;
+        let keep_files: BTreeSet<&str> = self.files.iter().map(|file| file.path.as_str()).collect();
+        let keep_dirs: BTreeSet<&str> = self.directories.iter().map(String::as_str).collect();
         for path in table_paths(&tx, "files")? {
             if !keep_files.contains(path.as_str()) {
                 tx.execute("DELETE FROM files WHERE path=?1", params![path])?;
@@ -762,13 +966,19 @@ impl Vfs {
                 tx.execute("DELETE FROM directories WHERE path=?1", params![path])?;
             }
         }
-        for path in &directories {
+        for path in &self.directories {
             tx.execute(
                 "INSERT OR IGNORE INTO directories(path,created_at_ms) VALUES(?1,?2)",
                 params![path, now],
             )?;
         }
-        for (path, content_id, size, media_type) in &files {
+        for file in &self.files {
+            let StagedFile {
+                path,
+                content_id,
+                size,
+                media_type,
+            } = file;
             let existing: Option<(i64, String, String, String)> = tx
                 .query_row(
                     "SELECT version,content_id,media_type,hydration FROM files WHERE path=?1",
@@ -808,7 +1018,7 @@ impl Vfs {
         // is a duplicate, and the receipts that said so individually are now
         // redundant — keeping them would regrow the record the snapshot exists
         // to make unnecessary.
-        for (store, hlc) in snapshot.watermark.origins() {
+        for (store, hlc) in self.watermark.origins() {
             // A divergence at or below the watermark stops being a divergence
             // here: the write it deferred is the state that was just installed.
             // One above the watermark is still open, and stays above the horizon
@@ -826,7 +1036,9 @@ impl Vfs {
         tx.commit()?;
         Ok(())
     }
+}
 
+impl Vfs {
     /// Rows older than one cutoff in a log table, counted and dated per store.
     ///
     /// The table name is a compile-time constant, never user input; the cutoff
@@ -910,17 +1122,21 @@ fn table_paths(tx: &Connection, table: &str) -> Result<Vec<String>, VfsError> {
 /// structures a peer session carries, so this is one of several wires that
 /// can move them. It lives in the library rather than a binary because the
 /// shell and the VFS are two callers of the same exchange.
+///
+/// Deliberately still the whole-message format. An ssh command is one stdin and
+/// one stdout with nothing to negotiate over, so it cannot interleave frames
+/// and cannot ask a sender to continue where it left off; the price is that
+/// nothing it moves may exceed a single message. The framed format is
+/// [`crate::stream`], and the two are told apart by [`MESSAGE_VERSION`] rather
+/// than by hoping a peer notices.
 pub fn pull_over_ssh(
     vfs: &mut Vfs,
     remote: &str,
     remote_root: &str,
     remote_bin: &str,
     limit: usize,
-) -> Result<Vec<ApplyOutcome>, VfsError> {
-    let request = SyncRequest {
-        cursor: vfs.sync_cursor()?,
-        limit,
-    };
+) -> Result<(Vec<ApplyOutcome>, TransferReport), VfsError> {
+    let request = SyncRequest::new(vfs.sync_cursor()?, limit);
     let command = format!(
         "{} --root {} sync serve",
         remote_bin,
@@ -955,7 +1171,25 @@ pub fn pull_over_ssh(
     }
     let response: SyncResponse = serde_json::from_slice(&output.stdout)
         .map_err(|error| VfsError::Transport(format!("decode response: {error}")))?;
-    vfs.apply_sync(&response)
+    let report = TransferReport {
+        session: response.snapshot.as_ref().map(Snapshot::session),
+        bytes: output.stdout.len() as u64,
+        entries: response
+            .snapshot
+            .as_ref()
+            .map_or(response.ops.len() as u64, |snapshot| {
+                snapshot.entries.len() as u64
+            }),
+        content_bytes: response
+            .content
+            .iter()
+            .map(|blob| blob.data.len() as u64 / 2)
+            .sum(),
+        resumed_from: 0,
+        attempts: 1,
+    };
+    let outcomes = vfs.apply_sync(&response)?;
+    Ok((outcomes, report))
 }
 
 /// Quote one argument for the remote shell.
@@ -1020,10 +1254,7 @@ mod tests {
         a.put("notes/two.md", b"two", "text/markdown", Expect::Any)
             .unwrap();
 
-        let request = SyncRequest {
-            cursor: b.sync_cursor().unwrap(),
-            limit: 100,
-        };
+        let request = SyncRequest::new(b.sync_cursor().unwrap(), 100);
         let wire = serde_json::to_string(&request).unwrap();
         let decoded: SyncRequest = serde_json::from_str(&wire).unwrap();
 
@@ -1039,12 +1270,21 @@ mod tests {
         assert_eq!(b.get("notes/two.md").unwrap(), b"two");
 
         // The second round trip has nothing left to send.
-        let request = SyncRequest {
-            cursor: b.sync_cursor().unwrap(),
-            limit: 100,
-        };
+        let request = SyncRequest::new(b.sync_cursor().unwrap(), 100);
         let response = a.serve_sync(&request).unwrap();
         assert!(response.ops.is_empty());
+    }
+
+    #[test]
+    fn a_request_in_the_framed_version_is_refused_by_the_whole_message_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, b) = pair(dir.path());
+        // The two formats are told apart by number rather than by hoping a peer
+        // notices: a framed request is not something this path can answer.
+        let mut request = SyncRequest::new(b.sync_cursor().unwrap(), 100);
+        request.version = crate::STREAM_VERSION;
+        let error = a.serve_sync(&request).unwrap_err();
+        assert!(error.to_string().contains("wire version"), "{error}");
     }
 
     #[test]
@@ -1258,10 +1498,7 @@ mod tests {
             "a gap must be answered with state"
         );
 
-        let request = SyncRequest {
-            cursor: b.sync_cursor().unwrap(),
-            limit: 100,
-        };
+        let request = SyncRequest::new(b.sync_cursor().unwrap(), 100);
         let response = a.serve_sync(&request).unwrap();
         assert!(response.ops.is_empty());
         assert_eq!(
@@ -1324,10 +1561,7 @@ mod tests {
         wait_past(newest(&a));
         a.compact(std::time::Duration::ZERO).unwrap();
 
-        let request = SyncRequest {
-            cursor: b.sync_cursor().unwrap(),
-            limit: 100,
-        };
+        let request = SyncRequest::new(b.sync_cursor().unwrap(), 100);
         let response = a.serve_sync(&request).unwrap();
         assert!(response.snapshot.is_some());
         assert_eq!(
@@ -1344,10 +1578,7 @@ mod tests {
         // what the snapshot already carried, no duplicate writes.
         a.put("notes/three.md", b"three", "text/markdown", Expect::Any)
             .unwrap();
-        let request = SyncRequest {
-            cursor: b.sync_cursor().unwrap(),
-            limit: 100,
-        };
+        let request = SyncRequest::new(b.sync_cursor().unwrap(), 100);
         let response = a.serve_sync(&request).unwrap();
         assert!(response.snapshot.is_none(), "b is past the horizon now");
         assert_eq!(response.ops.len(), 1);

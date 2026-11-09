@@ -1,19 +1,20 @@
 //! A QUIC carrier for the sync protocol.
 //!
-//! [`crate::sync`] is transport-free on purpose: `SyncRequest` and
-//! `SyncResponse` are values, and `pull_over_ssh` is a short function that moves
-//! them. This module is a second wire for the same values, not a second
-//! protocol — the ops, the cursor, the snapshot and the divergence rules are the
-//! ones `sync` already defines.
+//! [`crate::sync`] is transport-free on purpose: what a peer needs is a value,
+//! and `pull_over_ssh` is a short function that moves it. This module is the
+//! carrier that can do better than one message in and one out — it runs [`crate::stream`]
+//! over a QUIC stream, which is the one wire here that can carry a snapshot a
+//! frame at a time and continue one that was interrupted.
 //!
 //! Three things are specific to this wire:
 //!
-//! - **Framing.** A message travels as a 4-byte big-endian length followed by
-//!   that many bytes. QUIC streams end when they end, but relying on the end to
-//!   delimit a message makes a large snapshot indistinguishable from a truncated
-//!   transfer, so the length is stated up front and a peer that announces more
-//!   than [`MAX_FRAME`] is refused rather than trusted. One stream carries one
-//!   request and one response.
+//! - **Framing.** Each frame travels as a 4-byte big-endian length followed by
+//!   that many bytes, and the frame kinds and their bodies are
+//!   [`crate::stream`]'s. Because the unit is a frame rather than a message, a
+//!   snapshot is bounded by its largest entry instead of by its total size, and
+//!   the receiver applies entries as they arrive instead of after the last one.
+//!   A peer that announces a frame above [`crate::MAX_FRAME`] is refused rather
+//!   than trusted.
 //! - **Identity.** QUIC is TLS 1.3, so the server has a certificate. There is no
 //!   CA here: the server self-signs, and the client refuses any certificate
 //!   whose fingerprint does not match one it was given out of band. The binding
@@ -24,10 +25,10 @@
 //!   reaching a peer across hosts is the overlay's job, and this carrier only
 //!   has to be correct once the address is known.
 //!
-//! The message itself is still materialised whole in memory by `serde_json`,
-//! because `SyncResponse` is one value. [`MAX_FRAME`] is the honest ceiling on
-//! that: it bounds what a single snapshot can be before the carrier refuses it,
-//! instead of discovering the limit by exhausting memory.
+//! One stream carries one exchange. A snapshot that dies with its stream can be
+//! asked for again on a new connection, continuing from the entry the receiver
+//! had reached; the session identity that makes that safe lives in
+//! [`crate::stream`], so this module only has to reconnect and try.
 
 use std::{fs, io::Write, net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
@@ -37,24 +38,23 @@ use quinn::rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
 };
-use serde::{Serialize, de::DeserializeOwned};
 
-use crate::{ApplyOutcome, SyncRequest, SyncResponse, Vfs, VfsError};
+use crate::{ApplyOutcome, PullClient, TransferReport, Vfs, VfsError, stream};
 
 /// The protocol a client and server must agree on before anything is exchanged.
 ///
 /// Named rather than empty so a future carrier change cannot be negotiated by
 /// accident: a peer speaking a different revision fails the handshake instead of
-/// deserialising something unexpected.
-const ALPN: &[u8] = b"fungos-vfs-sync/1";
+/// deserialising something unexpected. Bumped to 2 with the framed format: a
+/// peer that only knows the whole-message exchange would read a frame kind byte
+/// where it expected JSON.
+const ALPN: &[u8] = b"fungos-vfs-sync/2";
 
-/// The largest single message this carrier will send or accept.
+/// How many connections one exchange may take before it gives up.
 ///
-/// A resume-sized snapshot is megabytes; a claim of gigabytes is either a bug or
-/// an attack, and either way it is not worth allocating. Refusing above the
-/// limit fails loudly at the sender's own error path instead of at the OOM
-/// killer.
-const MAX_FRAME: usize = 64 * 1024 * 1024;
+/// Enough to ride out a peer that dropped a stream, few enough that a peer that
+/// is simply gone is reported instead of retried forever.
+const MAX_ATTEMPTS: u32 = 3;
 
 /// The name the client presents and the server ignores.
 ///
@@ -93,62 +93,6 @@ fn runtime() -> Result<tokio::runtime::Runtime, VfsError> {
         .enable_all()
         .build()
         .map_err(|error| transport("start async runtime", error))
-}
-
-/// Write one length-prefixed message and close the sending half.
-async fn write_message<T: Serialize>(
-    send: &mut quinn::SendStream,
-    value: &T,
-) -> Result<usize, VfsError> {
-    let body = serde_json::to_vec(value).map_err(|error| transport("encode message", error))?;
-    // Refused here rather than sent: a peer applies the same ceiling, so a
-    // message over it would only be refused at the far end after crossing the
-    // network.
-    let length = match u32::try_from(body.len()) {
-        Ok(length) if length as usize <= MAX_FRAME => length,
-        _ => {
-            return Err(transport(
-                "encode message",
-                format!(
-                    "{} bytes is above the {MAX_FRAME} byte frame limit",
-                    body.len()
-                ),
-            ));
-        }
-    };
-    send.write_all(&length.to_be_bytes())
-        .await
-        .map_err(|error| transport("send length", error))?;
-    send.write_all(&body)
-        .await
-        .map_err(|error| transport("send message", error))?;
-    send.finish()
-        .map_err(|error| transport("close stream", error))?;
-    Ok(body.len())
-}
-
-/// Read one length-prefixed message, returning it and how many bytes it claimed.
-async fn read_message<T: DeserializeOwned>(
-    recv: &mut quinn::RecvStream,
-) -> Result<(T, usize), VfsError> {
-    let mut prefix = [0u8; 4];
-    recv.read_exact(&mut prefix)
-        .await
-        .map_err(|error| transport("read length", error))?;
-    let length = u32::from_be_bytes(prefix) as usize;
-    if length > MAX_FRAME {
-        return Err(transport(
-            "read message",
-            format!("peer announced {length} bytes, above the {MAX_FRAME} byte frame limit"),
-        ));
-    }
-    let mut body = vec![0u8; length];
-    recv.read_exact(&mut body)
-        .await
-        .map_err(|error| transport("read message", error))?;
-    let value =
-        serde_json::from_slice(&body).map_err(|error| transport("decode message", error))?;
-    Ok((value, length))
 }
 
 /// A server's TLS identity: a certificate nobody signed, and the key for it.
@@ -358,9 +302,13 @@ async fn serve_session(endpoint: &quinn::Endpoint, vfs: &mut Vfs) -> Result<usiz
             Err(quinn::ConnectionError::ApplicationClosed(_)) => break,
             Err(error) => return Err(transport("accept stream", error)),
         };
-        let (request, _) = read_message::<SyncRequest>(&mut recv).await?;
-        let response = vfs.serve_sync(&request)?;
-        write_message(&mut send, &response).await?;
+        // One stream is one exchange, and the exchange decides its own frames:
+        // a delta is one frame, a snapshot is a header, an entry per path and an
+        // end marker. A stream that dies mid-snapshot leaves the receiver's
+        // store untouched — nothing is committed until the end marker — so the
+        // answer to a torn stream is a new one, not a repair.
+        stream::serve(vfs, &mut recv, &mut send, stream::MAX_FRAME).await?;
+        let _ = send.finish();
         answered += 1;
     }
     connection.close(0u32.into(), b"done");
@@ -476,70 +424,91 @@ fn client_endpoint(addr: SocketAddr, pin: &str) -> Result<quinn::Endpoint, VfsEr
 /// Ask a peer over QUIC and apply the answer.
 ///
 /// The second wire for the exchange [`crate::pull_over_ssh`] carries: the same
-/// request built from the same cursor, the same response applied by the same
-/// `apply_sync`. The differences are the address (numeric `host:port`) and that
-/// the peer must present the certificate whose fingerprint the caller pins.
+/// cursor, the same delta rules, the same snapshot applied by the same staging
+/// code. The differences are the address (numeric `host:port`), that the peer
+/// must present the certificate whose fingerprint the caller pins, and that a
+/// snapshot arrives a frame at a time and can be continued after a tear.
 pub fn pull_over_quic(
     vfs: &mut Vfs,
     addr: &str,
     fingerprint: &str,
     limit: usize,
-) -> Result<Vec<ApplyOutcome>, VfsError> {
-    let (outcomes, _) = pull(vfs, addr, fingerprint, limit)?;
-    Ok(outcomes)
+) -> Result<(Vec<ApplyOutcome>, TransferReport), VfsError> {
+    pull(
+        vfs,
+        addr,
+        fingerprint,
+        limit,
+        stream::MAX_FRAME,
+        MAX_ATTEMPTS,
+    )
 }
 
-/// The whole exchange, also reporting how many bytes came back.
+/// The whole exchange, also reporting what it cost.
 ///
-/// The size is what the framing actually had to move, which is the number worth
-/// knowing when a snapshot is unexpectedly large.
+/// An attempt that fails on the carrier while a snapshot is in flight is retried
+/// on a fresh connection from the point the receiver reached. Anything else — a
+/// refusal, a store that has nothing to give — is reported once, because trying
+/// again would only fail the same way.
 fn pull(
     vfs: &mut Vfs,
     addr: &str,
     expected: &str,
     limit: usize,
-) -> Result<(Vec<ApplyOutcome>, usize), VfsError> {
+    max_frame: usize,
+    max_attempts: u32,
+) -> Result<(Vec<ApplyOutcome>, TransferReport), VfsError> {
     let target: SocketAddr = addr
         .parse()
         .map_err(|error| transport("connect", format!("{addr} is not host:port: {error}")))?;
-    let request = SyncRequest {
-        cursor: vfs.sync_cursor()?,
-        limit,
-    };
     let runtime = runtime()?;
-    let (response, size) = runtime.block_on(async {
-        let session = async {
-            let endpoint = client_endpoint(target, expected)?;
-            let connection = endpoint
-                .connect(target, SERVER_NAME)
-                .map_err(|error| transport("connect", error))?
-                .await
-                .map_err(|error| transport("handshake", error))?;
-            let (mut send, mut recv) = connection
-                .open_bi()
-                .await
-                .map_err(|error| transport("open stream", error))?;
-            write_message(&mut send, &request).await?;
-            let (response, size) = read_message::<SyncResponse>(&mut recv).await?;
-            connection.close(0u32.into(), b"done");
-            endpoint.wait_idle().await;
-            Ok::<_, VfsError>((response, size))
-        };
-        match tokio::time::timeout(SESSION_TIMEOUT, session).await {
-            Ok(result) => result,
-            Err(_) => Err(transport(
-                "sync",
-                format!("no answer within {}s", SESSION_TIMEOUT.as_secs()),
-            )),
+    let mut client = PullClient::new(vfs.sync_cursor()?, limit);
+    let mut failure = None;
+    for _ in 0..max_attempts {
+        let result = runtime.block_on(async {
+            let session = async {
+                let endpoint = client_endpoint(target, expected)?;
+                let connection = endpoint
+                    .connect(target, SERVER_NAME)
+                    .map_err(|error| transport("connect", error))?
+                    .await
+                    .map_err(|error| transport("handshake", error))?;
+                let (mut send, mut recv) = connection
+                    .open_bi()
+                    .await
+                    .map_err(|error| transport("open stream", error))?;
+                let outcomes = client.attempt(vfs, &mut recv, &mut send, max_frame).await?;
+                let _ = send.finish();
+                connection.close(0u32.into(), b"done");
+                endpoint.wait_idle().await;
+                Ok::<_, VfsError>(outcomes)
+            };
+            match tokio::time::timeout(SESSION_TIMEOUT, session).await {
+                Ok(result) => result,
+                Err(_) => Err(transport(
+                    "sync",
+                    format!("no answer within {}s", SESSION_TIMEOUT.as_secs()),
+                )),
+            }
+        });
+        match result {
+            Ok(outcomes) => return Ok((outcomes, client.report())),
+            Err(error @ VfsError::Transport(_)) if client.resume().is_some() => {
+                // The receiver still holds what it staged and the entry it
+                // reached, so the next connection asks to continue rather than
+                // asking for the store again.
+                failure = Some(error);
+            }
+            Err(error) => return Err(error),
         }
-    })?;
-    let outcomes = vfs.apply_sync(&response)?;
-    Ok((outcomes, size))
+    }
+    Err(failure.unwrap_or_else(|| transport("sync", "no attempt was made")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream::Cut;
     use crate::{Expect, Hlc, NodeRole, Vfs};
     use std::{path::Path, thread};
 
@@ -635,13 +604,17 @@ mod tests {
         // Two sessions: one to catch up, one to show there is nothing left.
         let peer = Peer::start(SyncServer::bind(LOOPBACK).unwrap(), a, 2);
 
-        let outcomes = pull_over_quic(&mut b, &peer.endpoint(), &peer.fingerprint, 100).unwrap();
+        let (outcomes, report) =
+            pull_over_quic(&mut b, &peer.endpoint(), &peer.fingerprint, 100).unwrap();
         assert_eq!(outcomes, vec![ApplyOutcome::Applied; 2]);
+        assert_eq!(report.entries, 2);
+        assert!(report.session.is_none(), "a delta is not a session");
         assert_eq!(b.get("notes/one.md").unwrap(), b"one");
         assert_eq!(b.get("notes/two.md").unwrap(), b"two");
 
         // The second round trip has nothing left to send.
-        let outcomes = pull_over_quic(&mut b, &peer.endpoint(), &peer.fingerprint, 100).unwrap();
+        let (outcomes, _) =
+            pull_over_quic(&mut b, &peer.endpoint(), &peer.fingerprint, 100).unwrap();
         assert!(outcomes.is_empty(), "{outcomes:?}");
 
         assert!(peer.join().is_empty());
@@ -671,13 +644,17 @@ mod tests {
 
         // b sees one write, so its cursor is a real reading that the compaction
         // can leave behind — an empty cursor was simply never caught up.
-        let outcomes = pull_over_quic(&mut b, &peer.endpoint(), &peer.fingerprint, 100).unwrap();
+        let (outcomes, _) =
+            pull_over_quic(&mut b, &peer.endpoint(), &peer.fingerprint, 100).unwrap();
         assert_eq!(outcomes, vec![ApplyOutcome::Applied]);
 
         // The delta b would get starts after the hole and looks complete, so it
         // is told the log cannot reach it and handed the state instead.
-        let outcomes = pull_over_quic(&mut b, &peer.endpoint(), &peer.fingerprint, 100).unwrap();
+        let (outcomes, report) =
+            pull_over_quic(&mut b, &peer.endpoint(), &peer.fingerprint, 100).unwrap();
         assert_eq!(outcomes, vec![ApplyOutcome::Snapshot]);
+        assert!(report.session.is_some(), "a snapshot names its session");
+        assert_eq!(report.entries, 2);
         assert_eq!(
             b.get("notes/one.md").unwrap(),
             b"one",
@@ -720,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn a_large_snapshot_crosses_the_stream_intact() {
+    fn a_snapshot_far_bigger_than_one_frame_crosses_the_stream_intact() {
         let dir = tempfile::tempdir().unwrap();
         let (mut a, mut b) = pair(dir.path());
         a.put("seed.md", b"seed", "text/markdown", Expect::Any)
@@ -728,6 +705,10 @@ mod tests {
 
         const FILES: usize = 24;
         const SIZE: usize = 256 * 1024;
+        // One entry has to fit in a frame; the store does not. The constant is
+        // reduced here rather than sending 65 MiB, and it is the frame limit
+        // being respected per frame that the test is about.
+        const FRAME: usize = 512 * 1024;
 
         let peer = Peer::start_with(
             SyncServer::bind(LOOPBACK).unwrap(),
@@ -757,18 +738,27 @@ mod tests {
         );
 
         // b learns the seed first, so the compaction can leave it behind.
-        let outcomes = pull_over_quic(&mut b, &peer.endpoint(), &peer.fingerprint, 100).unwrap();
+        let (outcomes, _) =
+            pull_over_quic(&mut b, &peer.endpoint(), &peer.fingerprint, 100).unwrap();
         assert_eq!(outcomes, vec![ApplyOutcome::Applied]);
 
-        let (outcomes, size) = pull(&mut b, &peer.endpoint(), &peer.fingerprint, 100).unwrap();
+        let (outcomes, report) = pull(
+            &mut b,
+            &peer.endpoint(),
+            &peer.fingerprint,
+            100,
+            FRAME,
+            MAX_ATTEMPTS,
+        )
+        .unwrap();
         assert_eq!(outcomes, vec![ApplyOutcome::Snapshot]);
-        // What the length prefix is for: this is a single message of several
-        // megabytes, and it was neither delimited by the connection ending nor
-        // buffered whole on the way in.
         assert!(
-            size > 8 * 1024 * 1024,
-            "a {size} byte answer does not prove the framing carries megabytes"
+            report.bytes > 8 * FRAME as u64,
+            "a {} byte answer does not prove the cap is per frame",
+            report.bytes
         );
+        // The seed is in the snapshot too, so it is part of the payload.
+        assert_eq!(report.content_bytes, (FILES * SIZE + b"seed".len()) as u64);
 
         for index in 0..FILES {
             let mut expected = vec![b'a'; SIZE];
@@ -782,5 +772,125 @@ mod tests {
         assert_eq!(b.get("seed.md").unwrap(), b"seed");
 
         assert!(peer.join().is_empty());
+    }
+
+    #[test]
+    fn an_interrupted_snapshot_resumes_on_a_second_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, mut b) = pair(dir.path());
+        a.put("seed.md", b"seed", "text/markdown", Expect::Any)
+            .unwrap();
+
+        const FILES: usize = 12;
+        const SIZE: usize = 64 * 1024;
+        const FRAME: usize = 128 * 1024;
+        // Three connections: the seed delta, the one that is cut, and the one
+        // that resumes.
+        let peer = Peer::start_with(
+            SyncServer::bind(LOOPBACK).unwrap(),
+            a,
+            3,
+            |completed, store| {
+                if completed != 1 {
+                    return;
+                }
+                for index in 0..FILES {
+                    let mut bytes = vec![b'a'; SIZE];
+                    bytes[0] = index as u8;
+                    store
+                        .put(
+                            &format!("bulk/{index}.bin"),
+                            &bytes,
+                            "application/octet-stream",
+                            Expect::Any,
+                        )
+                        .unwrap();
+                }
+                wait_past(newest(store));
+                store.compact(Duration::ZERO).unwrap();
+            },
+        );
+
+        let (outcomes, _) =
+            pull_over_quic(&mut b, &peer.endpoint(), &peer.fingerprint, 100).unwrap();
+        assert_eq!(outcomes, vec![ApplyOutcome::Applied]);
+        let before = serde_json::to_string(&b.list("").unwrap()).unwrap();
+
+        let target: SocketAddr = peer.endpoint().parse().unwrap();
+        let runtime = runtime().unwrap();
+        let mut client = PullClient::new(b.sync_cursor().unwrap(), 100);
+
+        // The first attempt is cut three and a half entries in.
+        let error = runtime
+            .block_on(async {
+                let endpoint = client_endpoint(target, &peer.fingerprint)?;
+                let connection = endpoint
+                    .connect(target, SERVER_NAME)
+                    .map_err(|error| transport("connect", error))?
+                    .await
+                    .map_err(|error| transport("handshake", error))?;
+                let (mut send, recv) = connection
+                    .open_bi()
+                    .await
+                    .map_err(|error| transport("open stream", error))?;
+                let mut cut = Cut::new(recv, FRAME + 3 * FRAME + FRAME / 2);
+                let result = client.attempt(&mut b, &mut cut, &mut send, FRAME).await;
+                // A cut is not a polite close: dropping the connection is what
+                // makes the sender see a stream that ended without a request to
+                // end it.
+                connection.close(0u32.into(), b"cut");
+                result
+            })
+            .unwrap_err();
+        assert!(matches!(error, VfsError::Transport(_)), "{error:?}");
+        assert_eq!(
+            serde_json::to_string(&b.list("").unwrap()).unwrap(),
+            before,
+            "a torn transfer changed the namespace"
+        );
+        let staged = client
+            .resume()
+            .expect("a snapshot in flight has a resume point")
+            .from;
+        assert!(staged > 0 && staged < FILES as u64 + 1, "{staged}");
+
+        let outcomes = runtime
+            .block_on(async {
+                let endpoint = client_endpoint(target, &peer.fingerprint)?;
+                let connection = endpoint
+                    .connect(target, SERVER_NAME)
+                    .map_err(|error| transport("connect", error))?
+                    .await
+                    .map_err(|error| transport("handshake", error))?;
+                let (mut send, mut recv) = connection
+                    .open_bi()
+                    .await
+                    .map_err(|error| transport("open stream", error))?;
+                let outcomes = client.attempt(&mut b, &mut recv, &mut send, FRAME).await?;
+                let _ = send.finish();
+                connection.close(0u32.into(), b"done");
+                endpoint.wait_idle().await;
+                Ok::<_, VfsError>(outcomes)
+            })
+            .unwrap();
+        assert_eq!(outcomes, vec![ApplyOutcome::Snapshot]);
+        let report = client.report();
+        assert_eq!(report.attempts, 2);
+        assert_eq!(report.resumed_from, staged);
+        for index in 0..FILES {
+            let mut expected = vec![b'a'; SIZE];
+            expected[0] = index as u8;
+            assert_eq!(
+                b.get(&format!("bulk/{index}.bin")).unwrap(),
+                expected,
+                "file {index} did not arrive intact"
+            );
+        }
+
+        // A cut may surface as a failed session, or be absorbed by the send
+        // window before the sender notices; either way the server survived it,
+        // and the next connection was served.
+        let failures = peer.join();
+        assert!(failures.len() <= 1, "{failures:?}");
     }
 }
