@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -7,7 +8,10 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{ContentId, normalize_path, store::BlobStore};
+use crate::{
+    ContentId, normalize_path,
+    store::{ContentStore, default_data_dir},
+};
 
 #[derive(Debug, Error)]
 pub enum VfsError {
@@ -48,6 +52,8 @@ pub enum VfsError {
     /// [`Self::Transport`]: nothing was attempted on the wire.
     #[error("configuration error: {0}")]
     Config(String),
+    #[error("no data directory: set FUNGOS_VFS_CAS or XDG_DATA_HOME")]
+    NoDataDirectory,
     #[error("transport error: {0}")]
     Transport(String),
     #[error("corrupt store metadata: {key} = {value}")]
@@ -321,11 +327,151 @@ struct Stamp {
     hlc: Hlc,
 }
 
+/// The directory that holds one root's own state.
+///
+/// `.fungos` was the old name: it described a product rather than the contents,
+/// and it held the content too. A root now keeps only its namespace, op log,
+/// versions, cursor, horizon and diverged records here — the bytes live in the
+/// machine's shared store. Roots an older build wrote keep the old name until
+/// [`migrate_storage_with_cas`] retires it.
+pub const STATE_DIR: &str = ".vfs-state";
+/// The legacy state directory, readable until a root is migrated.
+pub const LEGACY_STATE_DIR: &str = ".fungos";
+const NAMESPACE_DB: &str = "vfs.sqlite3";
+const OBJECTS_DIR: &str = "objects";
+
+/// Where one root's state lives, before anything is created.
+#[derive(Clone, Debug)]
+struct StateLayout {
+    root: PathBuf,
+}
+
+impl StateLayout {
+    fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// The directory holding this root's state.
+    ///
+    /// The current name wins when it exists; a root an older build wrote keeps
+    /// using the legacy name, so nothing has to be renamed before a migration
+    /// runs. Only a root with neither gets a directory created, and it gets the
+    /// current name.
+    fn state_dir(&self) -> PathBuf {
+        let current = self.root.join(STATE_DIR);
+        if current.exists() {
+            return current;
+        }
+        let legacy = self.root.join(LEGACY_STATE_DIR);
+        if legacy.exists() {
+            return legacy;
+        }
+        current
+    }
+
+    fn db_path(&self) -> PathBuf {
+        self.state_dir().join(NAMESPACE_DB)
+    }
+
+    /// The root's own object directory, if an older layout left one behind.
+    fn legacy_objects(&self) -> Option<PathBuf> {
+        let objects = self.root.join(LEGACY_STATE_DIR).join(OBJECTS_DIR);
+        objects.is_dir().then_some(objects)
+    }
+
+    /// Rename the legacy state directory to the current name, and retire the
+    /// object directory that used to live inside it.
+    ///
+    /// Must run with no store open on this root: renaming a directory out from
+    /// under an open SQLite connection leaves it writing WAL files next to a
+    /// path that no longer names its database.
+    fn retire_legacy_state_dir(&self) -> Result<bool, VfsError> {
+        let legacy = self.root.join(LEGACY_STATE_DIR);
+        let current = self.root.join(STATE_DIR);
+        if !legacy.is_dir() {
+            return Ok(false);
+        }
+        if current.exists() {
+            return Err(VfsError::InvalidPath(format!(
+                "both {} and {} exist; refusing to guess which holds this root's namespace",
+                legacy.display(),
+                current.display()
+            )));
+        }
+        // The per-root object directory goes with the migration. It is removed
+        // when empty; a file that is not an object stays visible in the renamed
+        // directory rather than disappearing here.
+        let objects = legacy.join(OBJECTS_DIR);
+        if objects.is_dir() {
+            let _ = std::fs::remove_dir(&objects);
+        }
+        std::fs::rename(&legacy, &current)?;
+        Ok(true)
+    }
+}
+
+/// What moving a root onto the shared content store did.
+#[derive(Clone, Debug, Serialize)]
+pub struct StorageMigration {
+    /// The shared store the root now reads content from.
+    pub content_store: String,
+    /// The root's state directory, after the rename.
+    pub state_dir: String,
+    /// Objects written into the shared store.
+    pub moved: usize,
+    /// Objects the shared store already had, which therefore cost nothing.
+    pub already_shared: usize,
+    /// Files left in the legacy object directory because they are not objects.
+    pub left_behind: usize,
+    /// Whether `.fungos` was renamed to `.vfs-state`.
+    pub renamed: bool,
+}
+
+/// Move a root onto the machine's shared content store.
+///
+/// A root that has never been migrated still works: reads fall back to its legacy
+/// object directory. This is what stops that, moving the blobs into the shared
+/// store and retiring `.fungos`. Running it twice moves nothing the second time.
+pub fn migrate_storage(root: impl AsRef<Path>) -> Result<StorageMigration, VfsError> {
+    migrate_storage_with_cas(root.as_ref(), None)
+}
+
+/// [`migrate_storage`] against an explicit content store instead of the
+/// machine's default one.
+pub fn migrate_storage_with_cas(
+    root: &Path,
+    cas: Option<&Path>,
+) -> Result<StorageMigration, VfsError> {
+    if !root.is_dir() {
+        return Err(VfsError::NotFound(root.display().to_string()));
+    }
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let layout = StateLayout::new(&root);
+    let data = match cas {
+        Some(dir) => dir.to_path_buf(),
+        None => default_data_dir()?,
+    };
+    let store = ContentStore::open(&data, layout.legacy_objects())?;
+    // Registered before the objects move: the moment content starts living in the
+    // shared store, a collection has to know this root names it.
+    store.register_root(&root)?;
+    let moved = store.migrate_legacy()?;
+    let renamed = layout.retire_legacy_state_dir()?;
+    Ok(StorageMigration {
+        content_store: store.data_dir().display().to_string(),
+        state_dir: layout.state_dir().display().to_string(),
+        moved: moved.moved,
+        already_shared: moved.already_shared,
+        left_behind: moved.left_behind,
+        renamed,
+    })
+}
+
 pub struct Vfs {
     root: PathBuf,
     role: NodeRole,
     pub(crate) db: Connection,
-    pub(crate) blobs: BlobStore,
+    pub(crate) blobs: ContentStore,
     writer: Writer,
     hlc: Hlc,
     /// The worktree this store's writes belong to, when it serves one.
@@ -352,10 +498,27 @@ impl Vfs {
     }
 
     pub fn open_with_role(root: impl AsRef<Path>, role: NodeRole) -> Result<Self, VfsError> {
+        Self::open_with(root, role, None)
+    }
+
+    /// Open a root against an explicit content store instead of the machine's
+    /// default one. `None` means the shared store every other root on this
+    /// machine uses; tests and services that own their own data directory pass
+    /// one.
+    pub fn open_with(
+        root: impl AsRef<Path>,
+        role: NodeRole,
+        cas: Option<&Path>,
+    ) -> Result<Self, VfsError> {
         let root = root.as_ref().to_path_buf();
-        std::fs::create_dir_all(root.join(".fungos"))?;
-        let blobs = BlobStore::open(root.join(".fungos/objects"))?;
-        let db = Connection::open(root.join(".fungos/vfs.sqlite3"))?;
+        let layout = StateLayout::new(&root);
+        std::fs::create_dir_all(layout.state_dir())?;
+        let data = match cas {
+            Some(dir) => dir.to_path_buf(),
+            None => default_data_dir()?,
+        };
+        let blobs = ContentStore::open(data, layout.legacy_objects())?;
+        let db = Connection::open(layout.db_path())?;
         let vfs = Self {
             root,
             role,
@@ -370,6 +533,11 @@ impl Vfs {
         let mut vfs = vfs;
         vfs.migrate()?;
         vfs.store = vfs.ensure_store_id()?;
+        // The content this root names is shared with every other root on the
+        // machine, so the machine has to know this root exists: `gc` collects
+        // across the roots that registered, and a root nobody listed is a root
+        // whose content would be deleted.
+        vfs.blobs.register_root(&vfs.canonical_root())?;
         vfs.hlc = vfs.stored_hlc()?;
         vfs.hlc.observe(now_ms());
         vfs.generation = vfs.stored_generation()?;
@@ -614,6 +782,13 @@ impl Vfs {
                path TEXT PRIMARY KEY,
                owner TEXT NOT NULL,
                expires_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS exports(
+               content_id TEXT NOT NULL,
+               path TEXT NOT NULL,
+               destination TEXT NOT NULL,
+               recorded_at_ms INTEGER NOT NULL,
+               PRIMARY KEY(content_id, destination)
              );",
         )?;
         self.db.execute(
@@ -672,9 +847,15 @@ impl Vfs {
         Ok(())
     }
 
+    /// This root's path with symlinks and relative components resolved, so that
+    /// two processes naming one root agree on its identity.
+    fn canonical_root(&self) -> PathBuf {
+        std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone())
+    }
+
     /// This store's identity: generated once, then read back.
     fn ensure_store_id(&self) -> Result<String, VfsError> {
-        let canonical = std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
+        let canonical = self.canonical_root();
         let digest = blake3::hash(canonical.to_string_lossy().as_bytes()).to_hex();
         self.db.execute(
             "INSERT OR IGNORE INTO meta(key,value) VALUES('store_id',?1)",
@@ -1151,6 +1332,32 @@ impl Vfs {
         Ok(())
     }
 
+    /// Record that what is under `prefix` was published to `destination`.
+    ///
+    /// An export is a promise that this content exists somewhere outside the
+    /// namespace — a release directory, a tarball, a build artifact. Those
+    /// content ids stay reachable for `gc` even after the namespace moves on,
+    /// because a collection that deletes what a release was built from leaves the
+    /// release pointing at nothing. Returns the number of entries recorded.
+    pub fn record_export(&self, prefix: &str, destination: &Path) -> Result<usize, VfsError> {
+        let destination = destination.to_string_lossy().to_string();
+        let now = now_ms();
+        let mut recorded = 0;
+        for entry in self.list(prefix)? {
+            if entry.hydration != Hydration::Present {
+                continue;
+            }
+            recorded += self.db.execute(
+                "INSERT INTO exports(content_id,path,destination,recorded_at_ms)
+                 VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(content_id,destination) DO UPDATE SET path=excluded.path,
+                   recorded_at_ms=excluded.recorded_at_ms",
+                params![entry.content_id.to_string(), entry.path, destination, now],
+            )?;
+        }
+        Ok(recorded)
+    }
+
     pub fn lease(&self, path: &str, owner: &str, ttl_ms: u64) -> Result<Lease, VfsError> {
         let path = normalize_path(path)?;
         let now = now_ms();
@@ -1387,6 +1594,12 @@ impl Vfs {
     }
 
     /// Evict oldest unpinned, unleased present files until the cache fits.
+    ///
+    /// The bytes are not deleted: they are shared with every other root on the
+    /// machine, so one root dropping its copy cannot speak for the rest. An
+    /// eviction drops this root's claim on the content — the entry becomes a
+    /// placeholder and stops counting against the cache — and [`Vfs::gc`]
+    /// collects what nothing on the machine names any more.
     pub fn evict_to(&mut self, max_bytes: u64) -> Result<usize, VfsError> {
         let now = now_ms();
         let mut total = self.cache_bytes()?;
@@ -1410,7 +1623,6 @@ impl Vfs {
             let entry = self
                 .file(&path)?
                 .ok_or_else(|| VfsError::NotFound(path.clone()))?;
-            self.blobs.remove(&entry.content_id)?;
             self.db.execute(
                 "UPDATE files SET hydration='placeholder' WHERE path=?1",
                 params![path],
@@ -1421,17 +1633,84 @@ impl Vfs {
         Ok(evicted)
     }
 
+    /// Collect shared content no root on this machine names any more.
+    ///
+    /// The reachable set is machine-wide, because the store is: this root's
+    /// namespace, history, pins and exports, plus the same for every root
+    /// registered with the store. Collecting against one root's namespace would
+    /// delete content every other root points at, which is the shape of data loss
+    /// a shared store makes possible.
+    ///
+    /// A root that no longer exists is stale: its marker is dropped, and the
+    /// content it used to name is nobody's. A root that exists but cannot be read
+    /// is an error rather than a skip — guessing that it names nothing would
+    /// delete content the guess was wrong about.
     pub fn gc(&self) -> Result<usize, VfsError> {
-        let mut statement = self.db.prepare(
-            "SELECT content_id FROM files WHERE hydration='present'
-             UNION SELECT content_id FROM versions",
-        )?;
-        let ids = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        let ids: Vec<ContentId> = ids.into_iter().map(ContentId).collect();
-        self.blobs.gc(ids.iter())
+        let own = self.canonical_root();
+        let mut reachable = reachable_in(&self.db)?;
+        for root in self.blobs.registered_roots()? {
+            if root == own {
+                continue;
+            }
+            match reachable_at(&root)? {
+                Some(ids) => reachable.extend(ids),
+                None => self.blobs.forget_root(&root)?,
+            }
+        }
+        let reachable: Vec<ContentId> = reachable.into_iter().collect();
+        self.blobs.gc(reachable.iter())
     }
+}
+
+/// Content a root's state says must survive collection: what its namespace names
+/// now, what it pinned, what it has ever named, and what it published as an
+/// artifact.
+fn reachable_in(db: &Connection) -> Result<BTreeSet<ContentId>, VfsError> {
+    let mut reachable = BTreeSet::new();
+    let mut statement = db.prepare(
+        "SELECT content_id FROM files WHERE hydration='present'
+         UNION SELECT content_id FROM files WHERE pinned=1
+         UNION SELECT content_id FROM versions",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        reachable.insert(ContentId(row?));
+    }
+    // A store written before exports existed simply has a smaller reachable set.
+    if table_exists(db, "exports")? {
+        let mut statement = db.prepare("SELECT content_id FROM exports")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            reachable.insert(ContentId(row?));
+        }
+    }
+    Ok(reachable)
+}
+
+fn table_exists(db: &Connection, table: &str) -> Result<bool, VfsError> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        params![table],
+        |row| row.get(0),
+    )?)
+}
+
+/// Another root's reachable set, read without taking its namespace over.
+///
+/// `None` means the root is gone, which is what a stale registration looks like.
+fn reachable_at(root: &Path) -> Result<Option<BTreeSet<ContentId>>, VfsError> {
+    if !root.is_dir() {
+        return Ok(None);
+    }
+    let db_path = StateLayout::new(root).db_path();
+    if !db_path.is_file() {
+        return Ok(None);
+    }
+    let db = Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    reachable_in(&db).map(Some)
 }
 
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileEntry> {
@@ -1479,7 +1758,7 @@ pub(crate) fn now_ms() -> i64 {
 /// not fall below is moved instead.
 #[cfg(test)]
 pub(crate) fn set_stored_hlc(root: &Path, hlc: Hlc) {
-    let db = Connection::open(root.join(".fungos/vfs.sqlite3")).unwrap();
+    let db = Connection::open(StateLayout::new(root).db_path()).unwrap();
     for (key, value) in [
         ("hlc_ms", hlc.ms.to_string()),
         ("hlc_counter", hlc.counter.to_string()),
@@ -1495,12 +1774,79 @@ pub(crate) fn set_stored_hlc(root: &Path, hlc: Hlc) {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
+    /// A root on a machine whose content store this test owns.
+    ///
+    /// Tests pass the store explicitly rather than using the machine's real one:
+    /// a test that collected against the store a developer's worktrees share
+    /// would delete their content.
     fn workspace() -> (tempfile::TempDir, Vfs) {
         let temp = tempfile::tempdir().unwrap();
-        let vfs = Vfs::open(temp.path()).unwrap();
+        let cas = temp.path().join("cas");
+        let vfs = Vfs::open_with(temp.path().join("root"), NodeRole::Full, Some(&cas)).unwrap();
         (temp, vfs)
+    }
+
+    /// Every object file in a content store.
+    fn object_files(cas: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        let Ok(shards) = fs::read_dir(cas.join("objects")) else {
+            return files;
+        };
+        for shard in shards {
+            let shard = shard.unwrap();
+            if !shard.file_type().unwrap().is_dir() {
+                continue;
+            }
+            for entry in fs::read_dir(shard.path()).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_file() {
+                    files.push(entry.path());
+                }
+            }
+        }
+        files
+    }
+
+    /// Bytes the content store holds, which is what sharing has to reduce.
+    fn object_bytes(cas: &Path) -> u64 {
+        object_files(cas)
+            .iter()
+            .map(|path| fs::metadata(path).unwrap().len())
+            .sum()
+    }
+
+    /// Write `bytes` into an object file the way the store files them.
+    fn write_object(cas: &Path, id: &ContentId, bytes: &[u8]) -> PathBuf {
+        let hex = id.hex();
+        let path = cas.join("objects").join(&hex[..2]).join(hex);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    /// Build a root the way the layout that kept a store per checkout left it:
+    /// state in `.fungos`, bytes in `.fungos/objects` rather than shared.
+    fn make_legacy_root(root: &Path, name: &str, bytes: &[u8], staging: &Path) -> ContentId {
+        let mut vfs = Vfs::open_with(root, NodeRole::Full, Some(staging)).unwrap();
+        let entry = vfs
+            .put(name, bytes, "application/octet-stream", Expect::Any)
+            .unwrap();
+        drop(vfs);
+        fs::rename(root.join(STATE_DIR), root.join(LEGACY_STATE_DIR)).unwrap();
+        let hex = entry.content_id.hex();
+        let from = staging.join("objects").join(&hex[..2]).join(hex);
+        let to = root
+            .join(LEGACY_STATE_DIR)
+            .join(OBJECTS_DIR)
+            .join(&hex[..2])
+            .join(hex);
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        fs::rename(from, to).unwrap();
+        entry.content_id
     }
 
     #[test]
@@ -1649,14 +1995,16 @@ mod tests {
 
     /// Attribution arrived after the first stores existed. An older database
     /// must open, gain the columns, and keep its rows — marked honestly rather
-    /// than backfilled with a guess.
+    /// than backfilled with a guess. It also uses the legacy `.fungos` name, so
+    /// this is the path a root that has not been migrated takes.
     #[test]
     fn a_store_from_before_attribution_upgrades_in_place() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        std::fs::create_dir_all(root.join(".fungos")).unwrap();
+        let root = temp.path().join("root");
+        let cas = temp.path().join("cas");
+        std::fs::create_dir_all(root.join(LEGACY_STATE_DIR)).unwrap();
         {
-            let db = Connection::open(root.join(".fungos/vfs.sqlite3")).unwrap();
+            let db = Connection::open(root.join(LEGACY_STATE_DIR).join(NAMESPACE_DB)).unwrap();
             db.execute_batch(
                 "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
                  INSERT INTO meta VALUES('role','full');
@@ -1674,7 +2022,7 @@ mod tests {
             .unwrap();
         }
 
-        let vfs = Vfs::open(root).unwrap();
+        let vfs = Vfs::open_with(&root, NodeRole::Full, Some(&cas)).unwrap();
         let history = vfs.history("a.txt").unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].size, 7);
@@ -1690,8 +2038,7 @@ mod tests {
 
     #[test]
     fn rename_preserves_identity_and_history() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut vfs = Vfs::open(temp.path()).unwrap();
+        let (_temp, mut vfs) = workspace();
         let entry = vfs
             .put("a.txt", b"same bytes", "text/plain", Expect::Any)
             .unwrap();
@@ -1724,7 +2071,9 @@ mod tests {
     #[test]
     fn cache_node_hydrates_and_evicts_without_writing() {
         let temp = tempfile::tempdir().unwrap();
-        let mut full = Vfs::open(temp.path().join("node")).unwrap();
+        let cas = temp.path().join("cas");
+        let mut full =
+            Vfs::open_with(temp.path().join("node"), NodeRole::Full, Some(&cas)).unwrap();
         full.put(
             "big.bin",
             &[7u8; 4096],
@@ -1734,7 +2083,8 @@ mod tests {
         .unwrap();
         let entry = full.file("big.bin").unwrap().unwrap();
 
-        let mut cache = Vfs::open_with_role(temp.path().join("cache"), NodeRole::Cache).unwrap();
+        let mut cache =
+            Vfs::open_with(temp.path().join("cache"), NodeRole::Cache, Some(&cas)).unwrap();
         cache
             .register_placeholder(
                 "big.bin",
@@ -1848,9 +2198,10 @@ mod tests {
     #[test]
     fn a_restart_with_a_clock_that_stepped_back_still_stamps_above_the_last_write() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
+        let root = temp.path().join("root");
+        let cas = temp.path().join("cas");
 
-        let mut a = Vfs::open(root).unwrap();
+        let mut a = Vfs::open_with(&root, NodeRole::Full, Some(&cas)).unwrap();
         a.put("one.md", b"one", "text/markdown", Expect::Any)
             .unwrap();
         let first = a.pending(10).unwrap().last().unwrap().hlc;
@@ -1862,9 +2213,9 @@ mod tests {
             ms: first.ms + 3_600_000,
             counter: 0,
         };
-        set_stored_hlc(root, ahead);
+        set_stored_hlc(&root, ahead);
 
-        let mut a = Vfs::open(root).unwrap();
+        let mut a = Vfs::open_with(&root, NodeRole::Full, Some(&cas)).unwrap();
         a.put("two.md", b"two", "text/markdown", Expect::Any)
             .unwrap();
         let second = a.pending(10).unwrap().last().unwrap().hlc;
@@ -1873,7 +2224,7 @@ mod tests {
 
         // A peer sees two writes, not a write and a duplicate: a clock that
         // restarted at zero would have made the second sort under the first.
-        let mut b = Vfs::open(temp.path().join("peer")).unwrap();
+        let mut b = Vfs::open_with(temp.path().join("peer"), NodeRole::Full, Some(&cas)).unwrap();
         let ops = a.pending(10).unwrap();
         let outcomes: Vec<_> = ops
             .iter()
@@ -1924,5 +2275,267 @@ mod tests {
         // does not exist here. The test pins that they stay recreatable.
         vfs.mkdir("projects").unwrap();
         assert!(vfs.is_directory("projects").unwrap());
+    }
+
+    /// The point of the shared store: two roots naming the same bytes cost one
+    /// object, not two.
+    #[test]
+    fn two_roots_on_one_machine_share_the_same_object() {
+        let temp = tempfile::tempdir().unwrap();
+        let cas = temp.path().join("cas");
+        let bytes = vec![9u8; 64 * 1024];
+
+        let mut a = Vfs::open_with(temp.path().join("a"), NodeRole::Full, Some(&cas)).unwrap();
+        a.put("big.bin", &bytes, "application/octet-stream", Expect::Any)
+            .unwrap();
+        let after_first = object_bytes(&cas);
+        assert_eq!(object_files(&cas).len(), 1);
+        assert_eq!(after_first, bytes.len() as u64);
+
+        let mut b = Vfs::open_with(temp.path().join("b"), NodeRole::Full, Some(&cas)).unwrap();
+        b.put("copy.bin", &bytes, "application/octet-stream", Expect::Any)
+            .unwrap();
+
+        // Not just behaviour: the second write added no object and no bytes.
+        assert_eq!(
+            object_files(&cas).len(),
+            1,
+            "the second root wrote a second object"
+        );
+        assert_eq!(object_bytes(&cas), after_first);
+        // And a root holds no objects of its own at all.
+        assert!(
+            !temp
+                .path()
+                .join("a")
+                .join(STATE_DIR)
+                .join(OBJECTS_DIR)
+                .exists()
+        );
+        assert!(
+            !temp
+                .path()
+                .join("b")
+                .join(STATE_DIR)
+                .join(OBJECTS_DIR)
+                .exists()
+        );
+        assert_eq!(a.get("big.bin").unwrap(), bytes);
+        assert_eq!(b.get("copy.bin").unwrap(), bytes);
+    }
+
+    /// A root an older layout wrote still works: reads fall back to its own
+    /// object directory, and opening it moves nothing.
+    #[test]
+    fn a_root_with_a_legacy_store_reads_before_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("legacy");
+        let staging = temp.path().join("staging");
+        let bytes = b"stated in .fungos".to_vec();
+        let id = make_legacy_root(&root, "notes/a.md", &bytes, &staging);
+
+        // A store this machine owns but which has never seen these bytes: only
+        // the legacy directory can answer.
+        let cas = temp.path().join("cas");
+        let mut vfs = Vfs::open_with(&root, NodeRole::Full, Some(&cas)).unwrap();
+        assert!(
+            object_files(&cas).is_empty(),
+            "a read must not copy into the shared store"
+        );
+        assert_eq!(vfs.get("notes/a.md").unwrap(), bytes);
+        assert_eq!(vfs.file("notes/a.md").unwrap().unwrap().content_id, id);
+        assert!(
+            root.join(LEGACY_STATE_DIR).is_dir(),
+            "opening a root must not migrate it"
+        );
+    }
+
+    /// The migration is a command: it moves the blobs into the shared store,
+    /// retires `.fungos`, and a second run has nothing left to do.
+    #[test]
+    fn migration_moves_blobs_into_the_shared_store_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("legacy");
+        let staging = temp.path().join("staging");
+        let bytes = b"migrate me".to_vec();
+        let id = make_legacy_root(&root, "notes/a.md", &bytes, &staging);
+
+        let cas = temp.path().join("cas");
+        let report = migrate_storage_with_cas(&root, Some(&cas)).unwrap();
+        assert_eq!(report.moved, 1);
+        assert_eq!(report.already_shared, 0);
+        assert_eq!(report.left_behind, 0);
+        assert!(report.renamed);
+        assert!(
+            report.state_dir.ends_with(STATE_DIR),
+            "{}",
+            report.state_dir
+        );
+        assert!(
+            !root.join(LEGACY_STATE_DIR).exists(),
+            "the old state directory is gone"
+        );
+        assert_eq!(object_files(&cas).len(), 1);
+        assert_eq!(object_bytes(&cas), bytes.len() as u64, "moved, not copied");
+
+        // The root reads from the shared store now, and only from there: the
+        // object is the one thing standing between it and the bytes.
+        let mut vfs = Vfs::open_with(&root, NodeRole::Full, Some(&cas)).unwrap();
+        assert_eq!(vfs.get("notes/a.md").unwrap(), bytes);
+        let hex = id.hex();
+        fs::remove_file(cas.join("objects").join(&hex[..2]).join(hex)).unwrap();
+        assert!(matches!(
+            vfs.get("notes/a.md"),
+            Err(VfsError::NotHydrated(_))
+        ));
+        drop(vfs);
+
+        // Idempotent: nothing left to move, nothing left to rename.
+        let again = migrate_storage_with_cas(&root, Some(&cas)).unwrap();
+        assert_eq!(
+            (again.moved, again.already_shared, again.renamed),
+            (0, 0, false)
+        );
+        assert_eq!(object_files(&cas).len(), 0);
+    }
+
+    /// While a root is migrating, the same content id can be in both places.
+    /// Moving it must not make a second copy, and nothing may be lost.
+    #[test]
+    fn migration_does_not_duplicate_content_already_in_the_shared_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("legacy");
+        let staging = temp.path().join("staging");
+        let bytes = b"shared and legacy".to_vec();
+        make_legacy_root(&root, "notes/a.md", &bytes, &staging);
+
+        let cas = temp.path().join("cas");
+        let mut other =
+            Vfs::open_with(temp.path().join("other"), NodeRole::Full, Some(&cas)).unwrap();
+        other
+            .put("copy.bin", &bytes, "application/octet-stream", Expect::Any)
+            .unwrap();
+        assert_eq!(object_files(&cas).len(), 1);
+
+        let report = migrate_storage_with_cas(&root, Some(&cas)).unwrap();
+        assert_eq!((report.moved, report.already_shared), (0, 1));
+        assert_eq!(object_files(&cas).len(), 1, "one object, not two");
+        assert!(!root.join(LEGACY_STATE_DIR).exists());
+        let mut legacy = Vfs::open_with(&root, NodeRole::Full, Some(&cas)).unwrap();
+        assert_eq!(legacy.get("notes/a.md").unwrap(), bytes);
+    }
+
+    /// A collection keeps what a namespace names and drops what nothing does.
+    #[test]
+    fn gc_drops_objects_no_namespace_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let cas = temp.path().join("cas");
+        let mut vfs = Vfs::open_with(temp.path().join("root"), NodeRole::Full, Some(&cas)).unwrap();
+        vfs.put("notes/a.md", b"# a\n", "text/markdown", Expect::Any)
+            .unwrap();
+
+        // What a deleted root leaves behind: bytes, and nothing naming them.
+        let orphan = ContentId::from_bytes(b"orphan");
+        let path = write_object(&cas, &orphan, b"orphan");
+        assert_eq!(object_files(&cas).len(), 2);
+
+        assert_eq!(vfs.gc().unwrap(), 1);
+        assert!(!path.exists());
+        assert_eq!(object_files(&cas).len(), 1);
+        assert_eq!(vfs.get("notes/a.md").unwrap(), b"# a\n");
+    }
+
+    /// An exported artifact outlives the path that produced it: a collection
+    /// that deleted it would leave a release pointing at nothing.
+    #[test]
+    fn gc_keeps_exported_content_that_no_live_path_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let cas = temp.path().join("cas");
+        let mut vfs = Vfs::open_with(temp.path().join("root"), NodeRole::Full, Some(&cas)).unwrap();
+        vfs.put(
+            "release/app.tar",
+            b"artifact",
+            "application/x-tar",
+            Expect::Any,
+        )
+        .unwrap();
+        vfs.put("notes/a.md", b"# a\n", "text/markdown", Expect::Any)
+            .unwrap();
+
+        let dest = temp.path().join("out");
+        assert_eq!(vfs.record_export("release", &dest).unwrap(), 1);
+        let artifact = vfs.file("release/app.tar").unwrap().unwrap();
+
+        // Strip the references a collection would otherwise count, leaving the
+        // export record as the only reason to keep the artifact.
+        vfs.remove("release/app.tar").unwrap();
+        vfs.db
+            .execute("DELETE FROM versions WHERE path='release/app.tar'", [])
+            .unwrap();
+
+        assert_eq!(vfs.gc().unwrap(), 0, "a published artifact is not garbage");
+        assert_eq!(vfs.content(&artifact.content_id).unwrap(), b"artifact");
+        assert_eq!(object_files(&cas).len(), 2);
+
+        // With the record gone, the same bytes are collectable: the export is
+        // what kept them, not some other reference.
+        vfs.db.execute("DELETE FROM exports", []).unwrap();
+        assert_eq!(vfs.gc().unwrap(), 1);
+        assert!(matches!(
+            vfs.content(&artifact.content_id),
+            Err(VfsError::NotHydrated(_))
+        ));
+        assert_eq!(vfs.get("notes/a.md").unwrap(), b"# a\n");
+    }
+
+    /// Two roots, one store: a collection in one must speak for both.
+    #[test]
+    fn one_roots_gc_keeps_content_another_root_references() {
+        let temp = tempfile::tempdir().unwrap();
+        let cas = temp.path().join("cas");
+        let mut a = Vfs::open_with(temp.path().join("a"), NodeRole::Full, Some(&cas)).unwrap();
+        let mut b = Vfs::open_with(temp.path().join("b"), NodeRole::Full, Some(&cas)).unwrap();
+        a.put("a.txt", b"a-owned", "text/plain", Expect::Any)
+            .unwrap();
+        b.put("b.txt", b"b-owned", "text/plain", Expect::Any)
+            .unwrap();
+        assert_eq!(object_files(&cas).len(), 2);
+        // Never opened by the collector: only the registration makes it known.
+        drop(b);
+
+        assert_eq!(a.gc().unwrap(), 0, "b's content is not a's garbage");
+        assert_eq!(object_files(&cas).len(), 2);
+        let mut b = Vfs::open_with(temp.path().join("b"), NodeRole::Full, Some(&cas)).unwrap();
+        assert_eq!(b.get("b.txt").unwrap(), b"b-owned");
+        assert_eq!(a.get("a.txt").unwrap(), b"a-owned");
+    }
+
+    /// A root still holding a legacy store is registered like any other, so its
+    /// content survives a collection run from a root that shares the store.
+    #[test]
+    fn a_collection_keeps_content_a_legacy_root_still_needs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("legacy");
+        let staging = temp.path().join("staging");
+        let bytes = b"legacy bytes".to_vec();
+        make_legacy_root(&root, "notes/a.md", &bytes, &staging);
+
+        let cas = temp.path().join("cas");
+        // The same bytes reach the shared store through another root.
+        let mut other =
+            Vfs::open_with(temp.path().join("other"), NodeRole::Full, Some(&cas)).unwrap();
+        other
+            .put("copy.bin", &bytes, "application/octet-stream", Expect::Any)
+            .unwrap();
+        // Opening the legacy root is what registers it; it stays unmigrated.
+        let legacy = Vfs::open_with(&root, NodeRole::Full, Some(&cas)).unwrap();
+        assert!(root.join(LEGACY_STATE_DIR).is_dir());
+        assert_eq!(object_files(&cas).len(), 1);
+
+        assert_eq!(other.gc().unwrap(), 0, "the legacy root names these bytes");
+        assert_eq!(object_files(&cas).len(), 1);
+        drop(legacy);
+        let mut legacy = Vfs::open_with(&root, NodeRole::Full, Some(&cas)).unwrap();
+        assert_eq!(legacy.get("notes/a.md").unwrap(), bytes);
     }
 }

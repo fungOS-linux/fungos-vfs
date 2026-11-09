@@ -1,8 +1,8 @@
 //! fungOS local-first VFS.
 //!
-//! A workspace is a content-addressed blob store plus a SQLite namespace and
-//! version history. A node can be a full replica or a pull-through cache.
-//! Distributed transport is deliberately outside this crate.
+//! A root is a SQLite namespace plus version history over a content-addressed
+//! store that every root on the machine shares. A node can be a full replica or a
+//! pull-through cache. Distributed transport is deliberately outside this crate.
 
 mod bus;
 mod cid;
@@ -35,6 +35,7 @@ pub use transfer::{
     ingest_dir_with_policy,
 };
 pub use vfs::{
-    Expect, FileEntry, Hlc, Hydration, Lease, LodPolicy, NodeRole, SyncOp, SyncOpKind, Version,
-    Vfs, VfsError, Writer,
+    Expect, FileEntry, Hlc, Hydration, LEGACY_STATE_DIR, Lease, LodPolicy, NodeRole, STATE_DIR,
+    StorageMigration, SyncOp, SyncOpKind, Version, Vfs, VfsError, Writer, migrate_storage,
+    migrate_storage_with_cas,
 };

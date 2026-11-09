@@ -3,7 +3,7 @@ use std::{fs, io::Write, path::PathBuf};
 use clap::{Parser, Subcommand};
 use fungos_vfs::{
     ApplyOutcome, ContentId, Expect, NodeRole, PathPolicy, SourceMode, SyncServer, Vfs, export_dir,
-    ingest_dir_with_policy, pull_over_quic, pull_over_ssh,
+    ingest_dir_with_policy, migrate_storage_with_cas, pull_over_quic, pull_over_ssh,
 };
 
 #[derive(Parser)]
@@ -11,6 +11,10 @@ use fungos_vfs::{
 struct Cli {
     #[arg(long, global = true, default_value = ".fungos-vfs")]
     root: PathBuf,
+    /// The machine's content store. Defaults to `$FUNGOS_VFS_CAS`, then
+    /// `$XDG_DATA_HOME/fungos-vfs`; every root on the machine shares it.
+    #[arg(long, global = true)]
+    cas: Option<PathBuf>,
     #[arg(long, global = true, value_enum, default_value_t = RoleArg::Full)]
     role: RoleArg,
     /// Stamp writes with this actor instead of the process user.
@@ -105,6 +109,10 @@ enum Command {
         ids: Vec<i64>,
     },
     Gc,
+    /// Move this root's blobs into the shared content store and retire its
+    /// `.fungos` directory. Reads fall back to the old location until then, so
+    /// this is safe to run at any time and safe to run twice.
+    Migrate,
     Evict {
         #[arg(long)]
         max_bytes: u64,
@@ -184,7 +192,15 @@ fn main() {
 
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let mut vfs = Vfs::open_with_role(&cli.root, cli.role.into())?;
+    // `migrate` renames this root's state directory, so it has to run before
+    // anything opens the root: an open database renamed out from under its own
+    // connection is exactly the kind of surprise this command exists to avoid.
+    if matches!(&cli.command, Command::Migrate) {
+        let report = migrate_storage_with_cas(&cli.root, cli.cas.as_deref())?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    let mut vfs = Vfs::open_with(&cli.root, cli.role.into(), cli.cas.as_deref())?;
     if let Some(actor) = &cli.actor {
         vfs.set_actor(actor.clone());
     }
@@ -413,6 +429,8 @@ fn run() -> anyhow::Result<()> {
             let report = export_dir(&mut vfs, &prefix, &dest)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        // Handled before the store is opened, above.
+        Command::Migrate => unreachable!(),
     }
     Ok(())
 }

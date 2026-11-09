@@ -251,6 +251,10 @@ pub fn export_dir(vfs: &mut Vfs, prefix: &str, dest: &Path) -> Result<ExportRepo
         report.bytes_written += bytes.len() as u64;
     }
 
+    // What was exported is a published artifact: recording it is what keeps its
+    // content reachable for `gc` after the namespace moves on.
+    vfs.record_export(prefix, dest)?;
+
     Ok(report)
 }
 
