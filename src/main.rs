@@ -1,8 +1,9 @@
-use std::{fs, path::PathBuf};
+use std::{fs, io::Write, path::PathBuf};
 
 use clap::{Parser, Subcommand};
 use fungos_vfs::{
-    ContentId, Expect, NodeRole, PathPolicy, SourceMode, Vfs, export_dir, ingest_dir_with_policy,
+    ApplyOutcome, ContentId, Expect, NodeRole, PathPolicy, SourceMode, SyncServer, Vfs, export_dir,
+    ingest_dir_with_policy, pull_over_quic, pull_over_ssh,
 };
 
 #[derive(Parser)]
@@ -154,6 +155,18 @@ enum Command {
         /// How old, in seconds, a log row must be before `compact` drops it.
         #[arg(long)]
         older_than: Option<u64>,
+        /// Serve over QUIC on this address instead of answering one request on
+        /// stdin, e.g. `127.0.0.1:7701`. A client needs the fingerprint this
+        /// prints.
+        #[arg(long)]
+        quic: Option<String>,
+        /// Where the QUIC identity lives. Created on first use and reused after
+        /// that, so the fingerprint a peer pinned keeps working across restarts.
+        #[arg(long)]
+        cert: Option<PathBuf>,
+        /// The fingerprint a QUIC peer must present, in hex.
+        #[arg(long)]
+        fingerprint: Option<String>,
     },
     /// Materialize everything under `prefix` into a directory.
     Export {
@@ -330,41 +343,63 @@ fn run() -> anyhow::Result<()> {
             remote_bin,
             limit,
             older_than,
+            quic,
+            cert,
+            fingerprint,
         } => match mode.as_str() {
+            // ssh stays the default carrier: without `--quic`, `serve` answers
+            // one request on stdin, which is exactly what an ssh session gives
+            // it, and `pull` shells out to `ssh` as it always has.
             "serve" => {
-                let mut input = String::new();
-                std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
-                let request: fungos_vfs::SyncRequest = serde_json::from_str(&input)?;
-                let response = vfs.serve_sync(&request)?;
-                println!("{}", serde_json::to_string(&response)?);
+                if let Some(addr) = quic {
+                    let server = match &cert {
+                        Some(path) => SyncServer::bind_with_identity(&addr, path)?,
+                        None => SyncServer::bind(&addr)?,
+                    };
+                    // Printed before serving, and flushed: a client cannot be
+                    // configured without it, and stdout is block buffered when
+                    // it is piped somewhere that is waiting for this line.
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "listening": server.local_addr()?.to_string(),
+                            "fingerprint": server.fingerprint(),
+                        })
+                    );
+                    std::io::stdout().flush()?;
+                    // One failed session is that peer's problem: a wrong
+                    // fingerprint or a corrupt request must not stop the ones
+                    // that are working.
+                    loop {
+                        if let Err(error) = server.accept_one(&mut vfs) {
+                            eprintln!("sync serve over quic: {error}");
+                        }
+                    }
+                } else {
+                    let mut input = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+                    let request: fungos_vfs::SyncRequest = serde_json::from_str(&input)?;
+                    let response = vfs.serve_sync(&request)?;
+                    println!("{}", serde_json::to_string(&response)?);
+                }
             }
             "pull" => {
-                let remote = remote.ok_or_else(|| anyhow::anyhow!("sync pull needs --remote"))?;
-                let remote_root =
-                    remote_root.ok_or_else(|| anyhow::anyhow!("sync pull needs --remote-root"))?;
-                let outcomes =
-                    fungos_vfs::pull_over_ssh(&mut vfs, &remote, &remote_root, &remote_bin, limit)?;
-                let mut applied = 0;
-                let mut duplicate = 0;
-                let mut diverged = 0;
-                let mut snapshot = false;
-                for outcome in &outcomes {
-                    match outcome {
-                        fungos_vfs::ApplyOutcome::Applied => applied += 1,
-                        fungos_vfs::ApplyOutcome::Duplicate => duplicate += 1,
-                        fungos_vfs::ApplyOutcome::Diverged => diverged += 1,
-                        fungos_vfs::ApplyOutcome::Snapshot => snapshot = true,
+                let outcomes = match quic {
+                    Some(endpoint) => {
+                        let fingerprint = fingerprint.ok_or_else(|| {
+                            anyhow::anyhow!("sync pull --quic needs --fingerprint")
+                        })?;
+                        pull_over_quic(&mut vfs, &endpoint, &fingerprint, limit)?
                     }
-                }
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "applied": applied,
-                        "duplicate": duplicate,
-                        "diverged": diverged,
-                        "snapshot": snapshot,
-                    })
-                );
+                    None => {
+                        let remote =
+                            remote.ok_or_else(|| anyhow::anyhow!("sync pull needs --remote"))?;
+                        let remote_root = remote_root
+                            .ok_or_else(|| anyhow::anyhow!("sync pull needs --remote-root"))?;
+                        pull_over_ssh(&mut vfs, &remote, &remote_root, &remote_bin, limit)?
+                    }
+                };
+                println!("{}", summarize(&outcomes));
             }
             "compact" => {
                 let seconds =
@@ -380,4 +415,26 @@ fn run() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// What `sync pull` prints, whichever carrier moved the ops.
+fn summarize(outcomes: &[ApplyOutcome]) -> serde_json::Value {
+    let mut applied = 0;
+    let mut duplicate = 0;
+    let mut diverged = 0;
+    let mut snapshot = false;
+    for outcome in outcomes {
+        match outcome {
+            ApplyOutcome::Applied => applied += 1,
+            ApplyOutcome::Duplicate => duplicate += 1,
+            ApplyOutcome::Diverged => diverged += 1,
+            ApplyOutcome::Snapshot => snapshot = true,
+        }
+    }
+    serde_json::json!({
+        "applied": applied,
+        "duplicate": duplicate,
+        "diverged": diverged,
+        "snapshot": snapshot,
+    })
 }
