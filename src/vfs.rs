@@ -1790,6 +1790,15 @@ mod tests {
         (temp, vfs)
     }
 
+    /// Open a root against a content store the test owns, under the root itself.
+    ///
+    /// No test may resolve the machine's default store: that one is shared with
+    /// real roots, so a test writing to it would be a test writing outside
+    /// itself.
+    fn open_temp_root(root: &Path) -> Vfs {
+        Vfs::open_with(root, NodeRole::Full, Some(&root.join(".cas"))).unwrap()
+    }
+
     /// Every object file in a content store.
     fn object_files(cas: &Path) -> Vec<PathBuf> {
         let mut files = Vec::new();
@@ -2137,7 +2146,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut seen = Vec::new();
         for _ in 0..4 {
-            let mut vfs = Vfs::open(temp.path()).unwrap();
+            let mut vfs = open_temp_root(temp.path());
             seen.push(vfs.begin_generation().unwrap());
             assert_eq!(vfs.generation(), *seen.last().unwrap());
         }
@@ -2147,14 +2156,14 @@ mod tests {
     #[test]
     fn opening_without_issuing_handles_leaves_the_generation_alone() {
         let temp = tempfile::tempdir().unwrap();
-        let mut vfs = Vfs::open(temp.path()).unwrap();
+        let mut vfs = open_temp_root(temp.path());
         assert_eq!(vfs.generation(), 0, "a fresh store has issued nothing");
         assert_eq!(vfs.begin_generation().unwrap(), 1);
         drop(vfs);
 
         // A reader that shares the root with a live mount must not invalidate
         // the handles that mount already issued.
-        let vfs = Vfs::open(temp.path()).unwrap();
+        let vfs = open_temp_root(temp.path());
         assert_eq!(vfs.generation(), 1);
     }
 
@@ -2162,7 +2171,7 @@ mod tests {
     fn an_unreadable_generation_refuses_to_open() {
         let temp = tempfile::tempdir().unwrap();
         {
-            let mut vfs = Vfs::open(temp.path()).unwrap();
+            let mut vfs = open_temp_root(temp.path());
             vfs.begin_generation().unwrap();
             vfs.db
                 .execute(
@@ -2172,7 +2181,7 @@ mod tests {
                 .unwrap();
         }
 
-        match Vfs::open(temp.path()) {
+        match Vfs::open_with(temp.path(), NodeRole::Full, Some(&temp.path().join(".cas"))) {
             Ok(_) => panic!("a corrupt generation opened as if it were zero"),
             Err(VfsError::CorruptMeta { key, value }) => {
                 assert_eq!(key, "generation");

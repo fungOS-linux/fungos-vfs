@@ -16,6 +16,7 @@
 
 use std::{
     collections::HashSet,
+    ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -42,7 +43,17 @@ const CAS_ENV: &str = "FUNGOS_VFS_CAS";
 /// checkout happens to be writing it — falling back to the platform convention
 /// when `XDG_DATA_HOME` is unset.
 pub fn default_data_dir() -> Result<PathBuf, VfsError> {
-    let env = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
+    data_dir_from(|name| std::env::var_os(name))
+}
+
+/// The precedence, as a function of an environment rather than of this process's
+/// copy of it.
+///
+/// A test that wanted to pin the ordering by setting the variables would be
+/// mutating state every other test in the process shares; passing the environment
+/// in keeps the rule testable and the process untouched.
+fn data_dir_from(env: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, VfsError> {
+    let env = |name: &str| env(name).filter(|value| !value.is_empty());
     if let Some(dir) = env(CAS_ENV) {
         return Ok(PathBuf::from(dir));
     }
@@ -296,5 +307,41 @@ impl ContentStore {
             let _ = fs::remove_dir(shard.path());
         }
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The environment as a lookup, so the rule can be tested without touching
+    /// the one this process shares with every other test.
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+        let pairs: Vec<(String, OsString)> = pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), OsString::from(value)))
+            .collect();
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    #[test]
+    fn the_override_wins_and_the_data_home_is_the_fallback() {
+        let dir = data_dir_from(env(&[(CAS_ENV, "/cas"), ("XDG_DATA_HOME", "/xdg")])).unwrap();
+        assert_eq!(dir, PathBuf::from("/cas"), "the override is not a hint");
+
+        let dir = data_dir_from(env(&[("XDG_DATA_HOME", "/xdg")])).unwrap();
+        assert_eq!(dir, PathBuf::from("/xdg").join(APP_DIR));
+
+        // An empty variable is not a directory, and neither is a missing one:
+        // failing loudly beats writing content somewhere nobody chose.
+        assert!(matches!(
+            data_dir_from(env(&[(CAS_ENV, ""), ("XDG_DATA_HOME", "")])),
+            Err(VfsError::NoDataDirectory)
+        ));
     }
 }

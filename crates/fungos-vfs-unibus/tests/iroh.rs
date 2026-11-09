@@ -6,7 +6,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use fungos_vfs::{CONTENT_DATA_KIND, CONTENT_FETCH_KIND, ContentData, ContentFetch, Expect, Vfs};
+use fungos_vfs::{
+    CONTENT_DATA_KIND, CONTENT_FETCH_KIND, ContentData, ContentFetch, Expect, NodeRole, Vfs,
+};
 use fungos_vfs_unibus::ContentService;
 use iroh::{Endpoint, endpoint::presets};
 use unibus::{
@@ -74,7 +76,8 @@ fn session_config(producer: &str, claims: DirectSessionClaims) -> SessionConfig 
 #[tokio::test]
 async fn content_service_serves_a_range_over_iroh() {
     let temp = tempfile::tempdir().unwrap();
-    let mut vfs = Vfs::open(temp.path()).unwrap();
+    let mut vfs =
+        Vfs::open_with(temp.path(), NodeRole::Full, Some(&temp.path().join("cas"))).unwrap();
     let bytes: Vec<u8> = (0..4096).map(|value| (value % 251) as u8).collect();
     let entry = vfs
         .put("asset.bin", &bytes, "application/octet-stream", Expect::Any)

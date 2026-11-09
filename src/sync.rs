@@ -993,14 +993,19 @@ fn hex_decode(text: &str) -> Result<Vec<u8>, VfsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Expect, Vfs};
+    use crate::{Expect, NodeRole, Vfs};
 
     /// Two stores on one host, which is the harder case: they infer the same
     /// origin from the environment and only their store identity separates them.
+    ///
+    /// They share the content store under `dir`, which is the test's own: a test
+    /// that let the machine's default store answer would write to a shared
+    /// location outside itself.
     fn pair(dir: &std::path::Path) -> (Vfs, Vfs) {
+        let cas = dir.join("cas");
         (
-            Vfs::open(dir.join("a")).unwrap(),
-            Vfs::open(dir.join("b")).unwrap(),
+            Vfs::open_with(dir.join("a"), NodeRole::Full, Some(&cas)).unwrap(),
+            Vfs::open_with(dir.join("b"), NodeRole::Full, Some(&cas)).unwrap(),
         )
     }
 
@@ -1052,7 +1057,12 @@ mod tests {
         assert_ne!(a.store(), b.store());
 
         // The store id survives reopening.
-        let reopened = Vfs::open(dir.path().join("a")).unwrap();
+        let reopened = Vfs::open_with(
+            dir.path().join("a"),
+            NodeRole::Full,
+            Some(&dir.path().join("cas")),
+        )
+        .unwrap();
         assert_eq!(reopened.store(), a.store());
 
         // Each store's op is in the other's future, which is what the cursor
@@ -1630,8 +1640,9 @@ mod tests {
     fn a_restart_does_not_let_a_new_write_land_under_a_horizon() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("a");
+        let cas = dir.path().join("cas");
 
-        let mut store = Vfs::open(&root).unwrap();
+        let mut store = Vfs::open_with(&root, NodeRole::Full, Some(&cas)).unwrap();
         store
             .put("one.md", b"one", "text/markdown", Expect::Any)
             .unwrap();
@@ -1658,7 +1669,7 @@ mod tests {
                 counter: 0,
             },
         );
-        let mut store = Vfs::open(&root).unwrap();
+        let mut store = Vfs::open_with(&root, NodeRole::Full, Some(&cas)).unwrap();
 
         // The horizon, not the clock, is what turns an old op away.
         assert_eq!(

@@ -192,7 +192,8 @@ mod tests {
     #[test]
     fn serves_bounded_ranges_from_a_full_node() {
         let temp = tempfile::tempdir().unwrap();
-        let mut vfs = Vfs::open(temp.path()).unwrap();
+        let mut vfs =
+            Vfs::open_with(temp.path(), NodeRole::Full, Some(&temp.path().join("cas"))).unwrap();
         let bytes: Vec<u8> = (0..4096).map(|value| (value % 251) as u8).collect();
         let entry = vfs
             .put("asset.bin", &bytes, "application/octet-stream", Expect::Any)
@@ -225,7 +226,8 @@ mod tests {
     #[test]
     fn cache_node_cannot_serve_a_missing_blob() {
         let temp = tempfile::tempdir().unwrap();
-        let mut vfs = Vfs::open_with_role(temp.path(), NodeRole::Cache).unwrap();
+        let mut vfs =
+            Vfs::open_with(temp.path(), NodeRole::Cache, Some(&temp.path().join("cas"))).unwrap();
         let content_id = ContentId::from_bytes(b"missing");
         vfs.register_placeholder(
             "missing.bin",

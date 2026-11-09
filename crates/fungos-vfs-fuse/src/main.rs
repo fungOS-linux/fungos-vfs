@@ -1051,8 +1051,11 @@ mod tests {
 
     /// A state that has opened the store and claimed a generation, the way
     /// `run` does before it mounts.
+    ///
+    /// The content store is the test's own: the machine's default one is shared
+    /// with real mounts, and a test must not file its fixtures there.
     fn mount(root: &Path) -> State {
-        let mut vfs = Vfs::open(root).unwrap();
+        let mut vfs = Vfs::open_with(root, NodeRole::Full, Some(&root.join("cas"))).unwrap();
         vfs.begin_generation().unwrap();
         State::new(vfs, None)
     }

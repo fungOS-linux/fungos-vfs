@@ -396,7 +396,16 @@ fn media_type_for(path: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NodeRole;
     use std::fs;
+
+    /// A VFS root on the content store this test owns.
+    ///
+    /// Every test here passes one: the machine's default store is shared with
+    /// real roots, and a test must not file its fixtures there.
+    fn open_vfs(base: &Path) -> Vfs {
+        Vfs::open_with(base.join("vfs"), NodeRole::Full, Some(&base.join("cas"))).unwrap()
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -421,8 +430,7 @@ mod tests {
         write(&source.join("docs/nested/b.md"), "# title\n");
         write(&source.join("top.txt"), "top\n");
 
-        let vfs_root = base.join("vfs");
-        let mut vfs = Vfs::open(&vfs_root).unwrap();
+        let mut vfs = open_vfs(&base);
 
         let first = ingest_dir(&mut vfs, &source, "projects/x", SourceMode::All, false).unwrap();
         assert_eq!(first.added, 3);
@@ -454,7 +462,7 @@ mod tests {
     #[test]
     fn export_skips_placeholders_instead_of_writing_empty_files() {
         let base = scratch("placeholder");
-        let mut vfs = Vfs::open(base.join("vfs")).unwrap();
+        let mut vfs = open_vfs(&base);
         vfs.register_placeholder(
             "projects/p/big.bin",
             ContentId::parse(
@@ -483,7 +491,7 @@ mod tests {
         write(&source.join("huge.iso"), "bytes\n");
 
         let policy = PathPolicy::parse("target/\nnode_modules/\nexclude: *.iso\n");
-        let mut vfs = Vfs::open(base.join("vfs")).unwrap();
+        let mut vfs = open_vfs(&base);
         let report =
             ingest_dir_with_policy(&mut vfs, &source, "p", SourceMode::All, false, &policy)
                 .unwrap();
@@ -506,7 +514,7 @@ mod tests {
         // Every source file belongs to the commit's tree, so the whole checkout
         // costs one pointer and zero blobs.
         let policy = PathPolicy::parse("git: **/*.rs\n");
-        let mut vfs = Vfs::open(base.join("vfs")).unwrap();
+        let mut vfs = open_vfs(&base);
         let report =
             ingest_dir_with_policy(&mut vfs, &source, "p", SourceMode::Git, false, &policy)
                 .unwrap();
@@ -529,7 +537,7 @@ mod tests {
         write(&source.join("src/a.rs"), "fn a() { /* changed */ }\n");
 
         let policy = PathPolicy::parse("git: **/*.rs\n");
-        let mut vfs = Vfs::open(base.join("vfs")).unwrap();
+        let mut vfs = open_vfs(&base);
         let report =
             ingest_dir_with_policy(&mut vfs, &source, "p", SourceMode::Git, false, &policy)
                 .unwrap();
@@ -580,7 +588,7 @@ mod tests {
         // `notes.md` is tracked and also demanded as a blob: two stores would own
         // the same bytes, so ingestion refuses rather than diverging later.
         let policy = PathPolicy::parse("cid: *.md\n");
-        let mut vfs = Vfs::open(base.join("vfs")).unwrap();
+        let mut vfs = open_vfs(&base);
         let error = ingest_dir_with_policy(&mut vfs, &source, "p", SourceMode::Git, false, &policy)
             .unwrap_err();
         assert!(format!("{error}").contains("notes.md"), "{error}");
@@ -594,7 +602,7 @@ mod tests {
         write(&source.join("real.txt"), "real\n");
         std::os::unix::fs::symlink(source.join("real.txt"), source.join("link.txt")).unwrap();
 
-        let mut vfs = Vfs::open(base.join("vfs")).unwrap();
+        let mut vfs = open_vfs(&base);
         let report = ingest_dir(&mut vfs, &source, "projects/s", SourceMode::All, false).unwrap();
         assert_eq!(report.added, 1);
         assert_eq!(report.skipped, 1);

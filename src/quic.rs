@@ -540,7 +540,7 @@ fn pull(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Expect, Hlc, Vfs};
+    use crate::{Expect, Hlc, NodeRole, Vfs};
     use std::{path::Path, thread};
 
     /// Port zero: the kernel picks one, so tests never collide.
@@ -548,10 +548,14 @@ mod tests {
 
     /// Two stores on one host: the same origin, distinct store identities, which
     /// is the harder case for the cursor and therefore the one worth carrying.
+    ///
+    /// The content store under `dir` is the test's own, so nothing here reads or
+    /// writes the store the machine's real roots share.
     fn pair(dir: &Path) -> (Vfs, Vfs) {
+        let cas = dir.join("cas");
         (
-            Vfs::open(dir.join("a")).unwrap(),
-            Vfs::open(dir.join("b")).unwrap(),
+            Vfs::open_with(dir.join("a"), NodeRole::Full, Some(&cas)).unwrap(),
+            Vfs::open_with(dir.join("b"), NodeRole::Full, Some(&cas)).unwrap(),
         )
     }
 
