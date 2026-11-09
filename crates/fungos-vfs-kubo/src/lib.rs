@@ -19,12 +19,31 @@ use fungos_vfs::{
     CODEC_DAG_CBOR, ContentId, Hydrator, VfsError, cid_bytes, cid_string, content_id_to_cid,
 };
 
-const KUBO_DEFAULT_API: &str = "http://127.0.0.1:5001";
+/// The environment variable naming the Kubo API endpoint to hydrate from.
+///
+/// `KuboHydrator::from_env` reads it. There is intentionally no compiled-in
+/// fallback address; see that constructor for why.
+pub const KUBO_API_ENV: &str = "KUBO_API";
 
 /// Reads blocks from a Kubo node over its HTTP API.
 pub struct KuboHydrator {
     api: String,
     client: reqwest::blocking::Client,
+}
+
+/// Resolve the endpoint from a `KUBO_API` lookup, refusing to invent one.
+///
+/// Split out from [`KuboHydrator::from_env`] so the refusal is testable without
+/// mutating process-global environment state.
+fn api_endpoint(lookup: Option<String>) -> Result<String, VfsError> {
+    match lookup {
+        Some(api) if !api.trim().is_empty() => Ok(api),
+        _ => Err(VfsError::Config(format!(
+            "{KUBO_API_ENV} is not set: name the Kubo API endpoint to hydrate from, for \
+             example {KUBO_API_ENV}=http://127.0.0.1:5001. There is no safe default because \
+             the correct node differs per deployment."
+        ))),
+    }
 }
 
 impl KuboHydrator {
@@ -42,9 +61,16 @@ impl KuboHydrator {
         }
     }
 
-    /// The local node's default API address.
-    pub fn local() -> Self {
-        Self::new(KUBO_DEFAULT_API)
+    /// A hydrator for the node named by [`KUBO_API_ENV`].
+    ///
+    /// Nothing is guessed when the variable is absent. Which node to hydrate
+    /// from is deployment-specific: on a host running more than one Kubo, a
+    /// fallback address reaches whichever node happens to listen there. The
+    /// blocks land, the pin does not, the import still exits successfully, and
+    /// the node's next GC reclaims the content. A missing endpoint is a
+    /// configuration error worth failing on, not a detail to paper over.
+    pub fn from_env() -> Result<Self, VfsError> {
+        api_endpoint(std::env::var(KUBO_API_ENV).ok()).map(Self::new)
     }
 
     /// Raw block bytes for `cid`.
@@ -339,12 +365,42 @@ mod tests {
         assert!(matches!(error, VfsError::InvalidContentId(_)));
     }
 
+    /// The node these live tests talk to. Deliberately not defaulted: a test
+    /// that silently points at the wrong node proves nothing.
+    fn live_api() -> String {
+        std::env::var(KUBO_API_ENV).expect("set KUBO_API to a running node's API endpoint")
+    }
+
+    /// An absent endpoint must fail, not resolve to an address that happens to
+    /// be listening. Guessing is how a hydrator lands blocks on the wrong node
+    /// and loses the pin that made them durable.
+    #[test]
+    fn an_unconfigured_hydrator_refuses_to_guess_a_node() {
+        let error = api_endpoint(None).unwrap_err();
+        assert!(matches!(error, VfsError::Config(_)), "{error}");
+        let message = error.to_string();
+        assert!(message.contains(KUBO_API_ENV), "{message}");
+        assert!(message.contains("no safe default"), "{message}");
+
+        // Blank is absence, not an endpoint.
+        assert!(matches!(
+            api_endpoint(Some("   ".into())).unwrap_err(),
+            VfsError::Config(_)
+        ));
+
+        // A supplied endpoint is used verbatim.
+        assert_eq!(
+            api_endpoint(Some("http://node.example:5002".into())).unwrap(),
+            "http://node.example:5002"
+        );
+    }
+
     /// Same round trip without pinning, which also covers a node whose pin
     /// store is unavailable: storing and reading a block must still work.
     #[test]
     #[ignore = "requires a running Kubo node"]
     fn stores_and_fetches_without_pinning() {
-        let api = std::env::var("KUBO_API").unwrap_or_else(|_| KUBO_DEFAULT_API.to_string());
+        let api = live_api();
         let payload = b"fungos vfs unpinned block\n".to_vec();
         let content_id = ContentId::from_bytes(&payload);
 
@@ -365,7 +421,7 @@ mod tests {
     #[test]
     #[ignore = "requires a running Kubo node"]
     fn round_trip_against_a_live_node() {
-        let api = std::env::var("KUBO_API").unwrap_or_else(|_| KUBO_DEFAULT_API.to_string());
+        let api = live_api();
         let payload = b"fungos vfs <-> kubo round trip\n".to_vec();
         let content_id = ContentId::from_bytes(&payload);
 

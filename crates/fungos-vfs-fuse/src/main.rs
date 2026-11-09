@@ -370,6 +370,7 @@ fn errno(error: &VfsError) -> Errno {
         VfsError::NotHydrated(_) | VfsError::Transport(_) => Errno::EIO,
         VfsError::ReadOnly => Errno::EROFS,
         VfsError::InvalidPath(_) => Errno::EINVAL,
+        VfsError::Config(_) => Errno::EINVAL,
         VfsError::InvalidContentId(_) => Errno::EIO,
         VfsError::Conflict { .. } | VfsError::AlreadyExists(_) => Errno::EEXIST,
         // A fenced write means the caller wrote against a head that has moved;

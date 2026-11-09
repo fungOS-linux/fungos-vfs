@@ -44,6 +44,10 @@ pub enum VfsError {
     SnapshotRefused { pending: usize },
     #[error("node is a pull-through cache; writes are disabled")]
     ReadOnly,
+    /// Deployment configuration is missing or unusable. Distinct from
+    /// [`Self::Transport`]: nothing was attempted on the wire.
+    #[error("configuration error: {0}")]
+    Config(String),
     #[error("transport error: {0}")]
     Transport(String),
     #[error("corrupt store metadata: {key} = {value}")]
