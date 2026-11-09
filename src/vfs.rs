@@ -467,6 +467,14 @@ impl Vfs {
                hlc_ms INTEGER NOT NULL,
                hlc_counter INTEGER NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS diverged(
+               store TEXT NOT NULL,
+               hlc_ms INTEGER NOT NULL,
+               hlc_counter INTEGER NOT NULL,
+               path TEXT NOT NULL,
+               detected_at_ms INTEGER NOT NULL,
+               PRIMARY KEY(store, hlc_ms, hlc_counter)
+             );
              CREATE TABLE IF NOT EXISTS leases(
                path TEXT PRIMARY KEY,
                owner TEXT NOT NULL,
@@ -1037,11 +1045,26 @@ impl Vfs {
             .map_err(VfsError::from)
     }
 
-    pub(crate) fn unmark_applied(&self, store: &str, hlc: Hlc) -> Result<(), VfsError> {
-        self.db.execute(
+    /// Record that an op was refused because the head had moved, and drop the
+    /// receipt for it.
+    ///
+    /// The receipt goes because nothing landed, but the fact of the refusal is
+    /// kept: "we deliberately deferred this write" and "we never saw it" are
+    /// different facts, and what compaction does to the log must not be allowed
+    /// to erase the difference. The record is removed when the divergence is
+    /// resolved — either by the op finally fitting, or by a caller saying so.
+    pub(crate) fn mark_diverged(&self, store: &str, hlc: Hlc, path: &str) -> Result<(), VfsError> {
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
             "DELETE FROM applied WHERE store=?1 AND hlc_ms=?2 AND hlc_counter=?3",
             params![store, hlc.ms, i64::from(hlc.counter)],
         )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO diverged(store,hlc_ms,hlc_counter,path,detected_at_ms)
+             VALUES(?1,?2,?3,?4,?5)",
+            params![store, hlc.ms, i64::from(hlc.counter), path, now_ms()],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 

@@ -30,7 +30,19 @@
 //! The horizon is a watermark, not a set of operations. It says "nothing at or
 //! below this clock is still here", which is enough to recognise a redelivery
 //! and enough to know when to snapshot; it is not a claim about every op that
-//! ever passed below it.
+//! ever passed below it. This store does not persist its last clock reading — it
+//! restarts from the wall clock — so a clock that steps back across a restart
+//! can put a later op underneath a horizon it has already passed. Persisting the
+//! reading is the fix, and it belongs to the clock rather than to compaction.
+//!
+//! It is also capped by any divergence this store is still holding. A diverged
+//! op records no receipt, so the horizon is the only thing that could still
+//! turn away its next offer — which means the horizon must never reach it, or a
+//! retried write would come back as a duplicate of a write this store does not
+//! have. Compaction therefore stops short of the earliest unresolved divergence
+//! for a store and leaves the rows above it in place. That is the cost, and it
+//! is the right one to pay: an unresolved divergence is unfinalised state, and
+//! a log that stays too long is a smaller problem than a write that disappears.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -171,6 +183,10 @@ pub struct CompactionReport {
     pub dropped_ops: BTreeMap<String, u64>,
     /// Applied-op receipts dropped, per store.
     pub dropped_receipts: BTreeMap<String, u64>,
+    /// Stores where the pass stopped short of the cutoff because an unresolved
+    /// divergence sits below it, with the reading that held it back. Empty when
+    /// nothing is pinned, which is the answer to "why is the log still here?".
+    pub pinned: BTreeMap<String, Hlc>,
     /// The horizon per store after this pass: the highest reading this store
     /// no longer keeps. Reported even when nothing was dropped, so a caller
     /// can see the point a peer would have to be behind to get a snapshot.
@@ -208,6 +224,20 @@ pub enum ApplyOutcome {
     Diverged,
     /// A whole state replaced this store's namespace instead of a delta.
     Snapshot,
+}
+
+/// An op this store refused because the head had moved, and has not resolved.
+///
+/// Kept rather than forgotten so that compaction knows where it must stop. The
+/// record is what distinguishes a write this store deliberately deferred from
+/// one it never saw, and only the second is safe to compact away.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Divergence {
+    pub store: String,
+    pub hlc: Hlc,
+    /// The path the op wanted to write, so the record can be explained.
+    pub path: String,
+    pub detected_at_ms: i64,
 }
 
 /// One store's answer to a sync request.
@@ -416,7 +446,7 @@ impl Vfs {
                 let current = self.file(&op.path)?;
                 let current_id = current.as_ref().map(|entry| &entry.content_id);
                 if current_id != op.base_content_id.as_ref() {
-                    self.unmark_applied(&op.store, op.hlc)?;
+                    self.mark_diverged(&op.store, op.hlc, &op.path)?;
                     return Ok(ApplyOutcome::Diverged);
                 }
                 self.apply_put(&op.path, bytes, current.as_ref(), &op.actor, &op.origin)?;
@@ -437,6 +467,10 @@ impl Vfs {
                 }
             }
         }
+        // If this op was deferred before and fits now, the deferral is over: a
+        // record that outlived it would keep pinning the log on a difference
+        // nobody has to reconcile any more.
+        self.resolve_divergence(&op.store, op.hlc)?;
         Ok(ApplyOutcome::Applied)
     }
 
@@ -484,35 +518,54 @@ impl Vfs {
     /// it twice with the same cutoff drops nothing the second time, because the
     /// horizon it raised is what would have been dropped.
     ///
-    /// Worth knowing: the horizon is a watermark, not a census of applied ops.
-    /// A divergence left unresolved when its receipt is compacted is afterwards
-    /// reported as a duplicate, because the receipt that distinguished the two
-    /// is exactly what was dropped to make room.
+    /// One thing holds compaction back: an unresolved divergence. A diverged op
+    /// has no receipt, so if the horizon passed its clock its next offer would
+    /// read as a duplicate of a write this store does not hold — the write would
+    /// be swallowed, which is the failure the divergence report exists to avoid.
+    /// The horizon is therefore capped below the earliest unresolved divergence
+    /// for each store, and the rows above that point stay where they are until
+    /// the divergence is resolved. A divergence nobody ever resolves pins
+    /// compaction for its store; that log growing again is cheaper than the
+    /// write it would have bought.
     pub fn compact(&mut self, older_than: Duration) -> Result<CompactionReport, VfsError> {
-        let cutoff_ms =
-            now_ms().saturating_sub(i64::try_from(older_than.as_millis()).unwrap_or(i64::MAX));
-        let ops = self.rows_older_than("sync_queue", cutoff_ms)?;
-        let receipts = self.rows_older_than("applied", cutoff_ms)?;
+        // A cutoff is a boundary, not a duration, once it is compared against a
+        // reading: `(ms, counter) < (cutoff, 0)` is the tuple form of
+        // "older than the cutoff in milliseconds".
+        let cutoff = Hlc {
+            ms: now_ms().saturating_sub(i64::try_from(older_than.as_millis()).unwrap_or(i64::MAX)),
+            counter: 0,
+        };
+        let pins = self.divergence_pins()?;
+        let ops = self.rows_older_than("sync_queue", cutoff, &pins)?;
+        let receipts = self.rows_older_than("applied", cutoff, &pins)?;
 
         let tx = self.db.transaction()?;
         for (store, dropped) in &ops {
             tx.execute(
-                "DELETE FROM sync_queue WHERE store=?1 AND hlc_ms<?2",
-                params![store, cutoff_ms],
+                "DELETE FROM sync_queue WHERE store=?1 AND (hlc_ms,hlc_counter)<(?2,?3)",
+                params![
+                    store,
+                    dropped.boundary.ms,
+                    i64::from(dropped.boundary.counter)
+                ],
             )?;
             raise_horizon(&tx, store, dropped.newest)?;
         }
         for (store, dropped) in &receipts {
             tx.execute(
-                "DELETE FROM applied WHERE store=?1 AND hlc_ms<?2",
-                params![store, cutoff_ms],
+                "DELETE FROM applied WHERE store=?1 AND (hlc_ms,hlc_counter)<(?2,?3)",
+                params![
+                    store,
+                    dropped.boundary.ms,
+                    i64::from(dropped.boundary.counter)
+                ],
             )?;
             raise_horizon(&tx, store, dropped.newest)?;
         }
         tx.commit()?;
 
         Ok(CompactionReport {
-            cutoff_ms,
+            cutoff_ms: cutoff.ms,
             dropped_ops: ops
                 .iter()
                 .map(|(store, dropped)| (store.clone(), dropped.count))
@@ -521,8 +574,62 @@ impl Vfs {
                 .iter()
                 .map(|(store, dropped)| (store.clone(), dropped.count))
                 .collect(),
+            // Only a divergence older than the cutoff is holding the pass back:
+            // one above it was never going to be reached anyway.
+            pinned: pins.into_iter().filter(|(_, pin)| *pin < cutoff).collect(),
             horizons: self.horizons()?,
         })
+    }
+
+    /// The divergences this store is still holding, oldest first.
+    ///
+    /// A caller needs to see these to resolve them, and needs to resolve them
+    /// for compaction to get past their clocks.
+    pub fn divergences(&self) -> Result<Vec<Divergence>, VfsError> {
+        let mut statement = self.db.prepare(
+            "SELECT store, hlc_ms, hlc_counter, path, detected_at_ms FROM diverged
+             ORDER BY store, hlc_ms, hlc_counter",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(Divergence {
+                store: row.get(0)?,
+                hlc: Hlc {
+                    ms: row.get(1)?,
+                    counter: row.get::<_, i64>(2)? as u32,
+                },
+                path: row.get(3)?,
+                detected_at_ms: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(VfsError::from)
+    }
+
+    /// Settle one divergence without the op ever being applied.
+    ///
+    /// For the case where the local head wins: once the difference is decided,
+    /// the op is no longer unfinalised, and compaction may pass its clock. A
+    /// peer that keeps re-offering it will diverge again and record a fresh
+    /// record, which is correct — that divergence is still real until the two
+    /// sides agree on content.
+    pub fn resolve_divergence(&self, store: &str, hlc: Hlc) -> Result<bool, VfsError> {
+        let removed = self.db.execute(
+            "DELETE FROM diverged WHERE store=?1 AND hlc_ms=?2 AND hlc_counter=?3",
+            params![store, hlc.ms, i64::from(hlc.counter)],
+        )?;
+        Ok(removed > 0)
+    }
+
+    /// The earliest unresolved divergence per store, which is where compaction
+    /// has to stop for that store.
+    fn divergence_pins(&self) -> Result<BTreeMap<String, Hlc>, VfsError> {
+        let mut pins: BTreeMap<String, Hlc> = BTreeMap::new();
+        for divergence in self.divergences()? {
+            let entry = pins.entry(divergence.store).or_insert(divergence.hlc);
+            if divergence.hlc < *entry {
+                *entry = divergence.hlc;
+            }
+        }
+        Ok(pins)
     }
 
     /// The live namespace, as a replacement for a log a peer can no longer use.
@@ -702,6 +809,14 @@ impl Vfs {
         // redundant — keeping them would regrow the record the snapshot exists
         // to make unnecessary.
         for (store, hlc) in snapshot.watermark.origins() {
+            // A divergence at or below the watermark stops being a divergence
+            // here: the write it deferred is the state that was just installed.
+            // One above the watermark is still open, and stays above the horizon
+            // exactly as it would after a compaction pass.
+            tx.execute(
+                "DELETE FROM diverged WHERE store=?1 AND (hlc_ms,hlc_counter)<=(?2,?3)",
+                params![store, hlc.ms, i64::from(hlc.counter)],
+            )?;
             raise_horizon(&tx, store, hlc)?;
             tx.execute(
                 "DELETE FROM applied WHERE store=?1 AND (hlc_ms,hlc_counter)<=(?2,?3)",
@@ -712,21 +827,23 @@ impl Vfs {
         Ok(())
     }
 
-    /// Rows older than `cutoff_ms` in one log table, counted and dated per store.
+    /// Rows older than one cutoff in a log table, counted and dated per store.
     ///
     /// The table name is a compile-time constant, never user input; the cutoff
-    /// travels as a parameter. Returning the newest dropped reading per store
-    /// here is what makes the delete and the horizon agree about what was
-    /// actually removed.
+    /// travels as a parameter. Each store gets its own boundary — the cutoff,
+    /// unless an unresolved divergence sits below it — and the boundary is
+    /// returned with the count so the delete and the horizon agree about exactly
+    /// what was removed.
     fn rows_older_than(
         &self,
         table: &str,
-        cutoff_ms: i64,
+        cutoff: Hlc,
+        pins: &BTreeMap<String, Hlc>,
     ) -> Result<BTreeMap<String, Dropped>, VfsError> {
         let mut statement = self.db.prepare(&format!(
-            "SELECT store, hlc_ms, hlc_counter FROM {table} WHERE hlc_ms<?1"
+            "SELECT store, hlc_ms, hlc_counter FROM {table} WHERE (hlc_ms,hlc_counter)<(?1,?2)"
         ))?;
-        let rows = statement.query_map(params![cutoff_ms], |row| {
+        let rows = statement.query_map(params![cutoff.ms, i64::from(cutoff.counter)], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 Hlc {
@@ -738,9 +855,14 @@ impl Vfs {
         let mut dropped: BTreeMap<String, Dropped> = BTreeMap::new();
         for row in rows {
             let (store, hlc) = row?;
+            let boundary = pins.get(&store).map_or(cutoff, |pin| cutoff.min(*pin));
+            if hlc >= boundary {
+                continue;
+            }
             let entry = dropped.entry(store).or_insert(Dropped {
                 count: 0,
                 newest: hlc,
+                boundary,
             });
             entry.count += 1;
             if hlc > entry.newest {
@@ -755,6 +877,9 @@ impl Vfs {
 struct Dropped {
     count: u64,
     newest: Hlc,
+    /// The reading the drop stops short of: the cutoff, or an unresolved
+    /// divergence below it.
+    boundary: Hlc,
 }
 
 /// Raise `store`'s horizon to `hlc`, never lowering it.
@@ -1306,6 +1431,199 @@ mod tests {
             b.horizons().unwrap().get(&op.store),
             report.horizons.get(&op.store)
         );
+    }
+
+    #[test]
+    fn an_unresolved_divergence_pins_compaction_so_the_op_stays_deferred() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, mut b) = pair(dir.path());
+
+        // Both stores start from the same content, then each edits it.
+        a.put("f.md", b"v1", "text/markdown", Expect::Any).unwrap();
+        drain(&mut b, &mut a);
+        a.put("f.md", b"from-a", "text/markdown", Expect::Any)
+            .unwrap();
+        b.put("f.md", b"from-b", "text/markdown", Expect::Any)
+            .unwrap();
+
+        let cursor = b.sync_cursor().unwrap();
+        let op = a.answer_sync(&cursor, 100).unwrap().ops[0].clone();
+        assert_eq!(
+            b.apply_remote(&op, Some(b"from-a")).unwrap(),
+            ApplyOutcome::Diverged
+        );
+
+        // The refusal is recorded rather than forgotten. Without the record
+        // compaction has nothing to stop at, and the retry below would be
+        // swallowed as a duplicate of a write this store does not hold.
+        let divergences = b.divergences().unwrap();
+        assert_eq!(divergences.len(), 1);
+        assert_eq!(divergences[0].store, op.store);
+        assert_eq!(divergences[0].hlc, op.hlc);
+        assert_eq!(divergences[0].path, "f.md");
+
+        // Compaction is asked to take everything, and the clock has moved past
+        // the op — but the horizon must not reach an open divergence.
+        wait_past(op.hlc);
+        let report = b.compact(std::time::Duration::ZERO).unwrap();
+        assert!(
+            report.horizons.get(&op.store).is_none_or(|h| *h < op.hlc),
+            "{:?}",
+            report.horizons
+        );
+        assert_eq!(
+            report.pinned.get(&op.store),
+            Some(&op.hlc),
+            "the pass is held at the divergence, and the report says so"
+        );
+
+        // The retry is deferred again, not counted as already applied, and the
+        // local head is still the one b wrote.
+        assert_eq!(
+            b.apply_remote(&op, Some(b"from-a")).unwrap(),
+            ApplyOutcome::Diverged
+        );
+        assert_eq!(b.get("f.md").unwrap(), b"from-b");
+    }
+
+    #[test]
+    fn resolving_a_divergence_lets_the_horizon_move_past_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, mut b) = pair(dir.path());
+        a.put("f.md", b"v1", "text/markdown", Expect::Any).unwrap();
+        drain(&mut b, &mut a);
+        a.put("f.md", b"from-a", "text/markdown", Expect::Any)
+            .unwrap();
+        b.put("f.md", b"from-b", "text/markdown", Expect::Any)
+            .unwrap();
+
+        let cursor = b.sync_cursor().unwrap();
+        let op = a.answer_sync(&cursor, 100).unwrap().ops[0].clone();
+        assert_eq!(
+            b.apply_remote(&op, Some(b"from-a")).unwrap(),
+            ApplyOutcome::Diverged
+        );
+        wait_past(op.hlc);
+        let pinned = b.compact(std::time::Duration::ZERO).unwrap();
+        assert_eq!(pinned.pinned.get(&op.store), Some(&op.hlc));
+
+        // A human decides the local head wins, which is the only thing that can
+        // settle a difference the store cannot settle itself.
+        assert!(b.resolve_divergence(&op.store, op.hlc).unwrap());
+        assert!(b.divergences().unwrap().is_empty());
+        assert!(
+            !b.resolve_divergence(&op.store, op.hlc).unwrap(),
+            "resolving is not something that happens twice"
+        );
+
+        // With nothing open, a later write can be dropped on the next pass and
+        // the horizon passes the old divergence clock.
+        a.put("g.md", b"g", "text/markdown", Expect::Any).unwrap();
+        let cursor = b.sync_cursor().unwrap();
+        let batch = a.answer_sync(&cursor, 100).unwrap();
+        let later = batch
+            .ops
+            .iter()
+            .find(|candidate| candidate.path == "g.md")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            b.apply_remote(&later, Some(b"g")).unwrap(),
+            ApplyOutcome::Applied
+        );
+
+        wait_past(later.hlc);
+        let report = b.compact(std::time::Duration::ZERO).unwrap();
+        assert!(report.pinned.is_empty());
+        assert!(
+            report.horizons.get(&op.store).is_some_and(|h| *h > op.hlc),
+            "{:?}",
+            report.horizons
+        );
+
+        // And the op that was deferred is now genuinely moot rather than
+        // pending: the resolution is what makes that difference.
+        assert_eq!(
+            b.apply_remote(&op, Some(b"from-a")).unwrap(),
+            ApplyOutcome::Duplicate
+        );
+    }
+
+    #[test]
+    fn a_snapshot_settles_the_divergences_its_watermark_covers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, mut b) = pair(dir.path());
+        a.put("f.md", b"v1", "text/markdown", Expect::Any).unwrap();
+        drain(&mut b, &mut a);
+        a.put("f.md", b"from-a", "text/markdown", Expect::Any)
+            .unwrap();
+        b.put("f.md", b"from-b", "text/markdown", Expect::Any)
+            .unwrap();
+
+        let cursor = b.sync_cursor().unwrap();
+        let op = a.answer_sync(&cursor, 100).unwrap().ops[0].clone();
+        assert_eq!(
+            b.apply_remote(&op, Some(b"from-a")).unwrap(),
+            ApplyOutcome::Diverged
+        );
+
+        // A snapshot replaces the state the divergence was a difference about,
+        // so it settles the record rather than leaving a stale pin behind.
+        let ids: Vec<i64> = b.pending(10).unwrap().iter().map(|op| op.id).collect();
+        b.ack(&ids).unwrap();
+        let snapshot = a.snapshot().unwrap();
+        let content = snapshot_content(&a, &snapshot);
+        b.apply_snapshot(&snapshot, &content).unwrap();
+
+        assert!(b.divergences().unwrap().is_empty());
+        assert_eq!(b.get("f.md").unwrap(), b"from-a");
+        assert!(
+            b.horizons()
+                .unwrap()
+                .get(&op.store)
+                .is_some_and(|horizon| *horizon >= op.hlc)
+        );
+        assert_eq!(
+            b.apply_remote(&op, Some(b"from-a")).unwrap(),
+            ApplyOutcome::Duplicate,
+            "the state now holds the write the op wanted"
+        );
+    }
+
+    #[test]
+    fn a_divergence_that_finally_fits_is_settled_and_stops_pinning() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, mut b) = pair(dir.path());
+        a.put("f.md", b"v1", "text/markdown", Expect::Any).unwrap();
+        drain(&mut b, &mut a);
+
+        // b edits the path, so a's next write was based on a head b no longer
+        // has: the write is deferred rather than overwriting b's work.
+        b.put("f.md", b"from-b", "text/markdown", Expect::Any)
+            .unwrap();
+        a.put("f.md", b"from-a", "text/markdown", Expect::Any)
+            .unwrap();
+        let cursor = b.sync_cursor().unwrap();
+        let op = a.answer_sync(&cursor, 100).unwrap().ops[0].clone();
+        assert_eq!(
+            b.apply_remote(&op, Some(b"from-a")).unwrap(),
+            ApplyOutcome::Diverged
+        );
+        assert_eq!(b.divergences().unwrap().len(), 1);
+
+        // b puts its head back to what a's write was built on. The retry now
+        // fits, so the deferral is settled by the write itself and the record
+        // must not linger.
+        b.put("f.md", b"v1", "text/markdown", Expect::Any).unwrap();
+        assert_eq!(
+            b.apply_remote(&op, Some(b"from-a")).unwrap(),
+            ApplyOutcome::Applied
+        );
+        assert!(
+            b.divergences().unwrap().is_empty(),
+            "a resolved divergence must not keep pinning compaction"
+        );
+        assert_eq!(b.get("f.md").unwrap(), b"from-a");
     }
 
     #[test]
