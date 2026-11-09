@@ -301,7 +301,7 @@ struct Stamp {
 pub struct Vfs {
     root: PathBuf,
     role: NodeRole,
-    db: Connection,
+    pub(crate) db: Connection,
     blobs: BlobStore,
     writer: Writer,
     hlc: Hlc,
@@ -426,6 +426,12 @@ impl Vfs {
                hlc_counter INTEGER NOT NULL DEFAULT 0,
                base_content_id TEXT,
                worktree TEXT NOT NULL DEFAULT ''
+             );
+             CREATE TABLE IF NOT EXISTS applied(
+               origin TEXT NOT NULL,
+               hlc_ms INTEGER NOT NULL,
+               hlc_counter INTEGER NOT NULL,
+               PRIMARY KEY(origin, hlc_ms, hlc_counter)
              );
              CREATE TABLE IF NOT EXISTS leases(
                path TEXT PRIMARY KEY,
@@ -930,6 +936,129 @@ impl Vfs {
             "DELETE FROM leases WHERE path=?1 AND owner=?2",
             params![path, owner],
         )?;
+        Ok(())
+    }
+
+    /// Record that a remote op has been applied. Returns 0 when it already was.
+    ///
+    /// This is the duplicate check: a sender that retries, or a second path
+    /// delivering the same op, must not apply a write twice.
+    pub(crate) fn mark_applied(&self, origin: &str, hlc: Hlc) -> Result<usize, VfsError> {
+        self.db
+            .execute(
+                "INSERT OR IGNORE INTO applied(origin,hlc_ms,hlc_counter) VALUES(?1,?2,?3)",
+                params![origin, hlc.ms, i64::from(hlc.counter)],
+            )
+            .map_err(VfsError::from)
+    }
+
+    pub(crate) fn unmark_applied(&self, origin: &str, hlc: Hlc) -> Result<(), VfsError> {
+        self.db.execute(
+            "DELETE FROM applied WHERE origin=?1 AND hlc_ms=?2 AND hlc_counter=?3",
+            params![origin, hlc.ms, i64::from(hlc.counter)],
+        )?;
+        Ok(())
+    }
+
+    /// High-water marks for ops applied from other stores.
+    pub(crate) fn applied_cursor(&self) -> Result<crate::SyncCursor, VfsError> {
+        let mut cursor = crate::SyncCursor::new();
+        let mut statement = self
+            .db
+            .prepare("SELECT origin, hlc_ms, hlc_counter FROM applied")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                Hlc {
+                    ms: row.get(1)?,
+                    counter: row.get::<_, i64>(2)? as u32,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (origin, hlc) = row?;
+            cursor.observe(&origin, hlc);
+        }
+        Ok(cursor)
+    }
+
+    pub(crate) fn has_content(&self, content_id: &ContentId) -> Result<bool, VfsError> {
+        Ok(self.blobs.get(content_id).is_ok())
+    }
+
+    /// Apply a remote write without enqueueing a new local op.
+    ///
+    /// The op is already in the origin's log; recording it again here would
+    /// make every store re-broadcast every op it ever received, and the log
+    /// would grow with echoes instead of events.
+    pub(crate) fn apply_put(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        current: Option<&FileEntry>,
+        actor: &str,
+        origin: &str,
+    ) -> Result<(), VfsError> {
+        let path = normalize_path(path)?;
+        let content_id = self.blobs.put(bytes)?;
+        let version = current.map_or(1, |entry| entry.version + 1);
+        let media_type = current
+            .map(|entry| entry.media_type.clone())
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let now = now_ms();
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "INSERT INTO files(path,content_id,size,media_type,version,hydration,pinned,updated_at_ms)
+             VALUES(?1,?2,?3,?4,?5,'present',0,?6)
+             ON CONFLICT(path) DO UPDATE SET content_id=excluded.content_id,size=excluded.size,
+               media_type=excluded.media_type,version=excluded.version,hydration='present',
+               updated_at_ms=excluded.updated_at_ms",
+            params![
+                path,
+                content_id.to_string(),
+                bytes.len() as i64,
+                media_type,
+                version as i64,
+                now
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO versions(path,version,content_id,size,created_at_ms,actor,origin)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                path,
+                version as i64,
+                content_id.to_string(),
+                bytes.len() as i64,
+                now,
+                actor,
+                origin
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn apply_remove(&mut self, path: &str) -> Result<(), VfsError> {
+        let path = normalize_path(path)?;
+        self.db
+            .execute("DELETE FROM files WHERE path=?1", params![path])?;
+        Ok(())
+    }
+
+    pub(crate) fn apply_mkdir(&mut self, path: &str) -> Result<(), VfsError> {
+        let path = normalize_path(path)?;
+        self.db.execute(
+            "INSERT OR IGNORE INTO directories(path,created_at_ms) VALUES(?1,?2)",
+            params![path, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn apply_rmdir(&mut self, path: &str) -> Result<(), VfsError> {
+        let path = normalize_path(path)?;
+        self.db
+            .execute("DELETE FROM directories WHERE path=?1", params![path])?;
         Ok(())
     }
 

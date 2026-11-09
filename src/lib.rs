@@ -11,6 +11,7 @@ mod hydrate;
 mod path;
 mod policy;
 mod store;
+mod sync;
 mod transfer;
 mod vfs;
 
@@ -23,11 +24,12 @@ pub use content::ContentId;
 pub use hydrate::Hydrator;
 pub use path::normalize_path;
 pub use policy::{PathClass, PathPolicy};
+pub use sync::{ApplyOutcome, SyncBatch, SyncCursor};
 pub use transfer::{
     ExportReport, GitPointer, IngestReport, SourceMode, export_dir, ingest_dir,
     ingest_dir_with_policy,
 };
 pub use vfs::{
-    Expect, FileEntry, Hydration, Lease, LodPolicy, NodeRole, SyncOp, SyncOpKind, Version, Vfs,
-    VfsError, Writer,
+    Expect, FileEntry, Hlc, Hydration, Lease, LodPolicy, NodeRole, SyncOp, SyncOpKind, Version,
+    Vfs, VfsError, Writer,
 };
