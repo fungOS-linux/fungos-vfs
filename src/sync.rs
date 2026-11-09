@@ -1627,6 +1627,62 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_does_not_let_a_new_write_land_under_a_horizon() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("a");
+
+        let mut store = Vfs::open(&root).unwrap();
+        store
+            .put("one.md", b"one", "text/markdown", Expect::Any)
+            .unwrap();
+        let dropped = store.pending(10).unwrap().last().unwrap().clone();
+        wait_past(dropped.hlc);
+        let report = store.compact(Duration::ZERO).unwrap();
+        assert!(
+            report
+                .horizons
+                .get(store.store())
+                .is_some_and(|horizon| *horizon >= dropped.hlc),
+            "the op is gone and the horizon says so"
+        );
+        drop(store);
+
+        // The clock the reopened store reads is an hour behind the reading it
+        // already used, which is what a restored VM or a corrected RTC looks
+        // like. A store that restarted at zero would stamp under its own
+        // horizon here.
+        crate::vfs::set_stored_hlc(
+            &root,
+            Hlc {
+                ms: now_ms() + 3_600_000,
+                counter: 0,
+            },
+        );
+        let mut store = Vfs::open(&root).unwrap();
+
+        // The horizon, not the clock, is what turns an old op away.
+        assert_eq!(
+            store.apply_remote(&dropped, Some(b"one")).unwrap(),
+            ApplyOutcome::Duplicate
+        );
+
+        // And the write made after the restart is above that horizon, so no peer
+        // can mistake it for one it has already seen.
+        store
+            .put("two.md", b"two", "text/markdown", Expect::Any)
+            .unwrap();
+        let fresh = store.pending(10).unwrap().last().unwrap().hlc;
+        assert!(fresh > dropped.hlc);
+        assert!(
+            store
+                .horizons()
+                .unwrap()
+                .get(store.store())
+                .is_some_and(|horizon| fresh > *horizon)
+        );
+    }
+
+    #[test]
     fn compacting_twice_reports_nothing_the_second_time() {
         let dir = tempfile::tempdir().unwrap();
         let (mut a, mut b) = pair(dir.path());
