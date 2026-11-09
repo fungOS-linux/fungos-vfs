@@ -688,7 +688,7 @@ impl Vfs {
             }
         }
         let content_id = self.blobs.put(bytes)?;
-        let version = current.as_ref().map_or(1, |entry| entry.version + 1);
+        let version = self.next_version(&path)?;
         let now = now_ms();
         let stamp = self.stamp()?;
         let base = current.as_ref().map(|entry| entry.content_id.0.clone());
@@ -736,6 +736,21 @@ impl Vfs {
         self.file(&path)?.ok_or_else(|| VfsError::NotFound(path))
     }
 
+    /// The next version number for a path, taken from its history.
+    ///
+    /// A version belongs to the path's history, not to whether the path exists
+    /// at this moment. Reading it off the `files` row instead hands out 1 again
+    /// to a path that was removed and written back, which collides with the
+    /// history still on disk and fails the insert.
+    fn next_version(&self, path: &str) -> Result<u64, VfsError> {
+        let version: i64 = self.db.query_row(
+            "SELECT COALESCE(MAX(version),0)+1 FROM versions WHERE path=?1",
+            params![path],
+            |row| row.get(0),
+        )?;
+        Ok(version as u64)
+    }
+
     /// Pull-through cache fill. The bytes must match the registered content id.
     pub fn hydrate(&mut self, path: &str, bytes: &[u8]) -> Result<FileEntry, VfsError> {
         let path = normalize_path(path)?;
@@ -762,12 +777,20 @@ impl Vfs {
     ) -> Result<FileEntry, VfsError> {
         let path = normalize_path(path)?;
         let now = now_ms();
+        let version = self.next_version(&path)?;
         self.db.execute(
             "INSERT INTO files(path,content_id,size,media_type,version,hydration,pinned,updated_at_ms)
-             VALUES(?1,?2,?3,?4,1,'placeholder',0,?5)
+             VALUES(?1,?2,?3,?4,?5,'placeholder',0,?6)
              ON CONFLICT(path) DO UPDATE SET content_id=excluded.content_id,size=excluded.size,
                media_type=excluded.media_type,hydration='placeholder',updated_at_ms=excluded.updated_at_ms",
-            params![path, content_id.to_string(), size as i64, media_type, now],
+            params![
+                path,
+                content_id.to_string(),
+                size as i64,
+                media_type,
+                version as i64,
+                now
+            ],
         )?;
         self.file(&path)?.ok_or_else(|| VfsError::NotFound(path))
     }
@@ -1179,7 +1202,7 @@ impl Vfs {
     ) -> Result<(), VfsError> {
         let path = normalize_path(path)?;
         let content_id = self.blobs.put(bytes)?;
-        let version = current.map_or(1, |entry| entry.version + 1);
+        let version = self.next_version(&path)?;
         let media_type = current
             .map(|entry| entry.media_type.clone())
             .unwrap_or_else(|| "application/octet-stream".to_string());
@@ -1728,5 +1751,46 @@ mod tests {
             })
             .collect();
         assert_eq!(outcomes, vec![crate::ApplyOutcome::Applied; 2]);
+    }
+
+    #[test]
+    fn put_after_remove_continues_the_path_history() {
+        let (_temp, mut vfs) = workspace();
+        vfs.put("notes/a.md", b"one", "text/markdown", Expect::Any)
+            .unwrap();
+        vfs.remove("notes/a.md").unwrap();
+
+        // Recreating a path is an ordinary thing to do. The version used to be
+        // read off the now-absent `files` row, so it started at 1 again and the
+        // insert collided with history that was still there.
+        let entry = vfs
+            .put("notes/a.md", b"two", "text/markdown", Expect::Any)
+            .unwrap();
+        assert_eq!(entry.version, 2);
+
+        // A version is the path's, not the current file's: both writes are still
+        // in the history, in order. (The removal itself is not a version — this
+        // crate has no tombstone — which is why the numbers continue rather than
+        // restarting.)
+        let history = vfs.history("notes/a.md").unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|version| version.version)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(history[1].content_id, entry.content_id);
+    }
+
+    #[test]
+    fn a_directory_can_be_recreated_after_removal() {
+        let (_temp, mut vfs) = workspace();
+        vfs.mkdir("projects").unwrap();
+        vfs.rmdir("projects").unwrap();
+        // Directories carry no version rows at all, so the shape that broke `put`
+        // does not exist here. The test pins that they stay recreatable.
+        vfs.mkdir("projects").unwrap();
+        assert!(vfs.is_directory("projects").unwrap());
     }
 }
