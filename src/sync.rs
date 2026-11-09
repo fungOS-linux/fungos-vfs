@@ -18,12 +18,34 @@
 //!   receiver asks for it by content id, and what arrives is verified against
 //!   that id before it is stored, so a corrupted transfer cannot poison the
 //!   store.
+//! - **Truncation.** A log that only ever grows is a log that eventually takes
+//!   longer to scan than the work it describes, so rows older than a cutoff are
+//!   dropped. Dropping them is the easy half. The honest half is that a peer
+//!   whose cursor now sits behind what was dropped can no longer be caught up
+//!   from the log at all: the ops that would have filled its gap are exactly
+//!   the ones that are gone. Such a peer is told so and handed a snapshot of
+//!   the live namespace at a watermark instead of a short delta it would have
+//!   no way to recognise as short.
+//!
+//! The horizon is a watermark, not a set of operations. It says "nothing at or
+//! below this clock is still here", which is enough to recognise a redelivery
+//! and enough to know when to snapshot; it is not a claim about every op that
+//! ever passed below it.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::{ContentId, Hlc, SyncOpKind, Vfs, VfsError};
+use crate::{ContentId, Hlc, SyncOpKind, Vfs, VfsError, normalize_path, vfs::now_ms};
+
+/// Attribution for versions that arrived as wholesale state rather than as an
+/// authored op. A snapshot does not say who wrote each path, and inventing an
+/// author would be worse than saying plainly that nobody is named.
+const SNAPSHOT_ACTOR: &str = "snapshot";
 
 /// The highest clock reading this store has seen from each peer store.
 ///
@@ -67,6 +89,16 @@ impl SyncCursor {
     }
 }
 
+/// Whether `cursor` sits below `horizons` for any store it names.
+///
+/// One store behind is all it takes: the log has a gap the peer would fall
+/// into, and no page of it can close that gap.
+fn behind_horizon(cursor: &SyncCursor, horizons: &BTreeMap<String, Hlc>) -> bool {
+    cursor
+        .origins()
+        .any(|(store, seen)| horizons.get(store).is_some_and(|hlc| *hlc > seen))
+}
+
 /// A sync request, as it travels.
 ///
 /// The wire is deliberately plain: a carrier only has to move these bytes, so
@@ -82,7 +114,67 @@ pub struct SyncRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SyncResponse {
     pub ops: Vec<crate::SyncOp>,
+    /// Present instead of a delta when the requester's cursor is behind this
+    /// store's horizon: the ops the requester is missing were dropped, so the
+    /// live state is the only complete answer left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<Snapshot>,
     pub content: Vec<ContentBlob>,
+}
+
+/// The live namespace, for a peer that cannot be caught up from the log.
+///
+/// Deliberately not stored anywhere. A stored snapshot would be a second copy
+/// of the state that could drift from the first, and a watermark recorded
+/// beside it would then describe a state that no longer exists. Read at shoot
+/// time, the entries and the watermark are the same instant by construction.
+///
+/// Entries name content by id rather than carrying bytes: the blobs travel the
+/// same verified path ops already use, so a snapshot cannot smuggle in content
+/// that does not match its name.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Snapshot {
+    /// One entry per live path.
+    pub entries: Vec<SnapshotEntry>,
+    /// Everything this store had seen when the entries were read, per store.
+    /// A receiver adopts this as its horizon: below it, the entries are the
+    /// state; above it, the log still has the ops.
+    pub watermark: SyncCursor,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SnapshotEntry {
+    pub path: String,
+    pub kind: SnapshotKind,
+    /// The blob this path holds. Absent for a directory, which has no content
+    /// of its own — it exists so an empty directory survives the trip.
+    pub content_id: Option<ContentId>,
+    /// Carried because a media type is namespace metadata, not something the
+    /// bytes imply: a snapshot that dropped it would silently retype every
+    /// file it restored.
+    pub media_type: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotKind {
+    File,
+    Directory,
+}
+
+/// What one compaction pass dropped, and where the log now starts.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CompactionReport {
+    /// Rows strictly older than this clock reading were eligible to be dropped.
+    pub cutoff_ms: i64,
+    /// Outbound ops dropped, per store.
+    pub dropped_ops: BTreeMap<String, u64>,
+    /// Applied-op receipts dropped, per store.
+    pub dropped_receipts: BTreeMap<String, u64>,
+    /// The horizon per store after this pass: the highest reading this store
+    /// no longer keeps. Reported even when nothing was dropped, so a caller
+    /// can see the point a peer would have to be behind to get a snapshot.
+    pub horizons: BTreeMap<String, Hlc>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -114,6 +206,8 @@ pub enum ApplyOutcome {
     Duplicate,
     /// The head moved under the op, so applying it would discard that write.
     Diverged,
+    /// A whole state replaced this store's namespace instead of a delta.
+    Snapshot,
 }
 
 /// One store's answer to a sync request.
@@ -121,6 +215,8 @@ pub struct SyncBatch {
     pub ops: Vec<crate::SyncOp>,
     /// Content the sender must be asked for before these ops can be applied.
     pub missing_content: Vec<ContentId>,
+    /// Set when `ops` is empty because a delta would have had a hole in it.
+    pub snapshot: Option<Snapshot>,
 }
 
 impl Vfs {
@@ -128,11 +224,21 @@ impl Vfs {
     /// the bytes they carry.
     pub fn serve_sync(&mut self, request: &SyncRequest) -> Result<SyncResponse, VfsError> {
         let batch = self.answer_sync(&request.cursor, request.limit)?;
+        // One blob may serve several paths, and a snapshot names every path it
+        // has: sending the same bytes twice would make the answer grow with
+        // the namespace rather than with the content in it.
+        let mut wanted: BTreeSet<&ContentId> = BTreeSet::new();
+        wanted.extend(batch.ops.iter().filter_map(|op| op.content_id.as_ref()));
+        if let Some(snapshot) = &batch.snapshot {
+            wanted.extend(
+                snapshot
+                    .entries
+                    .iter()
+                    .filter_map(|entry| entry.content_id.as_ref()),
+            );
+        }
         let mut content = Vec::new();
-        for op in &batch.ops {
-            let Some(content_id) = &op.content_id else {
-                continue;
-            };
+        for content_id in wanted {
             // Read by content id, not by path: the path may have moved on since
             // the op was written, but the blob it names has not.
             match self.content(content_id) {
@@ -142,17 +248,25 @@ impl Vfs {
         }
         Ok(SyncResponse {
             ops: batch.ops,
+            snapshot: batch.snapshot,
             content,
         })
     }
 
     /// Apply a response, returning one outcome per op in order.
+    ///
+    /// A response that carries a snapshot yields a single `Snapshot` outcome
+    /// and no per-op outcomes: the state was replaced, not replayed.
     pub fn apply_sync(&mut self, response: &SyncResponse) -> Result<Vec<ApplyOutcome>, VfsError> {
         let mut blobs = BTreeMap::new();
         for blob in &response.content {
             blobs.insert(blob.id.clone(), blob.decode()?);
         }
         let mut outcomes = Vec::with_capacity(response.ops.len());
+        if let Some(snapshot) = &response.snapshot {
+            self.apply_snapshot_with(snapshot, &blobs)?;
+            outcomes.push(ApplyOutcome::Snapshot);
+        }
         for op in &response.ops {
             let bytes = op
                 .content_id
@@ -190,6 +304,13 @@ impl Vfs {
         {
             cursor.observe(&store, hlc);
         }
+        // A truncated prefix still counts as seen. Reporting a lower reading
+        // here would ask peers to resend ops this store has decided not to
+        // keep, and — worse — would let a peer that is genuinely behind look
+        // caught up for the stores it was compacted against.
+        for (store, hlc) in self.horizons()? {
+            cursor.observe(&store, hlc);
+        }
         Ok(cursor)
     }
 
@@ -216,6 +337,28 @@ impl Vfs {
         cursor: &SyncCursor,
         limit: usize,
     ) -> Result<SyncBatch, VfsError> {
+        // A peer behind the horizon is missing ops this store has dropped, and
+        // no amount of paging will produce them. Handing it the rest of the log
+        // would look like a complete delta and leave it silently short of the
+        // truth, so it gets the state itself instead. `limit` does not apply:
+        // a snapshot is not a page, it is the answer.
+        if behind_horizon(cursor, &self.horizons()?) {
+            let snapshot = self.snapshot()?;
+            let mut missing_content = Vec::new();
+            for entry in &snapshot.entries {
+                let Some(content_id) = &entry.content_id else {
+                    continue;
+                };
+                if !self.has_content(content_id)? {
+                    missing_content.push(content_id.clone());
+                }
+            }
+            return Ok(SyncBatch {
+                ops: Vec::new(),
+                missing_content,
+                snapshot: Some(snapshot),
+            });
+        }
         let ops = self.ops_after(cursor, limit)?;
         let mut missing_content = Vec::new();
         for op in &ops {
@@ -229,6 +372,7 @@ impl Vfs {
         Ok(SyncBatch {
             ops,
             missing_content,
+            snapshot: None,
         })
     }
 
@@ -241,6 +385,17 @@ impl Vfs {
         op: &crate::SyncOp,
         bytes: Option<&[u8]>,
     ) -> Result<ApplyOutcome, VfsError> {
+        // Truncation removed the receipt, so the horizon is what stands in for
+        // it: anything at or below what was dropped is already reflected in
+        // this store's state, and re-applying it would either duplicate a write
+        // or read as a divergence from a head this store never lost.
+        if self
+            .horizons()?
+            .get(&op.store)
+            .is_some_and(|horizon| *horizon >= op.hlc)
+        {
+            return Ok(ApplyOutcome::Duplicate);
+        }
         if self.mark_applied(&op.store, op.hlc)? == 0 {
             return Ok(ApplyOutcome::Duplicate);
         }
@@ -284,6 +439,344 @@ impl Vfs {
         }
         Ok(ApplyOutcome::Applied)
     }
+
+    /// The highest clock this store has dropped from its log, per store.
+    ///
+    /// Keyed exactly like the cursor, because it answers the same kind of
+    /// question: what do you already know about this store? The difference is
+    /// what it costs to be wrong. A cursor that is too high asks a peer for ops
+    /// it has already seen; a horizon that is too high tells a peer it is
+    /// caught up when it is not, so a horizon only ever moves forward and only
+    /// to something that was actually dropped.
+    pub fn horizons(&self) -> Result<BTreeMap<String, Hlc>, VfsError> {
+        let mut statement = self
+            .db
+            .prepare("SELECT store, hlc_ms, hlc_counter FROM horizon")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                Hlc {
+                    ms: row.get(1)?,
+                    counter: row.get::<_, i64>(2)? as u32,
+                },
+            ))
+        })?;
+        let mut horizons = BTreeMap::new();
+        for row in rows {
+            let (store, hlc) = row?;
+            horizons.insert(store, hlc);
+        }
+        Ok(horizons)
+    }
+
+    /// Drop log rows older than `older_than`, and record how far the log now
+    /// starts.
+    ///
+    /// Both halves of the log go together. The outbound ops are what peers can
+    /// still be caught up from; the receipts are what tells this store it has
+    /// already seen an op. Dropping either without raising the horizon would be
+    /// the quiet lie this whole module exists to avoid: the rows would be gone,
+    /// and nothing would say so, so a peer would be handed the delta that
+    /// follows the gap as if it were the whole story.
+    ///
+    /// Nothing at or above the cutoff is touched, so a writer that is running
+    /// right now cannot lose the ops it has not yet told anyone about. Running
+    /// it twice with the same cutoff drops nothing the second time, because the
+    /// horizon it raised is what would have been dropped.
+    ///
+    /// Worth knowing: the horizon is a watermark, not a census of applied ops.
+    /// A divergence left unresolved when its receipt is compacted is afterwards
+    /// reported as a duplicate, because the receipt that distinguished the two
+    /// is exactly what was dropped to make room.
+    pub fn compact(&mut self, older_than: Duration) -> Result<CompactionReport, VfsError> {
+        let cutoff_ms =
+            now_ms().saturating_sub(i64::try_from(older_than.as_millis()).unwrap_or(i64::MAX));
+        let ops = self.rows_older_than("sync_queue", cutoff_ms)?;
+        let receipts = self.rows_older_than("applied", cutoff_ms)?;
+
+        let tx = self.db.transaction()?;
+        for (store, dropped) in &ops {
+            tx.execute(
+                "DELETE FROM sync_queue WHERE store=?1 AND hlc_ms<?2",
+                params![store, cutoff_ms],
+            )?;
+            raise_horizon(&tx, store, dropped.newest)?;
+        }
+        for (store, dropped) in &receipts {
+            tx.execute(
+                "DELETE FROM applied WHERE store=?1 AND hlc_ms<?2",
+                params![store, cutoff_ms],
+            )?;
+            raise_horizon(&tx, store, dropped.newest)?;
+        }
+        tx.commit()?;
+
+        Ok(CompactionReport {
+            cutoff_ms,
+            dropped_ops: ops
+                .iter()
+                .map(|(store, dropped)| (store.clone(), dropped.count))
+                .collect(),
+            dropped_receipts: receipts
+                .iter()
+                .map(|(store, dropped)| (store.clone(), dropped.count))
+                .collect(),
+            horizons: self.horizons()?,
+        })
+    }
+
+    /// The live namespace, as a replacement for a log a peer can no longer use.
+    ///
+    /// Computed when it is asked for, never stored. Both reads happen in one
+    /// read transaction, watermark first and state second, so no write can land
+    /// between them even from another process: everything at or below the
+    /// watermark is already in the entries, and anything newer is still in the
+    /// log for the receiver to replay. A stored snapshot would have to prove the
+    /// same thing about a past instant, and would by then describe state that
+    /// has moved on.
+    pub fn snapshot(&self) -> Result<Snapshot, VfsError> {
+        let tx = self.db.unchecked_transaction()?;
+        let watermark = self.sync_cursor()?;
+        let mut entries = Vec::new();
+        let mut statement = self
+            .db
+            .prepare("SELECT path, content_id, media_type FROM files ORDER BY path")?;
+        let rows = statement.query_map([], |row| {
+            Ok(SnapshotEntry {
+                path: row.get(0)?,
+                kind: SnapshotKind::File,
+                content_id: Some(ContentId(row.get(1)?)),
+                media_type: Some(row.get(2)?),
+            })
+        })?;
+        for row in rows {
+            entries.push(row?);
+        }
+        let mut statement = self
+            .db
+            .prepare("SELECT path FROM directories ORDER BY path")?;
+        let rows = statement.query_map([], |row| {
+            Ok(SnapshotEntry {
+                path: row.get(0)?,
+                kind: SnapshotKind::Directory,
+                content_id: None,
+                media_type: None,
+            })
+        })?;
+        for row in rows {
+            entries.push(row?);
+        }
+        tx.commit()?;
+        Ok(Snapshot { entries, watermark })
+    }
+
+    /// Replace this store's namespace with a peer's, and adopt its watermark.
+    ///
+    /// Destructive by definition — the state is made to match, so anything not
+    /// in the snapshot goes — which is why it refuses when the local log still
+    /// holds ops no peer has acknowledged. Those writes exist nowhere else yet;
+    /// dropping them here would be the one failure this module cannot report
+    /// after the fact.
+    pub fn apply_snapshot(
+        &mut self,
+        snapshot: &Snapshot,
+        content: &[ContentBlob],
+    ) -> Result<(), VfsError> {
+        let mut blobs = BTreeMap::new();
+        for blob in content {
+            blobs.insert(blob.id.clone(), blob.decode()?);
+        }
+        self.apply_snapshot_with(snapshot, &blobs)
+    }
+
+    fn apply_snapshot_with(
+        &mut self,
+        snapshot: &Snapshot,
+        blobs: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<(), VfsError> {
+        // The refusal is checked before anything is written, which is the only
+        // moment at which it is still a refusal rather than a repair.
+        let pending: i64 = self
+            .db
+            .query_row("SELECT COUNT(*) FROM sync_queue", [], |row| row.get(0))?;
+        if pending > 0 {
+            return Err(VfsError::SnapshotRefused {
+                pending: pending as usize,
+            });
+        }
+
+        // Everything the snapshot names is verified before the namespace is
+        // touched, so a blob that is missing or does not match its id leaves the
+        // store exactly as it was rather than half replaced.
+        let mut files = Vec::new();
+        let mut directories = Vec::new();
+        for entry in &snapshot.entries {
+            let path = normalize_path(&entry.path)?;
+            match entry.kind {
+                SnapshotKind::Directory => directories.push(path),
+                SnapshotKind::File => {
+                    let content_id = entry
+                        .content_id
+                        .clone()
+                        .ok_or_else(|| VfsError::InvalidContentId(path.clone()))?;
+                    let bytes = blobs
+                        .get(&content_id.to_string())
+                        .ok_or_else(|| VfsError::NotHydrated(content_id.to_string()))?;
+                    if ContentId::from_bytes(bytes) != content_id {
+                        return Err(VfsError::InvalidContentId(content_id.to_string()));
+                    }
+                    // Content-addressed and already verified, so storing the
+                    // blob now costs nothing a later failure would have to undo.
+                    self.blobs.put(bytes)?;
+                    files.push((
+                        path,
+                        content_id,
+                        bytes.len() as i64,
+                        entry
+                            .media_type
+                            .clone()
+                            .unwrap_or_else(|| "application/octet-stream".to_string()),
+                    ));
+                }
+            }
+        }
+
+        let now = now_ms();
+        let tx = self.db.transaction()?;
+        let keep_files: BTreeSet<&str> = files.iter().map(|(path, ..)| path.as_str()).collect();
+        let keep_dirs: BTreeSet<&str> = directories.iter().map(String::as_str).collect();
+        for path in table_paths(&tx, "files")? {
+            if !keep_files.contains(path.as_str()) {
+                tx.execute("DELETE FROM files WHERE path=?1", params![path])?;
+            }
+        }
+        for path in table_paths(&tx, "directories")? {
+            if !keep_dirs.contains(path.as_str()) {
+                tx.execute("DELETE FROM directories WHERE path=?1", params![path])?;
+            }
+        }
+        for path in &directories {
+            tx.execute(
+                "INSERT OR IGNORE INTO directories(path,created_at_ms) VALUES(?1,?2)",
+                params![path, now],
+            )?;
+        }
+        for (path, content_id, size, media_type) in &files {
+            let existing: Option<(i64, String, String, String)> = tx
+                .query_row(
+                    "SELECT version,content_id,media_type,hydration FROM files WHERE path=?1",
+                    params![path],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            // Already matching: rewriting it would bump a version for a change
+            // that did not happen.
+            if let Some((_, current_id, current_media, hydration)) = &existing
+                && current_id == &content_id.0
+                && current_media == media_type
+                && hydration == "present"
+            {
+                continue;
+            }
+            let version = existing.as_ref().map_or(1, |(version, ..)| version + 1);
+            tx.execute(
+                "INSERT INTO files(path,content_id,size,media_type,version,hydration,pinned,updated_at_ms)
+                 VALUES(?1,?2,?3,?4,?5,'present',0,?6)
+                 ON CONFLICT(path) DO UPDATE SET content_id=excluded.content_id,size=excluded.size,
+                   media_type=excluded.media_type,version=excluded.version,hydration='present',
+                   updated_at_ms=excluded.updated_at_ms",
+                params![path, content_id.0, size, media_type, version, now],
+            )?;
+            // The history has to say where the version came from, even when the
+            // answer is "it arrived as state, with no author named".
+            tx.execute(
+                "INSERT OR REPLACE INTO versions(path,version,content_id,size,created_at_ms,actor,origin)
+                 VALUES(?1,?2,?3,?4,?5,?6,?6)",
+                params![path, version, content_id.0, size, now, SNAPSHOT_ACTOR],
+            )?;
+        }
+
+        // The watermark becomes this store's horizon: every write at or below it
+        // is in the state just installed, so a later redelivery of one of them
+        // is a duplicate, and the receipts that said so individually are now
+        // redundant — keeping them would regrow the record the snapshot exists
+        // to make unnecessary.
+        for (store, hlc) in snapshot.watermark.origins() {
+            raise_horizon(&tx, store, hlc)?;
+            tx.execute(
+                "DELETE FROM applied WHERE store=?1 AND (hlc_ms,hlc_counter)<=(?2,?3)",
+                params![store, hlc.ms, i64::from(hlc.counter)],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Rows older than `cutoff_ms` in one log table, counted and dated per store.
+    ///
+    /// The table name is a compile-time constant, never user input; the cutoff
+    /// travels as a parameter. Returning the newest dropped reading per store
+    /// here is what makes the delete and the horizon agree about what was
+    /// actually removed.
+    fn rows_older_than(
+        &self,
+        table: &str,
+        cutoff_ms: i64,
+    ) -> Result<BTreeMap<String, Dropped>, VfsError> {
+        let mut statement = self.db.prepare(&format!(
+            "SELECT store, hlc_ms, hlc_counter FROM {table} WHERE hlc_ms<?1"
+        ))?;
+        let rows = statement.query_map(params![cutoff_ms], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                Hlc {
+                    ms: row.get(1)?,
+                    counter: row.get::<_, i64>(2)? as u32,
+                },
+            ))
+        })?;
+        let mut dropped: BTreeMap<String, Dropped> = BTreeMap::new();
+        for row in rows {
+            let (store, hlc) = row?;
+            let entry = dropped.entry(store).or_insert(Dropped {
+                count: 0,
+                newest: hlc,
+            });
+            entry.count += 1;
+            if hlc > entry.newest {
+                entry.newest = hlc;
+            }
+        }
+        Ok(dropped)
+    }
+}
+
+/// What one table is about to lose for one store.
+struct Dropped {
+    count: u64,
+    newest: Hlc,
+}
+
+/// Raise `store`'s horizon to `hlc`, never lowering it.
+///
+/// A horizon is a claim that nothing at or below this reading is still kept.
+/// Letting it retreat would let a later redelivery be applied twice, which is
+/// the one thing the receipt it replaced existed to prevent.
+fn raise_horizon(tx: &Connection, store: &str, hlc: Hlc) -> Result<(), VfsError> {
+    tx.execute(
+        "INSERT INTO horizon(store,hlc_ms,hlc_counter) VALUES(?1,?2,?3)
+         ON CONFLICT(store) DO UPDATE SET hlc_ms=excluded.hlc_ms, hlc_counter=excluded.hlc_counter
+         WHERE (excluded.hlc_ms,excluded.hlc_counter)>(hlc_ms,hlc_counter)",
+        params![store, hlc.ms, i64::from(hlc.counter)],
+    )?;
+    Ok(())
+}
+
+/// Every path in one namespace table. The table name is a compile-time constant.
+fn table_paths(tx: &Connection, table: &str) -> Result<Vec<String>, VfsError> {
+    let mut statement = tx.prepare(&format!("SELECT path FROM {table}"))?;
+    let rows = statement.query_map([], |row| row.get(0))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(VfsError::from)
 }
 
 /// Ask a peer over ssh and apply the answer.
@@ -568,5 +1061,276 @@ mod tests {
         assert!(batch.ops[0].hlc < batch.ops[1].hlc);
         assert_eq!(batch.ops[0].actor, "alice");
         assert_eq!(batch.ops[1].actor, "carol");
+    }
+
+    /// Wait until the wall clock has moved past `hlc`.
+    ///
+    /// `older_than` is a grace window, so a zero-width one can only drop a row
+    /// written in an earlier millisecond. Sleeping is what makes that true
+    /// rather than likely.
+    fn wait_past(hlc: Hlc) {
+        while now_ms() <= hlc.ms {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// The newest op this store has queued, which is the one a drop has to
+    /// wait for.
+    fn newest(vfs: &Vfs) -> Hlc {
+        vfs.pending(100).unwrap().last().unwrap().hlc
+    }
+
+    fn snapshot_content(vfs: &Vfs, snapshot: &Snapshot) -> Vec<ContentBlob> {
+        snapshot
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                let content_id = entry.content_id.as_ref()?;
+                Some(ContentBlob::from_bytes(
+                    content_id,
+                    &vfs.content(content_id).unwrap(),
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_peer_behind_the_horizon_is_given_a_snapshot_not_a_short_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, mut b) = pair(dir.path());
+
+        // b sees one write, so its cursor is a real reading that can later be
+        // left behind rather than an empty one that was never caught up.
+        a.put("notes/one.md", b"one", "text/markdown", Expect::Any)
+            .unwrap();
+        drain(&mut b, &mut a);
+        a.put("notes/two.md", b"two", "text/markdown", Expect::Any)
+            .unwrap();
+
+        wait_past(newest(&a));
+        let report = a.compact(std::time::Duration::ZERO).unwrap();
+        assert_eq!(report.dropped_ops.values().sum::<u64>(), 2);
+        assert!(report.horizons.contains_key(a.store()));
+
+        // The delta b would get starts after the hole and looks complete, which
+        // is precisely the failure being replaced: it is told the log cannot
+        // reach it and handed the state instead.
+        let cursor = b.sync_cursor().unwrap();
+        let batch = a.answer_sync(&cursor, 100).unwrap();
+        assert!(batch.ops.is_empty(), "{:?}", batch.ops);
+        assert!(
+            batch.snapshot.is_some(),
+            "a gap must be answered with state"
+        );
+
+        let request = SyncRequest {
+            cursor: b.sync_cursor().unwrap(),
+            limit: 100,
+        };
+        let response = a.serve_sync(&request).unwrap();
+        assert!(response.ops.is_empty());
+        assert_eq!(
+            b.apply_sync(&response).unwrap(),
+            vec![ApplyOutcome::Snapshot]
+        );
+
+        // The point of the trip: both writes are here, including the one whose
+        // op was dropped before b could ever see it.
+        assert_eq!(b.get("notes/one.md").unwrap(), b"one");
+        assert_eq!(b.get("notes/two.md").unwrap(), b"two");
+    }
+
+    #[test]
+    fn a_store_with_unsynced_work_refuses_a_snapshot_and_loses_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, mut b) = pair(dir.path());
+        a.put("shared.md", b"from-a", "text/markdown", Expect::Any)
+            .unwrap();
+        b.put("local.md", b"from-b", "text/markdown", Expect::Any)
+            .unwrap();
+
+        let snapshot = a.snapshot().unwrap();
+        let content = snapshot_content(&a, &snapshot);
+
+        // b's write exists nowhere else yet. Replacing the namespace would
+        // delete the only copy, so the snapshot is refused instead.
+        let error = b.apply_snapshot(&snapshot, &content).unwrap_err();
+        assert!(
+            matches!(error, VfsError::SnapshotRefused { pending: 1 }),
+            "{error:?}"
+        );
+        assert_eq!(b.get("local.md").unwrap(), b"from-b");
+        assert!(
+            b.file("shared.md").unwrap().is_none(),
+            "refused means untouched, not half applied"
+        );
+
+        // Once the local op has been acknowledged there is nothing left to
+        // lose, and the snapshot goes through.
+        let ids: Vec<i64> = b.pending(10).unwrap().iter().map(|op| op.id).collect();
+        b.ack(&ids).unwrap();
+        b.apply_snapshot(&snapshot, &content).unwrap();
+        assert_eq!(b.get("shared.md").unwrap(), b"from-a");
+        assert!(
+            b.file("local.md").unwrap().is_none(),
+            "a snapshot is the state, not a merge into it"
+        );
+    }
+
+    #[test]
+    fn incremental_sync_resumes_after_a_snapshot_without_redelivering_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, mut b) = pair(dir.path());
+        a.put("notes/one.md", b"one", "text/markdown", Expect::Any)
+            .unwrap();
+        drain(&mut b, &mut a);
+        a.put("notes/two.md", b"two", "text/markdown", Expect::Any)
+            .unwrap();
+        wait_past(newest(&a));
+        a.compact(std::time::Duration::ZERO).unwrap();
+
+        let request = SyncRequest {
+            cursor: b.sync_cursor().unwrap(),
+            limit: 100,
+        };
+        let response = a.serve_sync(&request).unwrap();
+        assert!(response.snapshot.is_some());
+        assert_eq!(
+            b.apply_sync(&response).unwrap(),
+            vec![ApplyOutcome::Snapshot]
+        );
+        assert!(
+            b.horizons().unwrap().contains_key(a.store()),
+            "adopting the watermark is what makes the next answer a delta"
+        );
+
+        // Everything up to the watermark is now b's own horizon, so the next
+        // answer is the write that follows it and nothing else: no replay of
+        // what the snapshot already carried, no duplicate writes.
+        a.put("notes/three.md", b"three", "text/markdown", Expect::Any)
+            .unwrap();
+        let request = SyncRequest {
+            cursor: b.sync_cursor().unwrap(),
+            limit: 100,
+        };
+        let response = a.serve_sync(&request).unwrap();
+        assert!(response.snapshot.is_none(), "b is past the horizon now");
+        assert_eq!(response.ops.len(), 1);
+        assert_eq!(response.ops[0].path, "notes/three.md");
+        assert_eq!(
+            b.apply_sync(&response).unwrap(),
+            vec![ApplyOutcome::Applied]
+        );
+        assert_eq!(b.get("notes/three.md").unwrap(), b"three");
+        assert_eq!(b.get("notes/one.md").unwrap(), b"one");
+    }
+
+    #[test]
+    fn compaction_never_drops_an_op_newer_than_the_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, _) = pair(dir.path());
+        a.put("recent.md", b"recent", "text/markdown", Expect::Any)
+            .unwrap();
+
+        // A grace window is a threshold, not a trigger: a write made now is
+        // newer than a cutoff an hour in the past, so it survives untouched.
+        let report = a.compact(std::time::Duration::from_secs(3600)).unwrap();
+        assert!(report.dropped_ops.is_empty(), "{:?}", report.dropped_ops);
+        assert!(
+            report.horizons.is_empty(),
+            "nothing dropped means no horizon to raise"
+        );
+        assert_eq!(a.pending(10).unwrap().len(), 1);
+
+        // Only once the clock has moved past it does a zero-width window see it
+        // as old, which is the boundary the first assertion was guarding.
+        wait_past(newest(&a));
+        let report = a.compact(std::time::Duration::ZERO).unwrap();
+        assert_eq!(report.dropped_ops.values().sum::<u64>(), 1);
+        assert!(a.pending(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_op_redelivered_below_the_applied_horizon_is_a_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, mut b) = pair(dir.path());
+        a.put("f.md", b"v1", "text/markdown", Expect::Any).unwrap();
+
+        let cursor = b.sync_cursor().unwrap();
+        let op = a.answer_sync(&cursor, 100).unwrap().ops[0].clone();
+        assert_eq!(
+            b.apply_remote(&op, Some(b"v1")).unwrap(),
+            ApplyOutcome::Applied
+        );
+
+        // Truncation takes the per-op receipt with it, so the receipt can no
+        // longer be what recognises the redelivery.
+        wait_past(op.hlc);
+        let report = b.compact(std::time::Duration::ZERO).unwrap();
+        assert_eq!(report.dropped_receipts.get(&op.store), Some(&1));
+        assert!(
+            report.horizons.get(&op.store).is_some_and(|h| *h >= op.hlc),
+            "the horizon is what is left of the receipt"
+        );
+        assert!(!b.applied_cursor().unwrap().covers(&op));
+
+        // Horizon membership replaces it: already reflected in this store's
+        // state, so not a second write — and not a divergence from a head this
+        // store never lost.
+        assert_eq!(
+            b.apply_remote(&op, Some(b"v1")).unwrap(),
+            ApplyOutcome::Duplicate
+        );
+        assert_eq!(b.history("f.md").unwrap().len(), 1, "one write, not two");
+
+        // And the horizon cannot be walked back by a later snapshot whose
+        // watermark is older: a claim about what was dropped is not something a
+        // peer gets to lower, or the duplicate above would be applied twice.
+        let mut older = SyncCursor::new();
+        older.observe(
+            &op.store,
+            Hlc {
+                ms: op.hlc.ms - 1,
+                ..Hlc::default()
+            },
+        );
+        b.apply_snapshot(
+            &Snapshot {
+                entries: Vec::new(),
+                watermark: older,
+            },
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            b.horizons().unwrap().get(&op.store),
+            report.horizons.get(&op.store)
+        );
+    }
+
+    #[test]
+    fn compacting_twice_reports_nothing_the_second_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, mut b) = pair(dir.path());
+        a.put("notes/one.md", b"one", "text/markdown", Expect::Any)
+            .unwrap();
+        a.put("notes/two.md", b"two", "text/markdown", Expect::Any)
+            .unwrap();
+        drain(&mut b, &mut a);
+
+        wait_past(newest(&a));
+        let first = a.compact(std::time::Duration::ZERO).unwrap();
+        assert_eq!(first.dropped_ops.values().sum::<u64>(), 2);
+        assert!(
+            first.dropped_receipts.is_empty(),
+            "a wrote these; it received nothing"
+        );
+
+        // Nothing is left to drop, and the horizon has not moved: the second
+        // pass is the same answer, not a second round of truncation.
+        let second = a.compact(std::time::Duration::ZERO).unwrap();
+        assert!(second.dropped_ops.is_empty(), "{:?}", second.dropped_ops);
+        assert!(second.dropped_receipts.is_empty());
+        assert_eq!(second.horizons, first.horizons);
     }
 }

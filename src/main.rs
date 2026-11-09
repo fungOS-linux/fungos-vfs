@@ -137,7 +137,8 @@ enum Command {
     },
     /// Exchange ops with a peer store.
     Sync {
-        /// `serve` answers a request on stdin; `pull` asks a peer.
+        /// `serve` answers a request on stdin; `pull` asks a peer; `compact`
+        /// drops log rows a peer can no longer be caught up from.
         mode: String,
         /// ssh destination for `pull`, e.g. `agora-one`.
         #[arg(long)]
@@ -150,6 +151,9 @@ enum Command {
         remote_bin: String,
         #[arg(long, default_value_t = 500)]
         limit: usize,
+        /// How old, in seconds, a log row must be before `compact` drops it.
+        #[arg(long)]
+        older_than: Option<u64>,
     },
     /// Materialize everything under `prefix` into a directory.
     Export {
@@ -325,6 +329,7 @@ fn run() -> anyhow::Result<()> {
             remote_root,
             remote_bin,
             limit,
+            older_than,
         } => match mode.as_str() {
             "serve" => {
                 let mut input = String::new();
@@ -342,11 +347,13 @@ fn run() -> anyhow::Result<()> {
                 let mut applied = 0;
                 let mut duplicate = 0;
                 let mut diverged = 0;
+                let mut snapshot = false;
                 for outcome in &outcomes {
                     match outcome {
                         fungos_vfs::ApplyOutcome::Applied => applied += 1,
                         fungos_vfs::ApplyOutcome::Duplicate => duplicate += 1,
                         fungos_vfs::ApplyOutcome::Diverged => diverged += 1,
+                        fungos_vfs::ApplyOutcome::Snapshot => snapshot = true,
                     }
                 }
                 println!(
@@ -355,10 +362,17 @@ fn run() -> anyhow::Result<()> {
                         "applied": applied,
                         "duplicate": duplicate,
                         "diverged": diverged,
+                        "snapshot": snapshot,
                     })
                 );
             }
-            other => anyhow::bail!("sync mode must be serve or pull, not {other}"),
+            "compact" => {
+                let seconds =
+                    older_than.ok_or_else(|| anyhow::anyhow!("sync compact needs --older-than"))?;
+                let report = vfs.compact(std::time::Duration::from_secs(seconds))?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            other => anyhow::bail!("sync mode must be serve, pull or compact, not {other}"),
         },
         Command::Export { prefix, dest } => {
             let report = export_dir(&mut vfs, &prefix, &dest)?;
