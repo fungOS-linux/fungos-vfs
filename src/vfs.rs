@@ -25,6 +25,13 @@ pub enum VfsError {
     NotHydrated(String),
     #[error("version conflict: expected {expected}, current {current}")]
     Conflict { expected: u64, current: u64 },
+    /// A write declared the head it was replacing and the head had moved.
+    #[error("write fenced: {path} was based on {expected}, head is {current}")]
+    Fenced {
+        path: String,
+        expected: String,
+        current: String,
+    },
     #[error("path is leased by {owner} until {expires_at_ms}")]
     Leased { owner: String, expires_at_ms: i64 },
     #[error("node is a pull-through cache; writes are disabled")]
@@ -114,6 +121,8 @@ pub struct SyncOp {
     pub actor: String,
     /// Where it came from: host, device or process.
     pub origin: String,
+    /// The worktree this op belongs to, empty when the store is unscoped.
+    pub worktree: String,
     /// Total order across writers, not just within one.
     pub hlc: Hlc,
     /// The head this write replaced, when the write produced content.
@@ -133,6 +142,23 @@ pub struct Version {
     pub created_at_ms: i64,
     pub actor: String,
     pub origin: String,
+}
+
+/// What a write claims about the state it is replacing.
+///
+/// A version number fences writers on one store, because it is a local counter
+/// that means nothing anywhere else. A content id means the same thing on every
+/// store, so it is the fence that holds between devices — and the one the op log
+/// records as `base_content_id`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Expect<'a> {
+    /// Overwrite whatever is there.
+    #[default]
+    Any,
+    /// Replace this version, or fail. Fences one store's writers.
+    Version(u64),
+    /// Replace a head holding this content, or fail. Fences across devices.
+    Base(&'a ContentId),
 }
 
 /// A hybrid logical clock reading.
@@ -268,6 +294,7 @@ impl Default for LodPolicy {
 struct Stamp {
     actor: String,
     origin: String,
+    worktree: String,
     hlc: Hlc,
 }
 
@@ -278,6 +305,8 @@ pub struct Vfs {
     blobs: BlobStore,
     writer: Writer,
     hlc: Hlc,
+    /// The worktree this store's writes belong to, when it serves one.
+    worktree: String,
 }
 
 impl Vfs {
@@ -297,6 +326,7 @@ impl Vfs {
             blobs,
             writer: Writer::from_environment(),
             hlc: Hlc::default(),
+            worktree: String::new(),
         };
         vfs.migrate()?;
         let stored = vfs.stored_role()?;
@@ -333,10 +363,24 @@ impl Vfs {
         self.writer.actor = actor.into();
     }
 
+    /// Scope every following write to a worktree.
+    ///
+    /// Deliberately a property of the store rather than an argument to each
+    /// write: one VFS root serves one worktree, and an op log that mixed
+    /// worktrees would have to be filtered to be replayed.
+    pub fn set_worktree(&mut self, worktree: impl Into<String>) {
+        self.worktree = worktree.into();
+    }
+
+    pub fn worktree(&self) -> &str {
+        &self.worktree
+    }
+
     fn stamp(&mut self) -> Stamp {
         Stamp {
             actor: self.writer.actor.clone(),
             origin: self.writer.origin.clone(),
+            worktree: self.worktree.clone(),
             hlc: self.hlc.observe(now_ms()),
         }
     }
@@ -380,7 +424,8 @@ impl Vfs {
                origin TEXT NOT NULL DEFAULT 'unattributed',
                hlc_ms INTEGER NOT NULL DEFAULT 0,
                hlc_counter INTEGER NOT NULL DEFAULT 0,
-               base_content_id TEXT
+               base_content_id TEXT,
+               worktree TEXT NOT NULL DEFAULT ''
              );
              CREATE TABLE IF NOT EXISTS leases(
                path TEXT PRIMARY KEY,
@@ -410,6 +455,7 @@ impl Vfs {
         self.ensure_column("sync_queue", "hlc_ms", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("sync_queue", "hlc_counter", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("sync_queue", "base_content_id", "TEXT")?;
+        self.ensure_column("sync_queue", "worktree", "TEXT NOT NULL DEFAULT ''")?;
         Ok(())
     }
 
@@ -450,20 +496,37 @@ impl Vfs {
         path: &str,
         bytes: &[u8],
         media_type: &str,
-        expected_version: Option<u64>,
+        expect: Expect<'_>,
     ) -> Result<FileEntry, VfsError> {
         if self.role == NodeRole::Cache {
             return Err(VfsError::ReadOnly);
         }
         let path = normalize_path(path)?;
         let current = self.file(&path)?;
-        if let Some(expected) = expected_version {
-            let current_version = current.as_ref().map_or(0, |entry| entry.version);
-            if current_version != expected {
-                return Err(VfsError::Conflict {
-                    expected,
-                    current: current_version,
-                });
+        match expect {
+            Expect::Any => {}
+            Expect::Version(expected) => {
+                let current_version = current.as_ref().map_or(0, |entry| entry.version);
+                if current_version != expected {
+                    return Err(VfsError::Conflict {
+                        expected,
+                        current: current_version,
+                    });
+                }
+            }
+            Expect::Base(expected) => {
+                // A write that believes it is replacing content which is no
+                // longer the head would silently discard whatever replaced it.
+                let current_id = current.as_ref().map(|entry| &entry.content_id);
+                if current_id != Some(expected) {
+                    return Err(VfsError::Fenced {
+                        path: path.clone(),
+                        expected: expected.to_string(),
+                        current: current_id
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "nothing".to_string()),
+                    });
+                }
             }
         }
         let content_id = self.blobs.put(bytes)?;
@@ -495,8 +558,8 @@ impl Vfs {
         )?;
         tx.execute(
             "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin,
-                                    hlc_ms,hlc_counter,base_content_id)
-             VALUES('upsert',?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                                    hlc_ms,hlc_counter,base_content_id,worktree)
+             VALUES('upsert',?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 path,
                 version as i64,
@@ -506,7 +569,8 @@ impl Vfs {
                 stamp.origin,
                 stamp.hlc.ms,
                 i64::from(stamp.hlc.counter),
-                base
+                base,
+                stamp.worktree,
             ],
         )?;
         tx.commit()?;
@@ -629,8 +693,8 @@ impl Vfs {
         tx.execute("DELETE FROM files WHERE path=?1", params![path])?;
         tx.execute(
             "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin,
-                                    hlc_ms,hlc_counter)
-             VALUES('remove',?1,?2,NULL,?3,?4,?5,?6,?7)",
+                                    hlc_ms,hlc_counter,worktree)
+             VALUES('remove',?1,?2,NULL,?3,?4,?5,?6,?7,?8)",
             params![
                 path,
                 current.version as i64,
@@ -638,7 +702,8 @@ impl Vfs {
                 stamp.actor,
                 stamp.origin,
                 stamp.hlc.ms,
-                i64::from(stamp.hlc.counter)
+                i64::from(stamp.hlc.counter),
+                stamp.worktree,
             ],
         )?;
         tx.commit()?;
@@ -670,15 +735,16 @@ impl Vfs {
         )?;
         tx.execute(
             "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin,
-                                    hlc_ms,hlc_counter)
-             VALUES('mkdir',?1,1,NULL,?2,?3,?4,?5,?6)",
+                                    hlc_ms,hlc_counter,worktree)
+             VALUES('mkdir',?1,1,NULL,?2,?3,?4,?5,?6,?7)",
             params![
                 path,
                 now_ms(),
                 stamp.actor,
                 stamp.origin,
                 stamp.hlc.ms,
-                i64::from(stamp.hlc.counter)
+                i64::from(stamp.hlc.counter),
+                stamp.worktree,
             ],
         )?;
         tx.commit()?;
@@ -709,15 +775,16 @@ impl Vfs {
         tx.execute("DELETE FROM directories WHERE path=?1", params![path])?;
         tx.execute(
             "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin,
-                                    hlc_ms,hlc_counter)
-             VALUES('rmdir',?1,1,NULL,?2,?3,?4,?5,?6)",
+                                    hlc_ms,hlc_counter,worktree)
+             VALUES('rmdir',?1,1,NULL,?2,?3,?4,?5,?6,?7)",
             params![
                 path,
                 now_ms(),
                 stamp.actor,
                 stamp.origin,
                 stamp.hlc.ms,
-                i64::from(stamp.hlc.counter)
+                i64::from(stamp.hlc.counter),
+                stamp.worktree,
             ],
         )?;
         tx.commit()?;
@@ -783,8 +850,8 @@ impl Vfs {
         )?;
         tx.execute(
             "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin,
-                                    hlc_ms,hlc_counter)
-             VALUES('remove',?1,?2,NULL,?3,?4,?5,?6,?7)",
+                                    hlc_ms,hlc_counter,worktree)
+             VALUES('remove',?1,?2,NULL,?3,?4,?5,?6,?7,?8)",
             params![
                 from,
                 current.version as i64,
@@ -792,13 +859,14 @@ impl Vfs {
                 stamp.actor,
                 stamp.origin,
                 stamp.hlc.ms,
-                i64::from(stamp.hlc.counter)
+                i64::from(stamp.hlc.counter),
+                stamp.worktree,
             ],
         )?;
         tx.execute(
             "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin,
-                                    hlc_ms,hlc_counter)
-             VALUES('upsert',?1,?2,?3,?4,?5,?6,?7,?8)",
+                                    hlc_ms,hlc_counter,worktree)
+             VALUES('upsert',?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 to,
                 current.version as i64,
@@ -807,7 +875,8 @@ impl Vfs {
                 stamp.actor,
                 stamp.origin,
                 stamp.hlc.ms,
-                i64::from(stamp.hlc.counter)
+                i64::from(stamp.hlc.counter),
+                stamp.worktree,
             ],
         )?;
         tx.commit()?;
@@ -867,7 +936,7 @@ impl Vfs {
     pub fn pending(&self, limit: usize) -> Result<Vec<SyncOp>, VfsError> {
         let mut statement = self.db.prepare(
             "SELECT id,op,path,version,content_id,created_at_ms,actor,origin,
-                    hlc_ms,hlc_counter,base_content_id
+                    hlc_ms,hlc_counter,base_content_id,worktree
              FROM sync_queue ORDER BY hlc_ms, hlc_counter, id LIMIT ?1",
         )?;
         let rows = statement.query_map(params![limit as i64], |row| {
@@ -892,6 +961,7 @@ impl Vfs {
                     counter: row.get::<_, i64>(9)? as u32,
                 },
                 base_content_id: row.get::<_, Option<String>>(10)?.map(ContentId),
+                worktree: row.get(11)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(VfsError::from)
@@ -1002,10 +1072,10 @@ mod tests {
     fn writes_carry_the_actor_and_origin_that_made_them() {
         let (_temp, mut vfs) = workspace();
         vfs.set_writer(Writer::new("ajmwagar", "studio"));
-        vfs.put("notes/a.md", b"# a\n", "text/markdown", None)
+        vfs.put("notes/a.md", b"# a\n", "text/markdown", Expect::Any)
             .unwrap();
         vfs.set_writer(Writer::new("agent:reviewer", "agora-one"));
-        vfs.put("notes/a.md", b"# a again\n", "text/markdown", None)
+        vfs.put("notes/a.md", b"# a again\n", "text/markdown", Expect::Any)
             .unwrap();
 
         let history = vfs.history("notes/a.md").unwrap();
@@ -1030,10 +1100,10 @@ mod tests {
     fn the_op_log_is_totally_ordered_across_writers() {
         let (_temp, mut vfs) = workspace();
         vfs.set_writer(Writer::new("a", "studio"));
-        vfs.put("f.txt", b"1", "text/plain", None).unwrap();
-        vfs.put("f.txt", b"2", "text/plain", None).unwrap();
+        vfs.put("f.txt", b"1", "text/plain", Expect::Any).unwrap();
+        vfs.put("f.txt", b"2", "text/plain", Expect::Any).unwrap();
         vfs.set_writer(Writer::new("b", "agora-one"));
-        vfs.put("f.txt", b"3", "text/plain", None).unwrap();
+        vfs.put("f.txt", b"3", "text/plain", Expect::Any).unwrap();
 
         let ops = vfs.pending(10).unwrap();
         assert_eq!(ops.len(), 3);
@@ -1051,16 +1121,82 @@ mod tests {
     }
 
     #[test]
+    fn ops_are_scoped_to_the_worktree_the_store_serves() {
+        let (_temp, mut vfs) = workspace();
+        assert_eq!(vfs.worktree(), "", "an unscoped store stamps nothing");
+        vfs.put("a.txt", b"a", "text/plain", Expect::Any).unwrap();
+        assert_eq!(vfs.pending(10).unwrap()[0].worktree, "");
+
+        vfs.set_worktree("wt_fywy");
+        vfs.put("a.txt", b"b", "text/plain", Expect::Any).unwrap();
+        let ops = vfs.pending(10).unwrap();
+        assert_eq!(ops[1].worktree, "wt_fywy");
+    }
+
+    #[test]
+    fn a_write_based_on_stale_content_is_fenced() {
+        let (_temp, mut vfs) = workspace();
+        let first = vfs
+            .put("doc.md", b"v1", "text/markdown", Expect::Any)
+            .unwrap();
+
+        // The writer that read v1 may replace it.
+        let second = vfs
+            .put(
+                "doc.md",
+                b"v2",
+                "text/markdown",
+                Expect::Base(&first.content_id),
+            )
+            .unwrap();
+        assert_eq!(vfs.get("doc.md").unwrap(), b"v2");
+
+        // A writer still holding v1 would discard v2, so it is refused — and the
+        // error names both heads rather than just saying no.
+        let error = vfs
+            .put(
+                "doc.md",
+                b"v1b",
+                "text/markdown",
+                Expect::Base(&first.content_id),
+            )
+            .unwrap_err();
+        match &error {
+            VfsError::Fenced {
+                path,
+                expected,
+                current,
+            } => {
+                assert_eq!(path, "doc.md");
+                assert_eq!(expected, &first.content_id.to_string());
+                assert_eq!(current, &second.content_id.to_string());
+            }
+            other => panic!("expected a fence, got {other:?}"),
+        }
+        assert_eq!(vfs.get("doc.md").unwrap(), b"v2", "nothing was written");
+    }
+
+    #[test]
+    fn a_fence_on_a_missing_path_says_nothing_is_there() {
+        let (_temp, mut vfs) = workspace();
+        let other = ContentId::from_bytes(b"somewhere else");
+        let error = vfs
+            .put("absent.md", b"x", "text/markdown", Expect::Base(&other))
+            .unwrap_err();
+        assert!(format!("{error}").contains("nothing"), "{error}");
+    }
+
+    #[test]
     fn a_write_records_the_head_it_replaced() {
         let (_temp, mut vfs) = workspace();
-        let first = vfs.put("d.txt", b"one", "text/plain", None).unwrap();
+        let first = vfs.put("d.txt", b"one", "text/plain", Expect::Any).unwrap();
         assert_eq!(
             vfs.pending(10).unwrap()[0].base_content_id,
             None,
             "a create replaces nothing"
         );
 
-        vfs.put("d.txt", b"two", "text/plain", None).unwrap();
+        vfs.put("d.txt", b"two", "text/plain", Expect::Any).unwrap();
         let ops = vfs.pending(10).unwrap();
         assert_eq!(ops[1].base_content_id.as_ref(), Some(&first.content_id));
     }
@@ -1121,7 +1257,9 @@ mod tests {
     fn rename_preserves_identity_and_history() {
         let temp = tempfile::tempdir().unwrap();
         let mut vfs = Vfs::open(temp.path()).unwrap();
-        let entry = vfs.put("a.txt", b"same bytes", "text/plain", None).unwrap();
+        let entry = vfs
+            .put("a.txt", b"same bytes", "text/plain", Expect::Any)
+            .unwrap();
         let renamed = vfs.rename("a.txt", "b.txt").unwrap();
         assert_eq!(renamed.path, "b.txt");
         assert_eq!(renamed.content_id, entry.content_id);
@@ -1133,15 +1271,17 @@ mod tests {
     #[test]
     fn put_get_history_and_conflict() {
         let (_temp, mut vfs) = workspace();
-        let first = vfs.put("docs/a.md", b"one", "text/markdown", None).unwrap();
+        let first = vfs
+            .put("docs/a.md", b"one", "text/markdown", Expect::Any)
+            .unwrap();
         assert_eq!(first.version, 1);
         assert_eq!(vfs.get("docs/a.md").unwrap(), b"one");
         let second = vfs
-            .put("docs/a.md", b"two", "text/markdown", Some(1))
+            .put("docs/a.md", b"two", "text/markdown", Expect::Version(1))
             .unwrap();
         assert_eq!(second.version, 2);
         assert_eq!(vfs.history("docs/a.md").unwrap().len(), 2);
-        let conflict = vfs.put("docs/a.md", b"three", "text/markdown", Some(1));
+        let conflict = vfs.put("docs/a.md", b"three", "text/markdown", Expect::Version(1));
         assert!(matches!(conflict, Err(VfsError::Conflict { .. })));
         assert_eq!(vfs.list("docs").unwrap().len(), 1);
     }
@@ -1150,8 +1290,13 @@ mod tests {
     fn cache_node_hydrates_and_evicts_without_writing() {
         let temp = tempfile::tempdir().unwrap();
         let mut full = Vfs::open(temp.path().join("node")).unwrap();
-        full.put("big.bin", &[7u8; 4096], "application/octet-stream", None)
-            .unwrap();
+        full.put(
+            "big.bin",
+            &[7u8; 4096],
+            "application/octet-stream",
+            Expect::Any,
+        )
+        .unwrap();
         let entry = full.file("big.bin").unwrap().unwrap();
 
         let mut cache = Vfs::open_with_role(temp.path().join("cache"), NodeRole::Cache).unwrap();
@@ -1170,7 +1315,7 @@ mod tests {
         cache.hydrate("big.bin", &[7u8; 4096]).unwrap();
         assert_eq!(cache.get("big.bin").unwrap(), vec![7u8; 4096]);
         assert!(matches!(
-            cache.put("new.bin", b"no", "application/octet-stream", None),
+            cache.put("new.bin", b"no", "application/octet-stream", Expect::Any),
             Err(VfsError::ReadOnly)
         ));
         cache.lease("big.bin", "reader", 60_000).unwrap();
@@ -1205,7 +1350,7 @@ mod tests {
     #[test]
     fn sync_queue_round_trip() {
         let (_temp, mut vfs) = workspace();
-        vfs.put("a.txt", b"a", "text/plain", None).unwrap();
+        vfs.put("a.txt", b"a", "text/plain", Expect::Any).unwrap();
         vfs.remove("a.txt").unwrap();
         let ops = vfs.pending(10).unwrap();
         assert_eq!(ops.len(), 2);

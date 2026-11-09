@@ -2,7 +2,7 @@ use std::{fs, path::PathBuf};
 
 use clap::{Parser, Subcommand};
 use fungos_vfs::{
-    ContentId, NodeRole, PathPolicy, SourceMode, Vfs, export_dir, ingest_dir_with_policy,
+    ContentId, Expect, NodeRole, PathPolicy, SourceMode, Vfs, export_dir, ingest_dir_with_policy,
 };
 
 #[derive(Parser)]
@@ -43,6 +43,10 @@ enum Command {
         media_type: String,
         #[arg(long)]
         expected_version: Option<u64>,
+        /// Fail unless the current head holds this content. Unlike a version,
+        /// a content id means the same thing on every store.
+        #[arg(long)]
+        base: Option<String>,
     },
     Get {
         path: String,
@@ -157,9 +161,20 @@ fn run() -> anyhow::Result<()> {
             path,
             media_type,
             expected_version,
+            base,
         } => {
             let bytes = fs::read(&file)?;
-            let entry = vfs.put(&path, &bytes, &media_type, expected_version)?;
+            let base_id = base
+                .as_deref()
+                .map(ContentId::parse)
+                .transpose()
+                .map_err(|error| anyhow::anyhow!("--base: {error:?}"))?;
+            let expect = match (&base_id, expected_version) {
+                (Some(base), _) => Expect::Base(base),
+                (None, Some(version)) => Expect::Version(version),
+                (None, None) => Expect::Any,
+            };
+            let entry = vfs.put(&path, &bytes, &media_type, expect)?;
             println!("{}", serde_json::to_string_pretty(&entry)?);
         }
         Command::Get { path, output } => {

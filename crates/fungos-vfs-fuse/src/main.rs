@@ -16,7 +16,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use clap::{Parser, ValueEnum};
-use fungos_vfs::{NodeRole, Vfs, VfsError, normalize_path};
+use fungos_vfs::{Expect, NodeRole, Vfs, VfsError, normalize_path};
 use fungos_vfs_unibus::UnibusHydrator;
 use fuser::{
     AccessFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
@@ -298,7 +298,7 @@ impl State {
             .cloned()
             .ok_or_else(|| VfsError::NotFound(format!("inode {ino}")))?;
         self.vfs
-            .put(&path, &bytes, "application/octet-stream", None)?;
+            .put(&path, &bytes, "application/octet-stream", Expect::Any)?;
         Ok(())
     }
 
@@ -372,6 +372,10 @@ fn errno(error: &VfsError) -> Errno {
         VfsError::InvalidPath(_) => Errno::EINVAL,
         VfsError::InvalidContentId(_) => Errno::EIO,
         VfsError::Conflict { .. } | VfsError::AlreadyExists(_) => Errno::EEXIST,
+        // A fenced write means the caller wrote against a head that has moved;
+        // re-reading and retrying is the only correct response, and EAGAIN says
+        // so instead of pretending the file is gone or corrupt.
+        VfsError::Fenced { .. } => Errno::EAGAIN,
         VfsError::NotEmpty(_) => Errno::ENOTEMPTY,
         VfsError::Leased { .. } => Errno::EBUSY,
         VfsError::RoleMismatch { .. } | VfsError::Io(_) | VfsError::Sql(_) => Errno::EIO,
@@ -799,7 +803,10 @@ impl Filesystem for FungosFs {
         // server creates files — so a buffered file would never be flushed and
         // would stay invisible in `readdir` while `lookup` still answered for it.
         // A write that follows lands as the next version.
-        match state.vfs.put(&path, &[], "application/octet-stream", None) {
+        match state
+            .vfs
+            .put(&path, &[], "application/octet-stream", Expect::Any)
+        {
             Ok(_) => {}
             Err(error) => {
                 reply.error(errno(&error));
@@ -852,14 +859,19 @@ impl Filesystem for FungosFs {
                 .copied()
                 .and_then(|ino| state.pending.remove(&ino));
             match buffered {
-                Some(bytes) => match state.vfs.put(&to, &bytes, "application/octet-stream", None) {
-                    Ok(_) => {
-                        state.ino_for(&to, false);
-                        state.forget(&from);
-                        reply.ok();
+                Some(bytes) => {
+                    match state
+                        .vfs
+                        .put(&to, &bytes, "application/octet-stream", Expect::Any)
+                    {
+                        Ok(_) => {
+                            state.ino_for(&to, false);
+                            state.forget(&from);
+                            reply.ok();
+                        }
+                        Err(error) => reply.error(errno(&error)),
                     }
-                    Err(error) => reply.error(errno(&error)),
-                },
+                }
                 None => reply.error(Errno::ENOENT),
             }
             return;

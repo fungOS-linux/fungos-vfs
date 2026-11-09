@@ -28,6 +28,6 @@ pub use transfer::{
     ingest_dir_with_policy,
 };
 pub use vfs::{
-    FileEntry, Hydration, Lease, LodPolicy, NodeRole, SyncOp, SyncOpKind, Version, Vfs, VfsError,
-    Writer,
+    Expect, FileEntry, Hydration, Lease, LodPolicy, NodeRole, SyncOp, SyncOpKind, Version, Vfs,
+    VfsError, Writer,
 };

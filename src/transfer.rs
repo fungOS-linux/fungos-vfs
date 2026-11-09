@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use crate::{ContentId, Hydration, PathClass, PathPolicy, Vfs, normalize_path};
+use crate::{ContentId, Expect, Hydration, PathClass, PathPolicy, Vfs, normalize_path};
 
 /// How to decide which files under a directory belong to the tree.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -201,14 +201,14 @@ pub fn ingest_dir_with_policy(
             Some(entry) if entry.content_id == content_id => report.unchanged += 1,
             Some(_) => {
                 if !dry_run {
-                    vfs.put(&virtual_path, &bytes, media_type_for(&rel), None)?;
+                    vfs.put(&virtual_path, &bytes, media_type_for(&rel), Expect::Any)?;
                 }
                 report.changed += 1;
                 report.bytes_written += bytes.len() as u64;
             }
             None => {
                 if !dry_run {
-                    vfs.put(&virtual_path, &bytes, media_type_for(&rel), None)?;
+                    vfs.put(&virtual_path, &bytes, media_type_for(&rel), Expect::Any)?;
                 }
                 report.added += 1;
                 report.bytes_written += bytes.len() as u64;
