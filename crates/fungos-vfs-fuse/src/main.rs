@@ -379,6 +379,13 @@ fn errno(error: &VfsError) -> Errno {
         VfsError::Fenced { .. } => Errno::EAGAIN,
         VfsError::NotEmpty(_) => Errno::ENOTEMPTY,
         VfsError::Leased { .. } => Errno::EBUSY,
+        // Unsynced local work is holding the state that a snapshot would
+        // replace. That is the same class as a lease: settle the work rather
+        // than retry the mount operation, and say so instead of reporting the
+        // file as gone or corrupt.
+        VfsError::SnapshotRefused { .. } => Errno::EBUSY,
+        // Unreadable store metadata is an I/O-class failure, not a policy one.
+        VfsError::CorruptMeta { .. } => Errno::EIO,
         VfsError::RoleMismatch { .. } | VfsError::Io(_) | VfsError::Sql(_) => Errno::EIO,
     }
 }
