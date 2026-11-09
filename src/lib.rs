@@ -24,7 +24,9 @@ pub use content::ContentId;
 pub use hydrate::Hydrator;
 pub use path::normalize_path;
 pub use policy::{PathClass, PathPolicy};
-pub use sync::{ApplyOutcome, ContentBlob, SyncBatch, SyncCursor, SyncRequest, SyncResponse};
+pub use sync::{
+    ApplyOutcome, ContentBlob, SyncBatch, SyncCursor, SyncRequest, SyncResponse, pull_over_ssh,
+};
 pub use transfer::{
     ExportReport, GitPointer, IngestReport, SourceMode, export_dir, ingest_dir,
     ingest_dir_with_policy,

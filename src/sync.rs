@@ -286,6 +286,65 @@ impl Vfs {
     }
 }
 
+/// Ask a peer over ssh and apply the answer.
+///
+/// A carrier, not a protocol: the request and response are the same
+/// structures a peer session carries, so this is one of several wires that
+/// can move them. It lives in the library rather than a binary because the
+/// shell and the VFS are two callers of the same exchange.
+pub fn pull_over_ssh(
+    vfs: &mut Vfs,
+    remote: &str,
+    remote_root: &str,
+    remote_bin: &str,
+    limit: usize,
+) -> Result<Vec<ApplyOutcome>, VfsError> {
+    let request = SyncRequest {
+        cursor: vfs.sync_cursor()?,
+        limit,
+    };
+    let command = format!(
+        "{} --root {} sync serve",
+        remote_bin,
+        shell_quote(remote_root)
+    );
+    let mut child = std::process::Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg(remote)
+        .arg(&command)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| VfsError::Transport(format!("ssh {remote}: {error}")))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        use std::io::Write;
+        let body = serde_json::to_vec(&request)
+            .map_err(|error| VfsError::Transport(format!("encode request: {error}")))?;
+        stdin
+            .write_all(&body)
+            .map_err(|error| VfsError::Transport(format!("send request: {error}")))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| VfsError::Transport(format!("ssh {remote}: {error}")))?;
+    if !output.status.success() {
+        return Err(VfsError::Transport(format!(
+            "sync from {remote} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let response: SyncResponse = serde_json::from_slice(&output.stdout)
+        .map_err(|error| VfsError::Transport(format!("decode response: {error}")))?;
+    vfs.apply_sync(&response)
+}
+
+/// Quote one argument for the remote shell.
+fn shell_quote(value: &str) -> String {
+    format!("'''{}'''", value.replace('\'', "'\''"))
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

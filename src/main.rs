@@ -337,41 +337,8 @@ fn run() -> anyhow::Result<()> {
                 let remote = remote.ok_or_else(|| anyhow::anyhow!("sync pull needs --remote"))?;
                 let remote_root =
                     remote_root.ok_or_else(|| anyhow::anyhow!("sync pull needs --remote-root"))?;
-                let request = fungos_vfs::SyncRequest {
-                    cursor: vfs.sync_cursor()?,
-                    limit,
-                };
-                // The carrier is one command: the peer answers on stdout.
-                let command = format!(
-                    "{} --root {} sync serve",
-                    remote_bin,
-                    shell_quote(&remote_root)
-                );
-                let mut child = std::process::Command::new("ssh")
-                    .arg("-o")
-                    .arg("BatchMode=yes")
-                    .arg(&remote)
-                    .arg(&command)
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .spawn()?;
-                {
-                    use std::io::Write;
-                    let stdin = child
-                        .stdin
-                        .as_mut()
-                        .ok_or_else(|| anyhow::anyhow!("no stdin for ssh"))?;
-                    stdin.write_all(serde_json::to_string(&request)?.as_bytes())?;
-                }
-                let output = child.wait_with_output()?;
-                if !output.status.success() {
-                    anyhow::bail!(
-                        "sync pull from {remote} failed: {}",
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    );
-                }
-                let response: fungos_vfs::SyncResponse = serde_json::from_slice(&output.stdout)?;
-                let outcomes = vfs.apply_sync(&response)?;
+                let outcomes =
+                    fungos_vfs::pull_over_ssh(&mut vfs, &remote, &remote_root, &remote_bin, limit)?;
                 let mut applied = 0;
                 let mut duplicate = 0;
                 let mut diverged = 0;
@@ -399,9 +366,4 @@ fn run() -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-/// Quote one argument for the remote shell.
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', r"'\''"))
 }
