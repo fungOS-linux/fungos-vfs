@@ -19,6 +19,9 @@ serde_json = "1"
 unibus = { git = "https://github.com/fungOS-linux/unibus.git", rev = "89f7e5eda8426c13d6e7d71a433b0d82d2c37392" }
 fuser = { version = "0.18", optional = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 [[bin]]
 name = "fungos-vfs-fuse"
 path = "src/main.rs"

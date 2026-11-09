@@ -3,7 +3,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -54,6 +54,11 @@ pub enum VfsError {
     CorruptMeta { key: String, value: String },
     #[error("workspace role mismatch: expected {expected}, found {found}")]
     RoleMismatch { expected: NodeRole, found: NodeRole },
+    /// A generation is only ever advanced, never reused. Reaching the end of
+    /// the counter refuses to serve rather than wrap onto values that have
+    /// already been issued.
+    #[error("handle generation exhausted; refusing to reuse one")]
+    GenerationExhausted,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -331,6 +336,14 @@ pub struct Vfs {
     /// by every store on it. A cursor keyed on origin would let two stores on
     /// one host mask each other's newer ops, so the cursor keys on this.
     store: String,
+    /// The generation this process's file handles are issued under.
+    ///
+    /// Inodes are deterministic, so a handle memoised by a kernel or NFS client
+    /// survives a restart and still points at the same inode number — which may
+    /// now mean different content. The generation is the part of a handle that
+    /// changes when that mapping can change, so a stale handle is refused
+    /// instead of resolved against whatever took the inode's place.
+    generation: u64,
 }
 
 impl Vfs {
@@ -352,19 +365,14 @@ impl Vfs {
             hlc: Hlc::default(),
             worktree: String::new(),
             store: String::new(),
+            generation: 0,
         };
         let mut vfs = vfs;
         vfs.migrate()?;
         vfs.store = vfs.ensure_store_id()?;
-        // The clock resumes where the last process left it, and only then
-        // advances to the wall clock if that is ahead. Starting at zero would
-        // make every reading depend on the wall clock being monotonic across
-        // restarts, which it is not: a restored VM, NTP correcting downwards,
-        // or a laptop waking with a skewed RTC all hand a fresh process a
-        // reading below ones this store has already used — and every rule
-        // keyed on "at or below" would then treat a new write as an old one.
         vfs.hlc = vfs.stored_hlc()?;
         vfs.hlc.observe(now_ms());
+        vfs.generation = vfs.stored_generation()?;
         let stored = vfs.stored_role()?;
         if stored != role {
             return Err(VfsError::RoleMismatch {
@@ -467,6 +475,64 @@ impl Vfs {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// The generation a file handle has to carry to be accepted.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Advance and persist the generation handles are issued under.
+    ///
+    /// Called once by an adapter as it starts issuing handles. Deliberately not
+    /// part of `open`: a CLI command sharing the root with a live mount must
+    /// not invalidate that mount's handles.
+    ///
+    /// A read followed by a write would let two adapters open the same store and
+    /// both claim generation *n*, so this takes the write lock before reading,
+    /// the same way a stamp pins which clock reading it used.
+    pub fn begin_generation(&mut self) -> Result<u64, VfsError> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<String> = tx
+            .query_row("SELECT value FROM meta WHERE key='generation'", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let next = match current {
+            Some(value) => parse_generation(&value)?.checked_add(1),
+            // A store that has never issued a handle starts at one, so zero
+            // stays reserved for "never issued" and is never a live handle.
+            None => Some(1),
+        }
+        .ok_or(VfsError::GenerationExhausted)?;
+        tx.execute(
+            "INSERT INTO meta(key,value) VALUES('generation',?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![next.to_string()],
+        )?;
+        tx.commit()?;
+        self.generation = next;
+        Ok(next)
+    }
+
+    /// The persisted generation, or zero for a store that has never issued one.
+    ///
+    /// A missing row is a store from before handles carried a generation; it
+    /// has issued none, so zero is the honest reading. A row that does not
+    /// parse is corruption and refuses the open rather than restarting at zero.
+    fn stored_generation(&self) -> Result<u64, VfsError> {
+        let value: Option<String> = self
+            .db
+            .query_row("SELECT value FROM meta WHERE key='generation'", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        match value {
+            Some(value) => parse_generation(&value),
+            None => Ok(0),
+        }
     }
 
     fn stamp(&mut self) -> Result<Stamp, VfsError> {
@@ -1386,6 +1452,18 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileEntry> {
     })
 }
 
+/// A persisted generation either parses or the store refuses to open.
+///
+/// Falling back to zero would be the whole bug wearing a different hat: every
+/// cached handle from the previous run would then be indistinguishable from a
+/// handle issued now, and would resolve to whatever currently owns the inode.
+fn parse_generation(value: &str) -> Result<u64, VfsError> {
+    value.parse().map_err(|_| VfsError::CorruptMeta {
+        key: "generation".to_string(),
+        value: value.to_string(),
+    })
+}
+
 pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1702,6 +1780,56 @@ mod tests {
         let ops = vfs.pending(10).unwrap();
         assert_eq!(ops[0].kind, SyncOpKind::Mkdir);
         assert_eq!(ops[3].kind, SyncOpKind::Rmdir);
+    }
+
+    #[test]
+    fn generation_advances_across_reopens_without_repeating() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            let mut vfs = Vfs::open(temp.path()).unwrap();
+            seen.push(vfs.begin_generation().unwrap());
+            assert_eq!(vfs.generation(), *seen.last().unwrap());
+        }
+        assert_eq!(seen, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn opening_without_issuing_handles_leaves_the_generation_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut vfs = Vfs::open(temp.path()).unwrap();
+        assert_eq!(vfs.generation(), 0, "a fresh store has issued nothing");
+        assert_eq!(vfs.begin_generation().unwrap(), 1);
+        drop(vfs);
+
+        // A reader that shares the root with a live mount must not invalidate
+        // the handles that mount already issued.
+        let vfs = Vfs::open(temp.path()).unwrap();
+        assert_eq!(vfs.generation(), 1);
+    }
+
+    #[test]
+    fn an_unreadable_generation_refuses_to_open() {
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let mut vfs = Vfs::open(temp.path()).unwrap();
+            vfs.begin_generation().unwrap();
+            vfs.db
+                .execute(
+                    "UPDATE meta SET value='not-a-number' WHERE key='generation'",
+                    [],
+                )
+                .unwrap();
+        }
+
+        match Vfs::open(temp.path()) {
+            Ok(_) => panic!("a corrupt generation opened as if it were zero"),
+            Err(VfsError::CorruptMeta { key, value }) => {
+                assert_eq!(key, "generation");
+                assert_eq!(value, "not-a-number");
+            }
+            Err(error) => panic!("unexpected error: {error}"),
+        }
     }
 
     #[test]

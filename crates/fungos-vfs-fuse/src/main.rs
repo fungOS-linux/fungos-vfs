@@ -53,23 +53,30 @@ fn hash_path(path: &str, salt: u64) -> u64 {
 /// A counter renumbers every inode on each restart. NFS clients — and the kernel
 /// NFS server sitting in front of this mount — cache file handles built from
 /// inode numbers, so after a remount every cached handle resolved to a different
-/// file or to nothing: the client got `ESTALE` until it remounted. Deriving the
-/// inode from the path keeps it stable across restarts, so handles survive a
-/// mount restart and only go stale when the path itself disappears.
+/// file or to nothing: the client got `ESTALE` until it remounted. Hashing the
+/// path keeps the inode for a given name stable across restarts, which is what
+/// lets a handle that outlives a restart still name an inode at all.
+///
+/// The inode is only half of a handle. Stable inode numbers are also what make a
+/// stale handle dangerous: after a reopen the same number can name different
+/// content, so a handle is only accepted under the generation it was issued in
+/// (see [`generation_attr`]).
 fn inode_for_path(path: &str) -> u64 {
     const SPAN: u64 = u64::MAX - FIRST_DERIVED_INO;
     FIRST_DERIVED_INO + hash_path(path, 0) % SPAN
 }
 
-/// The per-path generation reported alongside an inode.
+/// The generation reported to the kernel for every inode this mount serves.
 ///
-/// The kernel copies this into `inode->i_generation` and the NFS server mixes it
-/// into file handles, so it must stay constant for as long as a path exists:
-/// deriving it from content version would make every open client handle stale
-/// on the next write. A different salt keeps it independent of the inode number
-/// itself, and it is never zero so it cannot be mistaken for an unset value.
-fn generation_for_path(path: &str) -> Generation {
-    Generation(hash_path(path, 0x9e37_79b9_7f4a_7c15) | 1)
+/// Inodes are a hash of the path, which is what makes them stable across a
+/// restart — and also what makes them unsafe on their own: after a reopen the
+/// same inode number can name different content. The kernel copies this value
+/// into `inode->i_generation` and the NFS server mixes it into file handles, so
+/// a handle minted before the restart is refused with `ESTALE` before it can
+/// resolve to the wrong file. It moves per mount, never per write: a write must
+/// not invalidate the handles of clients that are already open.
+fn generation_attr(generation: u64) -> Generation {
+    Generation(generation)
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -116,8 +123,15 @@ fn main() {
 
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let vfs = Vfs::open_with_role(&cli.root, cli.role.into())
+    let mut vfs = Vfs::open_with_role(&cli.root, cli.role.into())
         .with_context(|| format!("open VFS at {}", cli.root.display()))?;
+    // Claim this mount's generation before any handle is issued. Handles from a
+    // previous mount carry a different one, so the kernel and NFS clients get
+    // `ESTALE` and retry a lookup instead of silently reading another file.
+    let generation = vfs
+        .begin_generation()
+        .context("claim a handle generation")?;
+    eprintln!("fungos-vfs-fuse: handle generation {generation}");
     let hydrator = match &cli.unibus_config {
         Some(path) => {
             let config: ClientConfig =
@@ -158,6 +172,9 @@ fn run() -> anyhow::Result<()> {
 struct State {
     vfs: Vfs,
     hydrator: Option<Arc<UnibusHydrator>>,
+    /// The store generation this mount issues handles and inode generations
+    /// under. Captured once: it cannot move while this mount is serving.
+    generation: u64,
     inodes: HashMap<String, u64>,
     paths: HashMap<u64, String>,
     dirs: HashMap<String, bool>,
@@ -166,9 +183,11 @@ struct State {
 
 impl State {
     fn new(vfs: Vfs, hydrator: Option<Arc<UnibusHydrator>>) -> Self {
+        let generation = vfs.generation();
         let mut state = Self {
             vfs,
             hydrator,
+            generation,
             inodes: HashMap::from([(String::new(), ROOT)]),
             paths: HashMap::from([(ROOT, String::new())]),
             dirs: HashMap::from([(String::new(), true)]),
@@ -182,9 +201,10 @@ impl State {
     ///
     /// Inodes are recomputed identically after a restart, but the reverse map
     /// (inode -> path, used by `getattr`, `open`, `readdir` and friends) cannot
-    /// be inverted out of a hash. Seeding it means a client that arrives with a
-    /// pre-restart file handle resolves to the same path without an intervening
-    /// lookup.
+    /// be inverted out of a hash. Seeding it means an inode number resolves to
+    /// its path for the whole lifetime of this mount, including before the
+    /// client has looked that path up. It does not make a handle from a previous
+    /// mount valid: that is what the generation check is for.
     fn seed_namespace(&mut self) {
         for entry in self.vfs.list("").unwrap_or_default() {
             self.seed_path(&entry.path, false);
@@ -233,6 +253,29 @@ impl State {
 
     fn path_for(&self, ino: u64) -> Option<String> {
         self.paths.get(&ino).cloned()
+    }
+
+    /// The file handle this mount issues for every open.
+    ///
+    /// A FUSE handle is opaque to the kernel and comes back on every request
+    /// that carries one, which makes it the one place a generation can ride
+    /// along to the request that consumes it. Stamping the store generation
+    /// here is what separates a handle minted before a restart from one minted
+    /// after: the inode number alone cannot, because it is a hash of a path.
+    fn handle(&self) -> FileHandle {
+        FileHandle(self.generation)
+    }
+
+    /// Reject a handle minted under a different store generation.
+    ///
+    /// `ESTALE` is the answer a client can act on: it forgets the handle, looks
+    /// the path up again, and continues against the current generation.
+    fn accept(&self, handle: FileHandle) -> Result<(), Errno> {
+        if handle == self.handle() {
+            Ok(())
+        } else {
+            Err(Errno::ESTALE)
+        }
     }
 
     fn is_dir(&self, ino: u64) -> bool {
@@ -386,6 +429,10 @@ fn errno(error: &VfsError) -> Errno {
         VfsError::SnapshotRefused { .. } => Errno::EBUSY,
         // Unreadable store metadata is an I/O-class failure, not a policy one.
         VfsError::CorruptMeta { .. } => Errno::EIO,
+        // The store has no higher generation to issue. Unrecoverable state,
+        // not contention: EIO so a client does not retry an operation that can
+        // never succeed.
+        VfsError::GenerationExhausted => Errno::EIO,
         VfsError::RoleMismatch { .. } | VfsError::Io(_) | VfsError::Sql(_) => Errno::EIO,
     }
 }
@@ -415,7 +462,7 @@ impl Filesystem for FungosFs {
             reply.entry(
                 &ttl(),
                 &FungosFs::attr(ino, entry.size, false),
-                generation_for_path(&path),
+                generation_attr(state.generation),
             );
             return;
         }
@@ -427,7 +474,7 @@ impl Filesystem for FungosFs {
             reply.entry(
                 &ttl(),
                 &FungosFs::attr(ino, bytes.len() as u64, false),
-                generation_for_path(&path),
+                generation_attr(state.generation),
             );
             return;
         }
@@ -442,18 +489,24 @@ impl Filesystem for FungosFs {
             reply.entry(
                 &ttl(),
                 &FungosFs::attr(ino, 4096, true),
-                generation_for_path(&path),
+                generation_attr(state.generation),
             );
         } else {
             reply.error(Errno::ENOENT);
         }
     }
 
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         let Ok(state) = self.state.lock() else {
             reply.error(Errno::EIO);
             return;
         };
+        if let Some(fh) = fh
+            && let Err(error) = state.accept(fh)
+        {
+            reply.error(error);
+            return;
+        }
         let Some(path) = state.path_for(ino.0) else {
             reply.error(Errno::ENOENT);
             return;
@@ -484,7 +537,7 @@ impl Filesystem for FungosFs {
         _atime: Option<TimeOrNow>,
         _mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<FileHandle>,
+        fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
@@ -495,6 +548,12 @@ impl Filesystem for FungosFs {
             reply.error(Errno::EIO);
             return;
         };
+        if let Some(fh) = fh
+            && let Err(error) = state.accept(fh)
+        {
+            reply.error(error);
+            return;
+        }
         if let Some(size) = size {
             let mut bytes = state.data(ino.0).unwrap_or_default();
             bytes.resize(size as usize, 0);
@@ -530,14 +589,28 @@ impl Filesystem for FungosFs {
             reply.error(Errno::ENOENT);
             return;
         }
-        reply.opened(FileHandle(0), FopenFlags::empty());
+        reply.opened(state.handle(), FopenFlags::empty());
+    }
+
+    /// Directories need an issued handle too, because the kernel passes it back
+    /// to `readdir` and `releasedir` — which is where the generation check lands.
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let Ok(state) = self.state.lock() else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        match state.path_for(ino.0) {
+            None => reply.error(Errno::ENOENT),
+            Some(_) if !state.is_dir(ino.0) => reply.error(Errno::ENOTDIR),
+            Some(_) => reply.opened(state.handle(), FopenFlags::empty()),
+        }
     }
 
     fn read(
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         size: u32,
         _flags: OpenFlags,
@@ -548,6 +621,10 @@ impl Filesystem for FungosFs {
             reply.error(Errno::EIO);
             return;
         };
+        if let Err(error) = state.accept(fh) {
+            reply.error(error);
+            return;
+        }
         match state.data(ino.0) {
             Ok(bytes) => {
                 let start = (offset as usize).min(bytes.len());
@@ -562,7 +639,7 @@ impl Filesystem for FungosFs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         data: &[u8],
         _write_flags: WriteFlags,
@@ -574,6 +651,10 @@ impl Filesystem for FungosFs {
             reply.error(Errno::EIO);
             return;
         };
+        if let Err(error) = state.accept(fh) {
+            reply.error(error);
+            return;
+        }
         let mut bytes = state
             .pending
             .remove(&ino.0)
@@ -595,18 +676,25 @@ impl Filesystem for FungosFs {
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         _lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        let Ok(state) = self.state.lock() else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        match state.accept(fh) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
+        }
     }
 
     fn release(
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         _flags: OpenFlags,
         _lock_owner: Option<fuser::LockOwner>,
         _flush: bool,
@@ -616,6 +704,10 @@ impl Filesystem for FungosFs {
             reply.error(Errno::EIO);
             return;
         };
+        if let Err(error) = state.accept(fh) {
+            reply.error(error);
+            return;
+        }
         match state.write_back(ino.0) {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(errno(&error)),
@@ -626,7 +718,7 @@ impl Filesystem for FungosFs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
@@ -634,6 +726,10 @@ impl Filesystem for FungosFs {
             reply.error(Errno::EIO);
             return;
         };
+        if let Err(error) = state.accept(fh) {
+            reply.error(error);
+            return;
+        }
         let Some(path) = state.path_for(ino.0) else {
             reply.error(Errno::ENOENT);
             return;
@@ -693,8 +789,8 @@ impl Filesystem for FungosFs {
         reply.created(
             &ttl(),
             &FungosFs::attr(ino, 0, false),
-            generation_for_path(&path),
-            FileHandle(0),
+            generation_attr(state.generation),
+            state.handle(),
             FopenFlags::empty(),
         );
     }
@@ -750,7 +846,7 @@ impl Filesystem for FungosFs {
                 reply.entry(
                     &ttl(),
                     &FungosFs::attr(ino, 4096, true),
-                    generation_for_path(&path),
+                    generation_attr(state.generation),
                 );
             }
             Err(error) => reply.error(errno(&error)),
@@ -825,7 +921,7 @@ impl Filesystem for FungosFs {
         reply.entry(
             &ttl(),
             &FungosFs::attr(ino, 0, false),
-            generation_for_path(&path),
+            generation_attr(state.generation),
         );
     }
 
@@ -945,7 +1041,17 @@ fn join_path(parent: &str, name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
+
+    /// A state that has opened the store and claimed a generation, the way
+    /// `run` does before it mounts.
+    fn mount(root: &Path) -> State {
+        let mut vfs = Vfs::open(root).unwrap();
+        vfs.begin_generation().unwrap();
+        State::new(vfs, None)
+    }
 
     #[test]
     fn joins_root_and_nested_paths() {
@@ -964,6 +1070,50 @@ mod tests {
             let ino = inode_for_path(path);
             assert!(ino > ROOT, "{path} mapped to {ino}");
         }
-        assert_eq!(generation_for_path("docs/a.txt").0 % 2, 1);
+    }
+
+    #[test]
+    fn a_handle_from_before_a_reopen_is_rejected_after_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let departs = mount(temp.path());
+        let stale = departs.handle();
+        drop(departs);
+
+        let restarted = mount(temp.path());
+        assert_eq!(
+            restarted.accept(stale),
+            Err(Errno::ESTALE),
+            "a handle minted before the restart was accepted after it"
+        );
+    }
+
+    #[test]
+    fn a_handle_from_after_a_reopen_is_accepted() {
+        let temp = tempfile::tempdir().unwrap();
+        drop(mount(temp.path()));
+
+        let restarted = mount(temp.path());
+        assert_eq!(restarted.accept(restarted.handle()), Ok(()));
+    }
+
+    #[test]
+    fn handles_from_different_generations_are_not_interchangeable() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = mount(temp.path());
+        let second = mount(temp.path());
+
+        assert_ne!(first.handle(), second.handle());
+        assert_eq!(first.accept(second.handle()), Err(Errno::ESTALE));
+        assert_eq!(second.accept(first.handle()), Err(Errno::ESTALE));
+    }
+
+    #[test]
+    fn the_kernel_generation_moves_with_the_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = mount(temp.path());
+        let second = mount(temp.path());
+
+        assert_ne!(first.generation, second.generation);
+        assert_eq!(generation_attr(first.generation).0, first.generation);
     }
 }
