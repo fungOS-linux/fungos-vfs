@@ -123,6 +123,9 @@ pub struct SyncOp {
     pub origin: String,
     /// The worktree this op belongs to, empty when the store is unscoped.
     pub worktree: String,
+    /// The store that produced it. Two stores on one host share an origin, so
+    /// this is the identity a cursor has to key on.
+    pub store: String,
     /// Total order across writers, not just within one.
     pub hlc: Hlc,
     /// The head this write replaced, when the write produced content.
@@ -294,6 +297,7 @@ impl Default for LodPolicy {
 struct Stamp {
     actor: String,
     origin: String,
+    store: String,
     worktree: String,
     hlc: Hlc,
 }
@@ -307,6 +311,12 @@ pub struct Vfs {
     hlc: Hlc,
     /// The worktree this store's writes belong to, when it serves one.
     worktree: String,
+    /// This store's own identity.
+    ///
+    /// Distinct from `origin`, which names the machine and is therefore shared
+    /// by every store on it. A cursor keyed on origin would let two stores on
+    /// one host mask each other's newer ops, so the cursor keys on this.
+    store: String,
 }
 
 impl Vfs {
@@ -327,8 +337,11 @@ impl Vfs {
             writer: Writer::from_environment(),
             hlc: Hlc::default(),
             worktree: String::new(),
+            store: String::new(),
         };
+        let mut vfs = vfs;
         vfs.migrate()?;
+        vfs.store = vfs.ensure_store_id()?;
         let stored = vfs.stored_role()?;
         if stored != role {
             return Err(VfsError::RoleMismatch {
@@ -376,10 +389,16 @@ impl Vfs {
         &self.worktree
     }
 
+    /// This store's own identity, stable across restarts.
+    pub fn store(&self) -> &str {
+        &self.store
+    }
+
     fn stamp(&mut self) -> Stamp {
         Stamp {
             actor: self.writer.actor.clone(),
             origin: self.writer.origin.clone(),
+            store: self.store.clone(),
             worktree: self.worktree.clone(),
             hlc: self.hlc.observe(now_ms()),
         }
@@ -425,13 +444,15 @@ impl Vfs {
                hlc_ms INTEGER NOT NULL DEFAULT 0,
                hlc_counter INTEGER NOT NULL DEFAULT 0,
                base_content_id TEXT,
-               worktree TEXT NOT NULL DEFAULT ''
+               worktree TEXT NOT NULL DEFAULT '',
+               store TEXT NOT NULL DEFAULT ''
              );
              CREATE TABLE IF NOT EXISTS applied(
+               store TEXT NOT NULL,
                origin TEXT NOT NULL,
                hlc_ms INTEGER NOT NULL,
                hlc_counter INTEGER NOT NULL,
-               PRIMARY KEY(origin, hlc_ms, hlc_counter)
+               PRIMARY KEY(store, hlc_ms, hlc_counter)
              );
              CREATE TABLE IF NOT EXISTS leases(
                path TEXT PRIMARY KEY,
@@ -462,7 +483,52 @@ impl Vfs {
         self.ensure_column("sync_queue", "hlc_counter", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("sync_queue", "base_content_id", "TEXT")?;
         self.ensure_column("sync_queue", "worktree", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("sync_queue", "store", "TEXT NOT NULL DEFAULT ''")?;
+
+        // Receipts were keyed on origin, which two stores on one host share.
+        // The table is only a record of what has been applied, so rebuilding it
+        // costs a possible re-delivery — which the base check turns into
+        // divergence at worst, never a lost write.
+        let has_store: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('applied') WHERE name='store')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_store {
+            self.db.execute_batch(
+                "DROP TABLE IF EXISTS applied;
+                 CREATE TABLE applied(
+                   store TEXT NOT NULL,
+                   origin TEXT NOT NULL,
+                   hlc_ms INTEGER NOT NULL,
+                   hlc_counter INTEGER NOT NULL,
+                   PRIMARY KEY(store, hlc_ms, hlc_counter)
+                 );",
+            )?;
+        }
+
+        let store = self.ensure_store_id()?;
+        // Every row in this log was written by this store.
+        self.db.execute(
+            "UPDATE sync_queue SET store=?1 WHERE store=''",
+            params![store],
+        )?;
         Ok(())
+    }
+
+    /// This store's identity: generated once, then read back.
+    fn ensure_store_id(&self) -> Result<String, VfsError> {
+        let canonical = std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
+        let digest = blake3::hash(canonical.to_string_lossy().as_bytes()).to_hex();
+        self.db.execute(
+            "INSERT OR IGNORE INTO meta(key,value) VALUES('store_id',?1)",
+            params![&digest[..12]],
+        )?;
+        Ok(self
+            .db
+            .query_row("SELECT value FROM meta WHERE key='store_id'", [], |row| {
+                row.get(0)
+            })?)
     }
 
     /// Add a column to an existing table if it is not there yet.
@@ -564,8 +630,8 @@ impl Vfs {
         )?;
         tx.execute(
             "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin,
-                                    hlc_ms,hlc_counter,base_content_id,worktree)
-             VALUES('upsert',?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                                    hlc_ms,hlc_counter,base_content_id,worktree,store)
+             VALUES('upsert',?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
                 path,
                 version as i64,
@@ -577,6 +643,7 @@ impl Vfs {
                 i64::from(stamp.hlc.counter),
                 base,
                 stamp.worktree,
+                stamp.store,
             ],
         )?;
         tx.commit()?;
@@ -699,8 +766,8 @@ impl Vfs {
         tx.execute("DELETE FROM files WHERE path=?1", params![path])?;
         tx.execute(
             "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin,
-                                    hlc_ms,hlc_counter,worktree)
-             VALUES('remove',?1,?2,NULL,?3,?4,?5,?6,?7,?8)",
+                                    hlc_ms,hlc_counter,worktree,store)
+             VALUES('remove',?1,?2,NULL,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 path,
                 current.version as i64,
@@ -710,6 +777,7 @@ impl Vfs {
                 stamp.hlc.ms,
                 i64::from(stamp.hlc.counter),
                 stamp.worktree,
+                stamp.store,
             ],
         )?;
         tx.commit()?;
@@ -741,8 +809,8 @@ impl Vfs {
         )?;
         tx.execute(
             "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin,
-                                    hlc_ms,hlc_counter,worktree)
-             VALUES('mkdir',?1,1,NULL,?2,?3,?4,?5,?6,?7)",
+                                    hlc_ms,hlc_counter,worktree,store)
+             VALUES('mkdir',?1,1,NULL,?2,?3,?4,?5,?6,?7,?8)",
             params![
                 path,
                 now_ms(),
@@ -751,6 +819,7 @@ impl Vfs {
                 stamp.hlc.ms,
                 i64::from(stamp.hlc.counter),
                 stamp.worktree,
+                stamp.store,
             ],
         )?;
         tx.commit()?;
@@ -781,8 +850,8 @@ impl Vfs {
         tx.execute("DELETE FROM directories WHERE path=?1", params![path])?;
         tx.execute(
             "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin,
-                                    hlc_ms,hlc_counter,worktree)
-             VALUES('rmdir',?1,1,NULL,?2,?3,?4,?5,?6,?7)",
+                                    hlc_ms,hlc_counter,worktree,store)
+             VALUES('rmdir',?1,1,NULL,?2,?3,?4,?5,?6,?7,?8)",
             params![
                 path,
                 now_ms(),
@@ -791,6 +860,7 @@ impl Vfs {
                 stamp.hlc.ms,
                 i64::from(stamp.hlc.counter),
                 stamp.worktree,
+                stamp.store,
             ],
         )?;
         tx.commit()?;
@@ -856,8 +926,8 @@ impl Vfs {
         )?;
         tx.execute(
             "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin,
-                                    hlc_ms,hlc_counter,worktree)
-             VALUES('remove',?1,?2,NULL,?3,?4,?5,?6,?7,?8)",
+                                    hlc_ms,hlc_counter,worktree,store)
+             VALUES('remove',?1,?2,NULL,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 from,
                 current.version as i64,
@@ -867,12 +937,13 @@ impl Vfs {
                 stamp.hlc.ms,
                 i64::from(stamp.hlc.counter),
                 stamp.worktree,
+                stamp.store,
             ],
         )?;
         tx.execute(
             "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin,
-                                    hlc_ms,hlc_counter,worktree)
-             VALUES('upsert',?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                                    hlc_ms,hlc_counter,worktree,store)
+             VALUES('upsert',?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 to,
                 current.version as i64,
@@ -883,6 +954,7 @@ impl Vfs {
                 stamp.hlc.ms,
                 i64::from(stamp.hlc.counter),
                 stamp.worktree,
+                stamp.store,
             ],
         )?;
         tx.commit()?;
@@ -943,19 +1015,19 @@ impl Vfs {
     ///
     /// This is the duplicate check: a sender that retries, or a second path
     /// delivering the same op, must not apply a write twice.
-    pub(crate) fn mark_applied(&self, origin: &str, hlc: Hlc) -> Result<usize, VfsError> {
+    pub(crate) fn mark_applied(&self, store: &str, hlc: Hlc) -> Result<usize, VfsError> {
         self.db
             .execute(
-                "INSERT OR IGNORE INTO applied(origin,hlc_ms,hlc_counter) VALUES(?1,?2,?3)",
-                params![origin, hlc.ms, i64::from(hlc.counter)],
+                "INSERT OR IGNORE INTO applied(store,origin,hlc_ms,hlc_counter) VALUES(?1,?2,?3,?4)",
+                params![store, store, hlc.ms, i64::from(hlc.counter)],
             )
             .map_err(VfsError::from)
     }
 
-    pub(crate) fn unmark_applied(&self, origin: &str, hlc: Hlc) -> Result<(), VfsError> {
+    pub(crate) fn unmark_applied(&self, store: &str, hlc: Hlc) -> Result<(), VfsError> {
         self.db.execute(
-            "DELETE FROM applied WHERE origin=?1 AND hlc_ms=?2 AND hlc_counter=?3",
-            params![origin, hlc.ms, i64::from(hlc.counter)],
+            "DELETE FROM applied WHERE store=?1 AND hlc_ms=?2 AND hlc_counter=?3",
+            params![store, hlc.ms, i64::from(hlc.counter)],
         )?;
         Ok(())
     }
@@ -965,7 +1037,7 @@ impl Vfs {
         let mut cursor = crate::SyncCursor::new();
         let mut statement = self
             .db
-            .prepare("SELECT origin, hlc_ms, hlc_counter FROM applied")?;
+            .prepare("SELECT store, hlc_ms, hlc_counter FROM applied")?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -1065,7 +1137,7 @@ impl Vfs {
     pub fn pending(&self, limit: usize) -> Result<Vec<SyncOp>, VfsError> {
         let mut statement = self.db.prepare(
             "SELECT id,op,path,version,content_id,created_at_ms,actor,origin,
-                    hlc_ms,hlc_counter,base_content_id,worktree
+                    hlc_ms,hlc_counter,base_content_id,worktree,store
              FROM sync_queue ORDER BY hlc_ms, hlc_counter, id LIMIT ?1",
         )?;
         let rows = statement.query_map(params![limit as i64], |row| {
@@ -1091,6 +1163,7 @@ impl Vfs {
                 },
                 base_content_id: row.get::<_, Option<String>>(10)?.map(ContentId),
                 worktree: row.get(11)?,
+                store: row.get(12)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(VfsError::from)

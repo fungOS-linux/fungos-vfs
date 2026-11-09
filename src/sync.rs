@@ -23,12 +23,15 @@ use std::collections::BTreeMap;
 
 use crate::{ContentId, Hlc, SyncOpKind, Vfs, VfsError};
 
-/// The highest clock reading this store has seen from each origin.
+/// The highest clock reading this store has seen from each peer store.
 ///
 /// Sending this to a peer is the whole request: "tell me what happened after
-/// these points". It is per origin rather than a single number because two
+/// these points". It is per store rather than a single number because two
 /// devices advancing independently produce interleaved clocks that no single
 /// high-water mark describes.
+///
+/// Keyed by store identity, not by origin: origin names the machine, so two
+/// stores on one host share it and would mask each other's newer ops.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SyncCursor {
     seen: BTreeMap<String, Hlc>,
@@ -58,7 +61,7 @@ impl SyncCursor {
 
     /// Whether `op` is already covered by this cursor.
     pub fn covers(&self, op: &crate::SyncOp) -> bool {
-        self.get(&op.origin).is_some_and(|hlc| hlc >= op.hlc)
+        self.get(&op.store).is_some_and(|hlc| hlc >= op.hlc)
     }
 }
 
@@ -86,7 +89,7 @@ impl Vfs {
         let mut cursor = SyncCursor::new();
         let mut statement = self
             .db
-            .prepare("SELECT origin, hlc_ms, hlc_counter FROM sync_queue")?;
+            .prepare("SELECT store, hlc_ms, hlc_counter FROM sync_queue")?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -100,12 +103,12 @@ impl Vfs {
             let (origin, hlc) = row?;
             cursor.observe(&origin, hlc);
         }
-        for (origin, hlc) in self
+        for (store, hlc) in self
             .applied_cursor()?
             .origins()
-            .map(|(o, h)| (o.to_string(), h))
+            .map(|(s, h)| (s.to_string(), h))
         {
-            cursor.observe(&origin, hlc);
+            cursor.observe(&store, hlc);
         }
         Ok(cursor)
     }
@@ -158,7 +161,7 @@ impl Vfs {
         op: &crate::SyncOp,
         bytes: Option<&[u8]>,
     ) -> Result<ApplyOutcome, VfsError> {
-        if self.mark_applied(&op.origin, op.hlc)? == 0 {
+        if self.mark_applied(&op.store, op.hlc)? == 0 {
             return Ok(ApplyOutcome::Duplicate);
         }
 
@@ -178,7 +181,7 @@ impl Vfs {
                 let current = self.file(&op.path)?;
                 let current_id = current.as_ref().map(|entry| &entry.content_id);
                 if current_id != op.base_content_id.as_ref() {
-                    self.unmark_applied(&op.origin, op.hlc)?;
+                    self.unmark_applied(&op.store, op.hlc)?;
                     return Ok(ApplyOutcome::Diverged);
                 }
                 self.apply_put(&op.path, bytes, current.as_ref(), &op.actor, &op.origin)?;
@@ -208,18 +211,37 @@ mod tests {
     use super::*;
     use crate::{Expect, Vfs};
 
-    /// Two stores, each with its own origin.
-    ///
-    /// The cursor keys on origin, so two stores that infer the same origin —
-    /// both on one host, both from the environment — share one high-water mark
-    /// and each masks the other's newer ops. Real peers are separate devices;
-    /// a second store on one machine must be given its own origin.
+    /// Two stores on one host, which is the harder case: they infer the same
+    /// origin from the environment and only their store identity separates them.
     fn pair(dir: &std::path::Path) -> (Vfs, Vfs) {
-        let mut a = Vfs::open(dir.join("a")).unwrap();
-        let mut b = Vfs::open(dir.join("b")).unwrap();
-        a.set_writer(crate::Writer::new("alice", "studio"));
-        b.set_writer(crate::Writer::new("bob", "agora-one"));
-        (a, b)
+        (
+            Vfs::open(dir.join("a")).unwrap(),
+            Vfs::open(dir.join("b")).unwrap(),
+        )
+    }
+
+    #[test]
+    fn two_stores_on_one_host_are_distinct_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, mut b) = pair(dir.path());
+
+        // Same machine, so the same origin; the cursor must not rely on it.
+        assert_eq!(a.writer().origin, b.writer().origin);
+        assert_ne!(a.store(), b.store());
+
+        // The store id survives reopening.
+        let reopened = Vfs::open(dir.path().join("a")).unwrap();
+        assert_eq!(reopened.store(), a.store());
+
+        // Each store's op is in the other's future, which is what the cursor
+        // keyed on origin could not express.
+        a.put("a.md", b"a", "text/markdown", Expect::Any).unwrap();
+        b.put("b.md", b"b", "text/markdown", Expect::Any).unwrap();
+
+        let from_a = a.answer_sync(&b.sync_cursor().unwrap(), 100).unwrap();
+        assert_eq!(from_a.ops.len(), 1, "b must still see a's write");
+        let from_b = b.answer_sync(&a.sync_cursor().unwrap(), 100).unwrap();
+        assert_eq!(from_b.ops.len(), 1, "a must still see b's write");
     }
 
     fn drain(reader: &mut Vfs, writer: &mut Vfs) -> Vec<ApplyOutcome> {
@@ -331,6 +353,7 @@ mod tests {
     fn ops_are_ordered_by_clock_across_two_writers() {
         let dir = tempfile::tempdir().unwrap();
         let (mut a, _) = pair(dir.path());
+        a.set_writer(crate::Writer::new("alice", "studio"));
         a.put("a.md", b"a", "text/markdown", Expect::Any).unwrap();
         a.set_writer(crate::Writer::new("carol", "studio"));
         a.put("b.md", b"b", "text/markdown", Expect::Any).unwrap();
