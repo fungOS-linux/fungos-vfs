@@ -703,6 +703,8 @@ impl Vfs {
         }
     }
 
+    /// The local identity for a write: who, where, and the clock reading it is
+    /// ordered by.
     fn stamp(&mut self) -> Result<Stamp, VfsError> {
         let hlc = self.hlc.observe(now_ms());
         self.persist_hlc(hlc)?;
@@ -1410,6 +1412,43 @@ impl Vfs {
             .map_err(VfsError::from)
     }
 
+    /// Settle a divergence by taking the peer's version.
+    ///
+    /// The copy becomes the file and the record stops holding compaction back.
+    /// The other answer — keep ours — is `resolve_divergence` with the copy left
+    /// in place, because it is then the only remaining record of what arrived.
+    ///
+    /// Lives here rather than beside the record because it is a local write,
+    /// and a local write needs this store's stamp.
+    pub fn accept_divergence(&mut self, store: &str, hlc: Hlc) -> Result<bool, VfsError> {
+        let found = self
+            .divergences()?
+            .into_iter()
+            .find(|entry| entry.store == store && entry.hlc == hlc);
+        let Some(divergence) = found else {
+            return Ok(false);
+        };
+        let copy = divergence.copy_path();
+        if self.file(&copy)?.is_none() {
+            // Without the bytes there is nothing to accept, and dropping the
+            // record would erase the only trace that a write was refused.
+            return Err(VfsError::NotFound(copy));
+        }
+        let bytes = self.get(&copy)?;
+        let current = self.file(&divergence.path)?;
+        let stamp = self.stamp()?;
+        self.apply_put(
+            &divergence.path,
+            &bytes,
+            current.as_ref(),
+            &stamp.actor,
+            &stamp.origin,
+        )?;
+        self.resolve_divergence(store, hlc)?;
+        self.apply_remove(&copy)?;
+        Ok(true)
+    }
+
     /// Record that an op was refused because the head had moved, and drop the
     /// receipt for it.
     ///
@@ -1418,7 +1457,27 @@ impl Vfs {
     /// different facts, and what compaction does to the log must not be allowed
     /// to erase the difference. The record is removed when the divergence is
     /// resolved — either by the op finally fitting, or by a caller saying so.
-    pub(crate) fn mark_diverged(&self, store: &str, hlc: Hlc, path: &str) -> Result<(), VfsError> {
+    ///
+    /// The refused bytes are written to a visible path *first*. Deleting the
+    /// receipt is what makes that ordering mandatory rather than tidy: with no
+    /// receipt, an op the horizon has passed reads as a duplicate, so a write
+    /// that never landed would look like one that had. Keeping the copy is what
+    /// lets the horizon advance over a refusal honestly, and it is why the cost
+    /// of a divergence is disk instead of a log that cannot be compacted.
+    pub(crate) fn mark_diverged(
+        &mut self,
+        store: &str,
+        hlc: Hlc,
+        path: &str,
+        bytes: &[u8],
+        actor: &str,
+        origin: &str,
+    ) -> Result<(), VfsError> {
+        let detected_at_ms = now_ms();
+        let copy = crate::sync::conflict_path(path, store, detected_at_ms);
+        let current = self.file(&copy)?;
+        self.apply_put(&copy, bytes, current.as_ref(), actor, origin)?;
+
         let tx = self.db.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM applied WHERE store=?1 AND hlc_ms=?2 AND hlc_counter=?3",
@@ -1427,7 +1486,7 @@ impl Vfs {
         tx.execute(
             "INSERT OR REPLACE INTO diverged(store,hlc_ms,hlc_counter,path,detected_at_ms)
              VALUES(?1,?2,?3,?4,?5)",
-            params![store, hlc.ms, i64::from(hlc.counter), path, now_ms()],
+            params![store, hlc.ms, i64::from(hlc.counter), path, detected_at_ms],
         )?;
         tx.commit()?;
         Ok(())
