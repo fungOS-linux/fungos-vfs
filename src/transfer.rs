@@ -43,6 +43,9 @@ pub struct IngestReport {
     pub prefix: String,
     pub added: usize,
     pub changed: usize,
+    /// Entries removed from the namespace. A plain ingest only ever adds; a
+    /// projection of a recording removes what it no longer holds.
+    pub removed: usize,
     pub unchanged: usize,
     pub skipped: usize,
     pub excluded: usize,

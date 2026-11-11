@@ -58,7 +58,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 
 use crate::{
-    ContentId, Expect, PathClass, PathPolicy, SyncOpKind, Vfs,
+    ContentId, Expect, GitPointer, IngestReport, PathClass, PathPolicy, SyncOpKind, Vfs,
     project::{attach_policy, git},
     transfer::media_type_for,
 };
@@ -100,6 +100,9 @@ pub struct MaterializeReport {
     pub tree: String,
     /// The directory was already there at this base; only the in-between moved.
     pub reused: bool,
+    /// The directory was adopted rather than created: it was already a checkout
+    /// of this repository at this commit, and nothing in it was written.
+    pub adopted: bool,
     /// Paths placed from the content store.
     pub placed: usize,
     /// Of those, how many the filesystem copied on write instead of copying.
@@ -183,21 +186,28 @@ pub struct WorktreeChange {
     pub at_ms: i64,
 }
 
-/// Where an attached project's worktrees live in the namespace, so that
-/// `materialize` and `project attach` agree on one address per worktree.
+/// Where a worktree's recording lives in the namespace.
+///
+/// Deliberately the same address `project attach` gives it, and the same
+/// function decides both: the project's main worktree *is* the project's
+/// namespace, and every other worktree hangs under it. Two functions naming one
+/// worktree is how a recording and an attach end up writing the same files to
+/// two addresses.
+///
+/// `label` is the recording's own name; `main` says the directory is the
+/// repository's main worktree, which cannot be inferred from the label.
 #[must_use]
-pub fn namespace_for(prefix: &str, project: &Path, name: &str) -> String {
+pub fn namespace_for(prefix: &str, project: &Path, label: &str, main: bool) -> String {
     let project = project
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "project".to_string());
-    let name = crate::project::label(Some(name), Path::new(name));
-    format!(
-        "{}/{}/worktrees/{}",
-        prefix.trim_matches('/'),
-        project,
-        name
-    )
+    let prefix = prefix.trim_matches('/');
+    if main {
+        return format!("{prefix}/{project}");
+    }
+    let label = crate::project::label(Some(label), Path::new(label));
+    format!("{prefix}/{project}/worktrees/{label}")
 }
 
 /// Every worktree this store has recorded.
@@ -226,6 +236,112 @@ pub fn worktrees(vfs: &Vfs) -> Result<Vec<WorktreeState>> {
 
 fn state(vfs: &Vfs, name: &str) -> Result<Option<WorktreeState>> {
     Ok(worktrees(vfs)?.into_iter().find(|state| state.name == name))
+}
+
+/// The recording for the worktree whose directory is `path`, if there is one.
+///
+/// Matched on the resolved path, because the same checkout is named `/src/soil`
+/// by one caller and `/private/src/soil` by another and they are one directory.
+pub fn state_for_path(vfs: &Vfs, path: &Path) -> Result<Option<WorktreeState>> {
+    let wanted = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    Ok(worktrees(vfs)?.into_iter().find(|state| {
+        fs::canonicalize(&state.path).unwrap_or_else(|_| state.path.clone()) == wanted
+    }))
+}
+
+/// Write a recording into the namespace under `prefix`.
+///
+/// The namespace for a recorded worktree is the **in-between**, not the checkout:
+/// the base commit covers every file the work has not touched, through one
+/// pointer, so writing those files again would store what Git has already
+/// content-addressed and make attaching a dirty worktree cost its whole tree.
+///
+/// It also reconciles both ways. Anything under `prefix` that the recording does
+/// not hold is removed, which is what repairs a namespace an earlier `attach`
+/// filled with a whole dirty checkout.
+pub fn project(
+    vfs: &mut Vfs,
+    known: &WorktreeState,
+    prefix: &str,
+    dry_run: bool,
+) -> Result<IngestReport> {
+    let prefix = prefix.trim_matches('/');
+    let mut report = IngestReport {
+        prefix: prefix.to_string(),
+        ..IngestReport::default()
+    };
+    let overlay = overrides(vfs, &known.name)?;
+    let needle = format!("{prefix}/");
+
+    // `list` matches by prefix, so a sibling whose name starts the same way
+    // (`main` and `main-2`) comes back too; the separator is what tells them
+    // apart, and pruning the wrong one would delete another worktree's files.
+    let existing: BTreeMap<String, ContentId> = vfs
+        .list(prefix)?
+        .into_iter()
+        .filter(|entry| entry.path.starts_with(&needle))
+        .map(|entry| (entry.path, entry.content_id))
+        .collect();
+
+    for (rel, override_) in &overlay {
+        let path = format!("{needle}{rel}");
+        match override_.op {
+            Planned::Upsert => {
+                let content_id = override_.content_id.clone().ok_or_else(|| {
+                    anyhow!("the recording for {rel} says it has content but names none")
+                })?;
+                match existing.get(&path) {
+                    Some(current) if *current == content_id => report.unchanged += 1,
+                    Some(_) => {
+                        if !dry_run {
+                            let bytes = vfs.content(&content_id)?;
+                            vfs.put(&path, &bytes, &override_.media_type, Expect::Any)?;
+                        }
+                        report.changed += 1;
+                        report.bytes_written += override_.size;
+                    }
+                    None => {
+                        if !dry_run {
+                            let bytes = vfs.content(&content_id)?;
+                            vfs.put(&path, &bytes, &override_.media_type, Expect::Any)?;
+                        }
+                        report.added += 1;
+                        report.bytes_written += override_.size;
+                    }
+                }
+            }
+            Planned::Remove => {
+                if existing.contains_key(&path) {
+                    if !dry_run {
+                        vfs.remove(&path)?;
+                    }
+                    report.removed += 1;
+                }
+            }
+            Planned::Forget => {
+                // Never stored: a forgotten path is one the base commit covers.
+            }
+        }
+    }
+
+    for path in existing.keys() {
+        let rel = path.strip_prefix(&needle).unwrap_or_default();
+        if overlay.contains_key(rel) {
+            continue;
+        }
+        if !dry_run {
+            vfs.remove(path)?;
+        }
+        report.removed += 1;
+    }
+
+    report.git = Some(GitPointer {
+        commit: known.base_commit.clone(),
+        tree: known.base_tree.clone(),
+        // What the tree id does not describe is exactly the in-between.
+        dirty: !overlay.is_empty(),
+    });
+    Ok(report)
 }
 
 /// Put a recorded worktree on disk at its base commit.
@@ -258,7 +374,13 @@ pub fn materialize(
     let tree = git(&root, &["rev-parse", &format!("{commit}^{{tree}}")])?
         .trim()
         .to_string();
-    let namespace = namespace_for(prefix, &root, name);
+    // The repository's main worktree has a different address from every other
+    // one, and the directory that is about to exist is the only thing that can
+    // say which this is.
+    let resolved = fs::canonicalize(dest).ok();
+    let root_resolved = fs::canonicalize(&root).ok();
+    let main = matches!((&resolved, &root_resolved), (Some(dest), Some(root)) if dest == root);
+    let namespace = namespace_for(prefix, &root, name, main);
 
     let existing = state(vfs, name)?;
     if let Some(known) = &existing
@@ -286,16 +408,40 @@ pub fn materialize(
             .with_context(|| format!("reading {}", dest.display()))?
             .next()
             .is_none();
-    if present && !empty && existing.is_none() {
-        bail!(
-            "{} is not empty, and no worktree is recorded there; \
-             materialize writes into a directory it creates",
-            dest.display()
-        );
-    }
 
-    if present && !empty {
-        // Already checked out: only the in-between has to be put back.
+    if present && !empty && existing.is_none() {
+        // A checkout somebody already has is the common case: a worktree exists
+        // because an agent or an editor made it, and the recording arrives after.
+        // Adopting it writes nothing — the row says "this directory, at this
+        // commit" and the next `record` describes whatever is already different.
+        // Refusing instead would mean the only way into the recording was to
+        // throw away the work in the directory first.
+        let head = git(dest, &["rev-parse", "--show-toplevel"])
+            .map(|top| top.trim().to_string())
+            .ok()
+            .is_some_and(|top| Path::new(&top) == root.as_path());
+        if !head {
+            bail!(
+                "{} is not a worktree of {}; materialize writes into a directory \
+                 it creates, or adopts one of this repository's",
+                dest.display(),
+                root.display()
+            );
+        }
+        let on = git(dest, &["rev-parse", "HEAD"])
+            .map(|value| value.trim().to_string())
+            .unwrap_or_default();
+        if on != commit {
+            bail!(
+                "{} is checked out at {on}, not {commit}; pass --commit {on} to \
+                 record what is there",
+                dest.display()
+            );
+        }
+        report.adopted = true;
+        report.reused = true;
+    } else if present && !empty {
+        // Already checked out at this base: only the in-between has to be put back.
         report.reused = true;
     } else {
         if let Some(parent) = dest.parent() {
@@ -741,13 +887,15 @@ pub fn changes(vfs: &Vfs, name: &str, since: i64, limit: usize) -> Result<Change
 struct Override {
     op: Planned,
     content_id: Option<ContentId>,
+    media_type: String,
     size: u64,
 }
 
 fn overrides(vfs: &Vfs, name: &str) -> Result<BTreeMap<String, Override>> {
     let mut map = BTreeMap::new();
     let mut statement = vfs.db.prepare(
-        "SELECT path,op,content_id,size FROM worktree_overrides WHERE worktree=?1 ORDER BY path",
+        "SELECT path,op,content_id,media_type,size FROM worktree_overrides
+         WHERE worktree=?1 ORDER BY path",
     )?;
     let rows = statement.query_map(rusqlite::params![name], |row| {
         let op: String = row.get(1)?;
@@ -755,11 +903,12 @@ fn overrides(vfs: &Vfs, name: &str) -> Result<BTreeMap<String, Override>> {
             row.get::<_, String>(0)?,
             op,
             row.get::<_, Option<String>>(2)?,
-            row.get::<_, i64>(3)? as u64,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)? as u64,
         ))
     })?;
     for row in rows {
-        let (path, op, content_id, size) = row?;
+        let (path, op, content_id, media_type, size) = row?;
         let op = match op.as_str() {
             "upsert" => Planned::Upsert,
             "remove" => Planned::Remove,
@@ -774,6 +923,7 @@ fn overrides(vfs: &Vfs, name: &str) -> Result<BTreeMap<String, Override>> {
             Override {
                 op,
                 content_id,
+                media_type,
                 size,
             },
         );
@@ -1041,6 +1191,90 @@ mod tests {
 
     fn body(index: usize, suffix: &str) -> String {
         format!("contents of file {index}{suffix}\n")
+    }
+
+    #[test]
+    fn an_existing_checkout_is_adopted_rather_than_refused() {
+        let base = scratch("adopt");
+        let repo = base.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        run(&repo, &["init", "-q"]);
+        for index in 0..4 {
+            write(&repo.join(format!("src/f{index}.txt")), &body(index, ""));
+        }
+        commit_all(&repo, "init");
+        // Already somebody's working directory, and already dirty: the recording
+        // arrives after the work, which is the normal order.
+        write(&repo.join("src/f1.txt"), &body(1, " (edited)"));
+        let mut vfs = open_vfs(&base);
+
+        let report = materialize(&mut vfs, &repo, "main", &repo, None, "projects").unwrap();
+        assert!(report.adopted, "nothing in the directory was written");
+        assert_eq!(report.placed, 0);
+
+        let recorded = record(&mut vfs, "main", &RecordOptions::new("agent")).unwrap();
+        assert_eq!(recorded.planned, 1, "{recorded:#?}");
+        assert_eq!(overrides(&vfs, "main").unwrap().len(), 1);
+
+        // A directory that is not a worktree of this repository is refused, not
+        // silently adopted.
+        let stranger = base.join("stranger");
+        fs::create_dir_all(&stranger).unwrap();
+        write(&stranger.join("x.txt"), "x\n");
+        let error = materialize(&mut vfs, &repo, "other", &stranger, None, "projects").unwrap_err();
+        assert!(
+            format!("{error}").contains("is not a worktree of"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_recording_is_written_into_the_namespace_as_the_in_between() {
+        let base = scratch("project");
+        let (repo, _) = repository(&base, 8);
+        let mut vfs = open_vfs(&base);
+        let dest = base.join("work/main");
+        materialize(&mut vfs, &repo, "main", &dest, None, "projects").unwrap();
+
+        for index in [2usize, 6] {
+            write(
+                &dest.join(format!("src/file{index:03}.txt")),
+                &body(index, " (edited)"),
+            );
+        }
+        record(&mut vfs, "main", &RecordOptions::new("agent")).unwrap();
+
+        // Something else had filled this prefix — an earlier attach, or a peer.
+        vfs.put(
+            "projects/repo/worktrees/main/stale.txt",
+            b"gone\n",
+            "text/plain",
+            Expect::Any,
+        )
+        .unwrap();
+
+        let known = state(&vfs, "main").unwrap().unwrap();
+        assert_eq!(overrides(&vfs, "main").unwrap().len(), 2);
+        let report = project(&mut vfs, &known, &known.prefix, false).unwrap();
+        // `record` already wrote the in-between into the namespace; what is left
+        // for a projection is reconciling, and it found the two files correct and
+        // one path the recording does not hold.
+        assert_eq!(report.unchanged, 2);
+        assert_eq!(report.removed, 1, "{report:#?}");
+        let listed = vfs.list(&known.prefix).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed
+                .iter()
+                .all(|entry| !entry.path.ends_with("stale.txt"))
+        );
+
+        // Projecting again changes nothing: it is a projection, not a merge.
+        let again = project(&mut vfs, &known, &known.prefix, false).unwrap();
+        assert_eq!(again.added, 0);
+        assert_eq!(again.changed, 0);
+        assert_eq!(again.removed, 0);
+        assert_eq!(again.unchanged, 2);
     }
 
     #[test]

@@ -199,10 +199,10 @@ What attach records:
 - the **worktrees** Git knows about, so the desktop can see what is checked out
   and where, without a second copy of any object;
 the **in-between** Git cannot hold: a dirty worktree cannot be described by a
-  tree id, so its whole checkout is stored as blobs — deduplicated by the
-  content store, and not narrowed to the changed files — and the report says
-  `git.dirty` so the difference is
-  never implied.
+  tree id, so one that has not been recorded is stored as blobs — its whole
+  checkout, not only the changed files — and the report says `git.dirty` so the
+  difference is never implied. Record the worktree and it costs its diff instead;
+  see [Worktrees](#worktrees).
 
 The policy it attaches, in full:
 
@@ -218,6 +218,11 @@ exclude: build/
 
 Last matching rule wins, which is why the exclusions come second: a repository
 that commits its build output must not have that output treated as source.
+
+A *dirty* worktree cannot use the tree pointer, so attaching one stores its whole
+checkout as blobs — unless it has been recorded, in which case only the
+in-between is written (see [Worktrees](#worktrees)). The report says
+`git.dirty` either way, so the difference is never implied.
 
 A clean repository of one file attaches as **one tree pointer and zero bytes
 written**. Change a file and the next attach writes that file — the rest is
@@ -251,6 +256,25 @@ checkout. Only the recorded in-between is streamed out of the content store, and
 on APFS it is placed by `clonefile` — a reflink, not a copy. The report says which
 happened (`placed` against `cloned`).
 
+**Adopting is the usual case.** A worktree exists because an agent or an editor
+made it; the recording arrives second. `materialize` pointed at an existing
+checkout of the same repository at the same commit adopts it — it writes nothing,
+records the address, and the next `record` describes whatever is already
+different. Pointed at a directory that is not a worktree of that repository, it
+refuses and says so.
+
+**`project attach` prefers the recording.** A recorded worktree attaches as one
+pointer plus its in-between, not as a walk of the checkout. That is what repairs
+the old cost: attach a dirty checkout and it still stores the whole tree; record
+that worktree, attach again, and the namespace becomes the three files that
+actually changed, with the rest let go (`removed: 17` in a twenty-file checkout).
+The report says `recorded: true` when this happened, so "attached cheaply" and
+"attached the old way" are never confused.
+
+A recording owns its namespace address, computed by one function for both
+`materialize` and `attach`: the project's main worktree *is* `projects/<name>`,
+and every other worktree hangs under `projects/<name>/worktrees/<label>`.
+
 Two rules make an interrupted record safe:
 
 1. **The plan is written before it is applied.** Every op lands in the journal in
@@ -279,9 +303,10 @@ What it deliberately does not do, yet:
   build output anyway. Same rule as `project attach`, same policy.
 - **Renames** are recorded as a removal and an upsert — one blob, which is what a
   rename costs to store.
-- Attaching a *dirty* worktree still stores its whole checkout as blobs. The
-  recording now knows better, so `project attach` should prefer a recorded base
-  when one exists.
+- **Non-Git directories.** There is no cheap base for one, and hashing everything
+  on every record is the cost this design exists to avoid. Refused rather than
+  approximated — a content-addressed store for plain files is the other half of
+  the story, and it is a different one.
 
 ## Pieces
 
