@@ -129,6 +129,25 @@ fungos-vfs --root ~/fungos-local sync pull --quic agora-one:7701 \
 Content follows the ops: an op names content ids this store may not hold, and
 the bytes are fetched by id and verified against it before being stored.
 
+### Divergence, and where the other version went
+
+A refused write is not thrown away. Its bytes are written beside the file as
+`<name> (diverged from <store> <date>)<ext>`, so the other version is something
+you can open rather than a number you have to take on faith:
+
+```sh
+fungos-vfs --root ~/fungos-local sync diverged
+fungos-vfs --root ~/fungos-local sync resolve --path docs/plan.md --keep remote
+fungos-vfs --root ~/fungos-local sync resolve --path docs/plan.md --keep local
+```
+
+- `diverged` lists every refusal still held: the path, the store it came from,
+  where its bytes went, and how long it has been waiting.
+- `--keep remote` makes the copy the file and forgets the refusal; the copy is
+  removed because it is now redundant.
+- `--keep local` keeps what is here, forgets the refusal, and **leaves the copy**
+  — it is then the whole record of what the peer wanted to write.
+
 ### Compaction
 
 An op log that only grows eventually costs more to scan than the work it
@@ -141,17 +160,26 @@ fungos-vfs --root ~/fungos-node sync compact --older-than 2592000  # 30 days
 Dropping rows is the easy half. A peer whose cursor now sits below what was
 dropped cannot be caught up from the log at all — the ops that would fill its
 gap are the ones that are gone — so it is told so and given a snapshot instead.
-Compaction also stops short of the earliest unresolved divergence for a store:
-those rows stay until the divergence settles, because a retried write must not
-come back as a duplicate of a write this store never got.
+
+Divergences are the other half, and they are why the copy above exists. An op
+below the cutoff is either **forgotten** because its bytes are on disk, or
+**reported as a pin** because they are not — the same clock, one decision.
+That ordering is load-bearing: refusing a write deletes its receipt, so an op
+the horizon has passed reads as a duplicate, and a write that never landed
+would look like one that had. The copy is what lets the horizon advance
+honestly. In practice this means an unresolved divergence costs **disk** (paid
+at the moment of refusal) instead of a log that no one can compact.
+
+The report says which happened: `expired_divergences` per store, and `pinned`
+for the ones still holding the pass back.
 
 ### What sync is not
 
 - **Not push.** Nothing watches the filesystem, so convergence happens when a
   pull runs. A live-sync daemon is future work.
 - **Not a merge.** Concurrent writes to the same path surface as `diverged` for
-  a human or a policy to settle. There is no conflict copy and no automatic
-  winner.
+  a human to settle. Neither side wins automatically; the version that lost is
+  kept as a copy so the decision can be made by reading both.
 - **Not a server.** No node is authoritative; any store can pull from any other.
 
 ## Next

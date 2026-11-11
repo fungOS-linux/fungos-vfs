@@ -288,6 +288,10 @@ pub struct CompactionReport {
     /// divergence sits below it, with the reading that held it back. Empty when
     /// nothing is pinned, which is the answer to "why is the log still here?".
     pub pinned: BTreeMap<String, Hlc>,
+    /// Divergences forgotten because their bytes were already on disk, per
+    /// store. A forgotten divergence no longer pins the log: what it cost was
+    /// disk, paid at the moment of refusal, and that cost is still there.
+    pub expired_divergences: BTreeMap<String, u64>,
     /// The horizon per store after this pass: the highest reading this store
     /// no longer keeps. Reported even when nothing was dropped, so a caller
     /// can see the point a peer would have to be behind to get a snapshot.
@@ -339,6 +343,69 @@ pub struct Divergence {
     /// The path the op wanted to write, so the record can be explained.
     pub path: String,
     pub detected_at_ms: i64,
+}
+
+impl Divergence {
+    /// Where the refused op's bytes were kept.
+    ///
+    /// Derived rather than stored: the name is a function of the path, the
+    /// store and the moment the refusal was detected, so there is no second
+    /// copy of the fact to keep in step with this one.
+    #[must_use]
+    pub fn copy_path(&self) -> String {
+        conflict_path(&self.path, &self.store, self.detected_at_ms)
+    }
+}
+
+/// Name for the visible copy of a write that was refused.
+///
+/// Deliberately in the same directory and not hidden: a divergence costs disk
+/// so that it does not cost the log, and a cost nobody can see is one nobody
+/// manages. The name is Drive's conflicted-copy shape rather than a hashed
+/// path, because the person who has to decide between the two files is a
+/// person, not a program.
+#[must_use]
+pub fn conflict_path(path: &str, store: &str, detected_at_ms: i64) -> String {
+    let (parent, name) = match path.rfind('/') {
+        Some(index) => (&path[..index], &path[index + 1..]),
+        None => ("", path),
+    };
+    // A leading dot is part of the name, not an extension separator: `.env`
+    // does not have the extension `env`.
+    let (stem, extension) = match name.rfind('.') {
+        Some(index) if index > 0 => (&name[..index], &name[index..]),
+        _ => (name, ""),
+    };
+    let copy = format!(
+        "{stem} (diverged from {store} {}){extension}",
+        utc_date(detected_at_ms)
+    );
+    if parent.is_empty() {
+        copy
+    } else {
+        format!("{parent}/{copy}")
+    }
+}
+
+/// `YYYY-MM-DD` in UTC from a Unix timestamp in milliseconds.
+///
+/// No date library: the crate has none, and the copy's name needs a day, not a
+/// timezone database. Civil-from-days is the standard conversion (Howard
+/// Hinnant's algorithm), which is short enough to verify by reading it.
+fn utc_date(ms: i64) -> String {
+    let days = ms.div_euclid(86_400_000);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let mp = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 /// One store's answer to a sync request.
@@ -567,7 +634,10 @@ impl Vfs {
                 let current = self.file(&op.path)?;
                 let current_id = current.as_ref().map(|entry| &entry.content_id);
                 if current_id != op.base_content_id.as_ref() {
-                    self.mark_diverged(&op.store, op.hlc, &op.path)?;
+                    // The bytes are handed over so the refusal can keep them:
+                    // the receipt for this op is deleted in the same breath, so
+                    // a copy is the only thing between "deferred" and "lost".
+                    self.mark_diverged(&op.store, op.hlc, &op.path, bytes, &op.actor, &op.origin)?;
                     return Ok(ApplyOutcome::Diverged);
                 }
                 self.apply_put(&op.path, bytes, current.as_ref(), &op.actor, &op.origin)?;
@@ -656,6 +726,36 @@ impl Vfs {
             ms: now_ms().saturating_sub(i64::try_from(older_than.as_millis()).unwrap_or(i64::MAX)),
             counter: 0,
         };
+
+        // Expiry runs before the pins are read, so a divergence the pass is
+        // old enough to cover stops holding it back in this same pass.
+        //
+        // Expiry and pinning are the two halves of one decision, keyed on the
+        // same clock: an op below the cutoff is either forgotten because its
+        // bytes are on disk, or reported as a pin because they are not. A
+        // divergence used to pin unconditionally, which meant a log could only
+        // ever be compacted by a person deciding.
+        //
+        // Only a divergence whose copy is on disk may be forgotten. The copy is
+        // the whole of the guarantee: `mark_diverged` deletes the receipt for
+        // the op, so once the horizon passes an op that never landed, a retry
+        // reads as `duplicate` and the write is gone without anyone being told.
+        // With the bytes kept, the horizon can advance honestly.
+        let mut expired_divergences: BTreeMap<String, u64> = BTreeMap::new();
+        for divergence in self.divergences()? {
+            if divergence.hlc >= cutoff {
+                continue;
+            }
+            if self.file(&divergence.copy_path())?.is_none() {
+                continue;
+            }
+            if self.resolve_divergence(&divergence.store, divergence.hlc)? {
+                *expired_divergences
+                    .entry(divergence.store.clone())
+                    .or_default() += 1;
+            }
+        }
+
         let pins = self.divergence_pins()?;
         let ops = self.rows_older_than("sync_queue", cutoff, &pins)?;
         let receipts = self.rows_older_than("applied", cutoff, &pins)?;
@@ -698,6 +798,7 @@ impl Vfs {
             // Only a divergence older than the cutoff is holding the pass back:
             // one above it was never going to be reached anyway.
             pinned: pins.into_iter().filter(|(_, pin)| *pin < cutoff).collect(),
+            expired_divergences,
             horizons: self.horizons()?,
         })
     }
@@ -1704,7 +1805,10 @@ mod tests {
         assert_eq!(divergences[0].path, "f.md");
 
         // Compaction is asked to take everything, and the clock has moved past
-        // the op — but the horizon must not reach an open divergence.
+        // the op — but the horizon must not reach a divergence whose bytes are
+        // gone. This is the case expiry cannot rescue: nothing is on disk to
+        // keep, so forgetting the record would swallow the write below.
+        b.apply_remove(&divergences[0].copy_path()).unwrap();
         wait_past(op.hlc);
         let report = b.compact(std::time::Duration::ZERO).unwrap();
         assert!(
@@ -1716,6 +1820,10 @@ mod tests {
             report.pinned.get(&op.store),
             Some(&op.hlc),
             "the pass is held at the divergence, and the report says so"
+        );
+        assert!(
+            report.expired_divergences.is_empty(),
+            "nothing was forgotten, because nothing was kept"
         );
 
         // The retry is deferred again, not counted as already applied, and the
@@ -1745,8 +1853,6 @@ mod tests {
             ApplyOutcome::Diverged
         );
         wait_past(op.hlc);
-        let pinned = b.compact(std::time::Duration::ZERO).unwrap();
-        assert_eq!(pinned.pinned.get(&op.store), Some(&op.hlc));
 
         // A human decides the local head wins, which is the only thing that can
         // settle a difference the store cannot settle itself.
@@ -1948,5 +2054,152 @@ mod tests {
         assert!(second.dropped_ops.is_empty(), "{:?}", second.dropped_ops);
         assert!(second.dropped_receipts.is_empty());
         assert_eq!(second.horizons, first.horizons);
+    }
+
+    #[test]
+    fn a_conflict_copy_keeps_the_directory_and_takes_the_extension() {
+        assert_eq!(
+            conflict_path("docs/report.pdf", "agora", 1_760_000_000_000),
+            "docs/report (diverged from agora 2025-10-09).pdf"
+        );
+        assert_eq!(
+            conflict_path("README", "studio", 0),
+            "README (diverged from studio 1970-01-01)"
+        );
+        // A leading dot is part of the name; `.env` has no extension to keep.
+        assert_eq!(
+            conflict_path("a/.env", "studio", 0),
+            "a/.env (diverged from studio 1970-01-01)"
+        );
+        assert_eq!(
+            conflict_path("lib.tar.gz", "studio", 0),
+            "lib.tar (diverged from studio 1970-01-01).gz"
+        );
+    }
+
+    #[test]
+    fn a_refused_write_is_kept_as_a_visible_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, mut b) = pair(dir.path());
+        a.put("f.md", b"v1", "text/markdown", Expect::Any).unwrap();
+        drain(&mut b, &mut a);
+        a.put("f.md", b"from-a", "text/markdown", Expect::Any)
+            .unwrap();
+        b.put("f.md", b"from-b", "text/markdown", Expect::Any)
+            .unwrap();
+
+        let cursor = b.sync_cursor().unwrap();
+        let op = a.answer_sync(&cursor, 100).unwrap().ops[0].clone();
+        assert_eq!(
+            b.apply_remote(&op, Some(b"from-a")).unwrap(),
+            ApplyOutcome::Diverged
+        );
+
+        // Ours keeps the path, theirs becomes a file a person can see.
+        assert_eq!(b.get("f.md").unwrap(), b"from-b");
+        let divergence = b.divergences().unwrap().remove(0);
+        let copy = divergence.copy_path();
+        assert!(copy.starts_with("f (diverged from "), "{copy}");
+        assert_eq!(b.get(&copy).unwrap(), b"from-a");
+    }
+
+    #[test]
+    fn taking_the_copy_replaces_the_file_and_forgets_the_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, mut b) = pair(dir.path());
+        a.put("f.md", b"v1", "text/markdown", Expect::Any).unwrap();
+        drain(&mut b, &mut a);
+        a.put("f.md", b"from-a", "text/markdown", Expect::Any)
+            .unwrap();
+        b.put("f.md", b"from-b", "text/markdown", Expect::Any)
+            .unwrap();
+        let cursor = b.sync_cursor().unwrap();
+        let op = a.answer_sync(&cursor, 100).unwrap().ops[0].clone();
+        assert_eq!(
+            b.apply_remote(&op, Some(b"from-a")).unwrap(),
+            ApplyOutcome::Diverged
+        );
+        let divergence = b.divergences().unwrap().remove(0);
+        let copy = divergence.copy_path();
+
+        assert!(
+            b.accept_divergence(&divergence.store, divergence.hlc)
+                .unwrap()
+        );
+        assert_eq!(b.get("f.md").unwrap(), b"from-a");
+        assert!(
+            b.file(&copy).unwrap().is_none(),
+            "the copy is redundant now"
+        );
+        assert!(b.divergences().unwrap().is_empty());
+    }
+
+    #[test]
+    fn keeping_ours_leaves_the_copy_as_the_record_of_what_arrived() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, mut b) = pair(dir.path());
+        a.put("f.md", b"v1", "text/markdown", Expect::Any).unwrap();
+        drain(&mut b, &mut a);
+        a.put("f.md", b"from-a", "text/markdown", Expect::Any)
+            .unwrap();
+        b.put("f.md", b"from-b", "text/markdown", Expect::Any)
+            .unwrap();
+        let cursor = b.sync_cursor().unwrap();
+        let op = a.answer_sync(&cursor, 100).unwrap().ops[0].clone();
+        assert_eq!(
+            b.apply_remote(&op, Some(b"from-a")).unwrap(),
+            ApplyOutcome::Diverged
+        );
+        let divergence = b.divergences().unwrap().remove(0);
+        let copy = divergence.copy_path();
+
+        assert!(
+            b.resolve_divergence(&divergence.store, divergence.hlc)
+                .unwrap()
+        );
+        assert_eq!(b.get("f.md").unwrap(), b"from-b");
+        assert_eq!(b.get(&copy).unwrap(), b"from-a");
+        assert!(b.divergences().unwrap().is_empty());
+    }
+
+    #[test]
+    fn compaction_forgets_a_divergence_only_once_its_bytes_are_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, mut b) = pair(dir.path());
+        a.put("f.md", b"v1", "text/markdown", Expect::Any).unwrap();
+        drain(&mut b, &mut a);
+        a.put("f.md", b"from-a", "text/markdown", Expect::Any)
+            .unwrap();
+        b.put("f.md", b"from-b", "text/markdown", Expect::Any)
+            .unwrap();
+        let cursor = b.sync_cursor().unwrap();
+        let op = a.answer_sync(&cursor, 100).unwrap().ops[0].clone();
+        assert_eq!(
+            b.apply_remote(&op, Some(b"from-a")).unwrap(),
+            ApplyOutcome::Diverged
+        );
+        let divergence = b.divergences().unwrap().remove(0);
+        let copy = divergence.copy_path();
+
+        // Without the bytes there is nothing to keep, so the record must go on
+        // pinning rather than being expired into the void.
+        b.apply_remove(&copy).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let pinned = b.compact(std::time::Duration::from_millis(1)).unwrap();
+        assert!(pinned.expired_divergences.is_empty());
+        assert_eq!(b.divergences().unwrap().len(), 1);
+
+        // With the copy back, the same pass forgets it and says so.
+        b.put(&copy, b"from-a", "text/markdown", Expect::Any)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let expired = b.compact(std::time::Duration::from_millis(1)).unwrap();
+        assert_eq!(expired.expired_divergences.get(&divergence.store), Some(&1));
+        assert!(b.divergences().unwrap().is_empty());
+        assert_eq!(
+            b.get(&copy).unwrap(),
+            b"from-a",
+            "forgetting the refusal must not delete what arrived"
+        );
     }
 }

@@ -175,6 +175,15 @@ enum Command {
         /// The fingerprint a QUIC peer must present, in hex.
         #[arg(long)]
         fingerprint: Option<String>,
+        /// Path to settle, for `resolve`.
+        #[arg(long)]
+        path: Option<String>,
+        /// Which side wins: `local` keeps what is here, `remote` takes the copy.
+        #[arg(long)]
+        keep: Option<String>,
+        /// Which peer's divergence to settle, when several hold the same path.
+        #[arg(long)]
+        store: Option<String>,
     },
     /// Materialize everything under `prefix` into a directory.
     Export {
@@ -362,6 +371,9 @@ fn run() -> anyhow::Result<()> {
             quic,
             cert,
             fingerprint,
+            path,
+            keep,
+            store,
         } => match mode.as_str() {
             // ssh stays the default carrier: without `--quic`, `serve` answers
             // one request on stdin, which is exactly what an ssh session gives
@@ -423,7 +435,50 @@ fn run() -> anyhow::Result<()> {
                 let report = vfs.compact(std::time::Duration::from_secs(seconds))?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
-            other => anyhow::bail!("sync mode must be serve, pull or compact, not {other}"),
+            "diverged" => {
+                println!("{}", serde_json::to_string_pretty(&diverged_report(&vfs)?)?);
+            }
+            "resolve" => {
+                let path = path.ok_or_else(|| anyhow::anyhow!("sync resolve needs --path"))?;
+                let keep = keep.ok_or_else(|| anyhow::anyhow!("sync resolve needs --keep"))?;
+                let found: Vec<_> = vfs
+                    .divergences()?
+                    .into_iter()
+                    .filter(|entry| entry.path == path)
+                    .collect();
+                let chosen = match (found.len(), store) {
+                    (0, _) => anyhow::bail!("nothing is diverged at {path}"),
+                    (1, None) => found.into_iter().next().expect("one"),
+                    (_, None) => anyhow::bail!(
+                        "{path} is diverged from {} stores; pass --store",
+                        found.len()
+                    ),
+                    (_, Some(store)) => found
+                        .into_iter()
+                        .find(|entry| entry.store == store)
+                        .ok_or_else(|| anyhow::anyhow!("no divergence at {path} from {store}"))?,
+                };
+                let settled = match keep.as_str() {
+                    // Keeping ours leaves the copy: it is the only remaining
+                    // record of what the peer wanted to write.
+                    "local" => vfs.resolve_divergence(&chosen.store, chosen.hlc)?,
+                    "remote" => vfs.accept_divergence(&chosen.store, chosen.hlc)?,
+                    other => anyhow::bail!("--keep must be local or remote, not {other}"),
+                };
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "path": path,
+                        "store": chosen.store,
+                        "kept": keep,
+                        "settled": settled,
+                        "copy": chosen.copy_path(),
+                    })
+                );
+            }
+            other => anyhow::bail!(
+                "sync mode must be serve, pull, compact, diverged or resolve, not {other}"
+            ),
         },
         Command::Export { prefix, dest } => {
             let report = export_dir(&mut vfs, &prefix, &dest)?;
@@ -433,6 +488,30 @@ fn run() -> anyhow::Result<()> {
         Command::Migrate => unreachable!(),
     }
     Ok(())
+}
+
+/// What `sync diverged` prints: every refusal still held, and where its bytes
+/// went. The age is here rather than in the store because when a divergence
+/// expires is a policy of the caller running `compact`, not a fact of the log.
+fn diverged_report(vfs: &fungos_vfs::Vfs) -> anyhow::Result<serde_json::Value> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default();
+    let mut rows = Vec::new();
+    for divergence in vfs.divergences()? {
+        let copy = divergence.copy_path();
+        rows.push(serde_json::json!({
+            "store": divergence.store,
+            "hlc": { "ms": divergence.hlc.ms, "counter": divergence.hlc.counter },
+            "path": divergence.path,
+            "copy": copy,
+            "copy_present": vfs.file(&copy)?.is_some(),
+            "detected_at_ms": divergence.detected_at_ms,
+            "age_seconds": (now - divergence.detected_at_ms).max(0) / 1000,
+        }));
+    }
+    Ok(serde_json::Value::Array(rows))
 }
 
 /// What `sync pull` prints, whichever carrier moved the ops.
