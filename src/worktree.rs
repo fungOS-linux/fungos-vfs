@@ -55,6 +55,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 
 use crate::{
@@ -146,6 +147,32 @@ pub struct CheckoutReport {
     /// Were the base commit's version, so laying the in-between over them is not
     /// a loss.
     pub replaced: usize,
+}
+
+/// What `worktree prune` found, and what it did about it.
+#[derive(Debug, Serialize)]
+pub struct PruneEntry {
+    pub name: String,
+    pub path: PathBuf,
+    /// Why this one can go, or why it stays.
+    ///
+    /// `clean` and `missing` are removable. `recorded` (the recording still
+    /// holds an in-between), `dirty` (uncommitted work the recording has not
+    /// seen), `leased` (work in progress), `unreadable` and `kept-by-git` are
+    /// kept, each with its own word so a report can be read without guessing.
+    pub state: &'static str,
+    pub removed: bool,
+    /// What went wrong, when something did: git refused, the row said one thing
+    /// and the disk said another.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// What `worktree prune` looked at and did.
+#[derive(Debug, Default, Serialize)]
+pub struct PruneReport {
+    pub applied: bool,
+    pub entries: Vec<PruneEntry>,
 }
 
 /// How `worktree checkout` behaves.
@@ -756,6 +783,148 @@ fn recorded_head(record: &serde_json::Value, namespace: &str) -> Result<String> 
         }
     }
     bail!("the marker does not name {namespace}")
+}
+
+/// Forget worktrees whose work is safe elsewhere, and say why for the rest.
+///
+/// Only two states are removable, and both are decided by evidence, never by age:
+///
+/// - **clean** — the recording holds no in-between and git reports nothing
+///   uncommitted, so every file in the checkout is described by a commit and the
+///   row is bookkeeping;
+/// - **missing** — the directory is gone, so the row is a promise about nothing.
+///
+/// Everything else is kept and named: **recorded** (the recording still holds an
+/// in-between, which exists nowhere else), **dirty** (the disk holds work the
+/// recording has not seen), **leased** (something is working in it right now),
+/// **unreadable**, **kept-by-git**. A prune that guesses is a prune that loses an
+/// afternoon.
+///
+/// Clean is deliberately not the same question as *merged*. A removed worktree
+/// loses its directory and its row, not its commits: they stay in the repository
+/// behind their branch, and `worktree checkout` rebuilds the directory from the
+/// row's commit. Whether a branch has landed is `git branch --merged`'s answer,
+/// asked by the merge that lands it — not something to re-derive here.
+///
+/// What clean cannot see is *ignored* files: git reports nothing for a `target/`
+/// and removes it without complaint, which is right for build output and is why
+/// `--name` exists for the one worktree holding something a commit does not
+/// describe.
+///
+/// A dry run by default: it prints what it would forget and changes nothing. The
+/// directory is removed through `git worktree remove`, so git's own refusals — the
+/// main worktree, the one you are standing in, a `.env` it does not know about —
+/// are the guard, rather than a copy of those rules kept here.
+pub fn prune(vfs: &mut Vfs, only: Option<&str>, apply: bool) -> Result<PruneReport> {
+    let mut report = PruneReport {
+        applied: apply,
+        ..PruneReport::default()
+    };
+    for known in worktrees(vfs)? {
+        if only.is_some_and(|name| name != known.name) {
+            continue;
+        }
+        let mut entry = PruneEntry {
+            name: known.name.clone(),
+            path: known.path.clone(),
+            state: "clean",
+            removed: false,
+            detail: None,
+        };
+        // A recording with an in-between is the one thing this must never forget:
+        // the work exists only as ops, and dropping the row drops the pointer to it.
+        if known.overrides > 0 || known.journal > 0 {
+            entry.state = "recorded";
+            report.entries.push(entry);
+            continue;
+        }
+        // A live lease means a `record` or a `checkout` is running here: removing
+        // the rows underneath it would turn its next commit into a failure.
+        if let Some(owner) = lease_holder(vfs, &known.prefix)? {
+            entry.state = "leased";
+            entry.detail = Some(format!("{owner} holds {}", known.prefix));
+            report.entries.push(entry);
+            continue;
+        }
+        let missing = !known.path.is_dir();
+        if !missing {
+            match uncommitted(&known.path) {
+                // Clean means the commit describes everything in the checkout, so
+                // there is nothing here that a fresh materialize would not rebuild.
+                Ok(false) => {}
+                Ok(true) => {
+                    entry.state = "dirty";
+                    report.entries.push(entry);
+                    continue;
+                }
+                Err(error) => {
+                    entry.state = "unreadable";
+                    entry.detail = Some(format!("{error:#}"));
+                    report.entries.push(entry);
+                    continue;
+                }
+            }
+        } else {
+            entry.state = "missing";
+        }
+
+        if apply {
+            if !missing {
+                let path = known.path.to_string_lossy().into_owned();
+                match crate::project::git(&known.path, &["worktree", "remove", &path]) {
+                    Ok(_) => {}
+                    Err(error) => {
+                        // Git refuses the main worktree, a dirty one, and the one
+                        // the caller is standing in. Keeping the row on a refusal
+                        // is the difference between "not yet" and "gone".
+                        entry.state = "kept-by-git";
+                        entry.detail = Some(format!("{error:#}"));
+                        report.entries.push(entry);
+                        continue;
+                    }
+                }
+            }
+            let tx = vfs.db.transaction()?;
+            for statement in [
+                "DELETE FROM worktree_overrides WHERE worktree=?1",
+                "DELETE FROM worktree_journal WHERE worktree=?1",
+                "DELETE FROM worktrees WHERE name=?1",
+            ] {
+                tx.execute(statement, rusqlite::params![known.name])?;
+            }
+            // A lease that has already lapsed is litter for a namespace that no
+            // longer has a row; a live one was refused above.
+            tx.execute(
+                "DELETE FROM leases WHERE path=?1 AND expires_at_ms<=?2",
+                rusqlite::params![known.prefix, now_ms()],
+            )?;
+            tx.commit()?;
+            entry.removed = true;
+        }
+        report.entries.push(entry);
+    }
+    Ok(report)
+}
+
+/// Who holds the lease over `prefix` right now, if anyone.
+fn lease_holder(vfs: &Vfs, prefix: &str) -> Result<Option<String>> {
+    Ok(vfs
+        .db
+        .query_row(
+            "SELECT owner FROM leases WHERE path=?1 AND expires_at_ms>?2",
+            rusqlite::params![prefix, now_ms()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?)
+}
+
+/// Whether a checkout holds anything a commit does not describe.
+fn uncommitted(path: &Path) -> Result<bool> {
+    let listing = crate::project::git(
+        path,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
+    Ok(!listing.trim_matches('\0').trim().is_empty())
 }
 
 /// Record what changed in a worktree's directory since its recorded base.
@@ -1549,6 +1718,107 @@ mod tests {
         assert_eq!(again.changed, 0);
         assert_eq!(again.removed, 0);
         assert_eq!(again.unchanged, 2);
+    }
+
+    #[test]
+    fn prune_forgets_a_clean_worktree_and_says_nothing_was_lost() {
+        let base = scratch("prune-clean");
+        let (repo, _) = repository(&base, 4);
+        let mut vfs = open_vfs(&base);
+        let dest = base.join("work/main");
+        materialize(&mut vfs, &repo, "main", &dest, None, "projects").unwrap();
+
+        // Nothing recorded and nothing on disk beyond the commit: the row is
+        // bookkeeping and the checkout is reproducible from `base_commit`.
+        let dry = prune(&mut vfs, None, false).unwrap();
+        assert_eq!(dry.entries.len(), 1);
+        assert_eq!(dry.entries[0].state, "clean");
+        assert!(!dry.entries[0].removed);
+        assert!(dry.entries[0].path.exists(), "a dry run changes nothing");
+        assert_eq!(worktrees(&vfs).unwrap().len(), 1);
+
+        let applied = prune(&mut vfs, None, true).unwrap();
+        assert!(applied.entries[0].removed, "{applied:#?}");
+        assert!(worktrees(&vfs).unwrap().is_empty(), "the row is gone");
+        assert!(!dest.exists(), "and so is the checkout");
+    }
+
+    #[test]
+    fn prune_refuses_a_worktree_something_is_working_in() {
+        let base = scratch("prune-leased");
+        let (repo, _) = repository(&base, 4);
+        let mut vfs = open_vfs(&base);
+        let dest = base.join("work/main");
+        materialize(&mut vfs, &repo, "main", &dest, None, "projects").unwrap();
+        // A record is running: it will write ops against these rows next.
+        let prefix = worktrees(&vfs).unwrap()[0].prefix.clone();
+        vfs.lease(&prefix, "builder-7", 60_000).unwrap();
+
+        let report = prune(&mut vfs, None, true).unwrap();
+        assert_eq!(report.entries[0].state, "leased");
+        assert!(!report.entries[0].removed);
+        assert_eq!(
+            report.entries[0].detail.as_deref(),
+            Some(format!("builder-7 holds {prefix}").as_str()),
+            "the refusal names who to wait for"
+        );
+        assert_eq!(worktrees(&vfs).unwrap().len(), 1);
+        assert!(dest.exists());
+    }
+
+    #[test]
+    fn prune_keeps_a_worktree_whose_recording_holds_work() {
+        let base = scratch("prune-recorded");
+        let (repo, _) = repository(&base, 4);
+        let mut vfs = open_vfs(&base);
+        let dest = base.join("work/main");
+        materialize(&mut vfs, &repo, "main", &dest, None, "projects").unwrap();
+        write(&dest.join("src/file001.txt"), &body(1, " (edited)"));
+        record(&mut vfs, "main", &RecordOptions::new("agent")).unwrap();
+
+        // The work exists only as ops. Dropping the row would drop the only
+        // pointer to it, so the in-between outranks a clean git status.
+        let report = prune(&mut vfs, None, true).unwrap();
+        assert_eq!(report.entries[0].state, "recorded");
+        assert!(!report.entries[0].removed);
+        assert_eq!(worktrees(&vfs).unwrap().len(), 1);
+        assert!(dest.exists());
+    }
+
+    #[test]
+    fn prune_keeps_work_the_recording_has_not_seen_yet() {
+        let base = scratch("prune-dirty");
+        let (repo, _) = repository(&base, 4);
+        let mut vfs = open_vfs(&base);
+        let dest = base.join("work/main");
+        materialize(&mut vfs, &repo, "main", &dest, None, "projects").unwrap();
+        // Edited, never recorded: the disk holds work no commit and no op knows.
+        write(&dest.join("src/file002.txt"), &body(2, " (unsaved)"));
+
+        let report = prune(&mut vfs, None, true).unwrap();
+        assert_eq!(report.entries[0].state, "dirty");
+        assert!(!report.entries[0].removed);
+        assert!(dest.exists());
+        assert_eq!(
+            fs::read(dest.join("src/file002.txt")).unwrap(),
+            body(2, " (unsaved)").into_bytes()
+        );
+    }
+
+    #[test]
+    fn prune_cannot_remove_the_projects_main_worktree() {
+        let base = scratch("prune-main");
+        let (repo, _) = repository(&base, 3);
+        let mut vfs = open_vfs(&base);
+        materialize(&mut vfs, &repo, "main", &repo, None, "projects").unwrap();
+
+        // Clean, so nothing to lose — but it is the repository itself, and git is
+        // the authority on that, not a rule copied here.
+        let report = prune(&mut vfs, None, true).unwrap();
+        assert_eq!(report.entries[0].state, "kept-by-git", "{report:#?}");
+        assert!(!report.entries[0].removed);
+        assert!(repo.join("src/file000.txt").exists());
+        assert_eq!(worktrees(&vfs).unwrap().len(), 1, "the row stays with it");
     }
 
     #[test]

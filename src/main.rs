@@ -211,7 +211,7 @@ enum Command {
     },
     /// Worktrees on a real disk, recorded by the difference.
     Worktree {
-        /// `materialize`, `checkout`, `list`, `record`, or `changes`.
+        /// `materialize`, `checkout`, `list`, `record`, `changes`, or `prune`.
         mode: String,
         #[arg(long)]
         name: Option<String>,
@@ -241,6 +241,9 @@ enum Command {
         /// commit's version.
         #[arg(long)]
         force: bool,
+        /// Forget, rather than only report, what `worktree prune` finds safe.
+        #[arg(long)]
+        apply: bool,
     },
     /// The build cache: content this root may forget.
     Cache {
@@ -586,6 +589,7 @@ fn run() -> anyhow::Result<()> {
             since,
             limit,
             force,
+            apply,
         } => match mode.as_str() {
             "materialize" => {
                 let project = project
@@ -640,8 +644,12 @@ fn run() -> anyhow::Result<()> {
                 )?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
+            "prune" => {
+                let report = fungos_vfs::prune(&mut vfs, name.as_deref(), apply)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
             other => anyhow::bail!(
-                "worktree mode must be materialize, checkout, list, record or changes, not {other}"
+                "worktree mode must be materialize, checkout, list, record, changes or prune, not {other}"
             ),
         },
         Command::Cache {

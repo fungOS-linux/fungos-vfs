@@ -345,6 +345,35 @@ level up: two writers to one working tree is a conflict pretending to be a diff.
 ops that arrived from a peer and removals — which are recorded as tombstones,
 because Git's tree pointer covers files the namespace never held.
 
+**Nothing cleans up after a worktree on its own.** Landing a PR, closing a thread,
+or ending a session leaves the checkout and its row exactly where they were, which
+is why `prune` exists and why it reports before it acts:
+
+```sh
+fungos-vfs --root ~/fungos worktree prune              # what would go, and why
+fungos-vfs --root ~/fungos worktree prune --apply      # forget those
+fungos-vfs --root ~/fungos worktree prune --name fix-parser --apply
+```
+
+There is no `--older-than`. Each row is decided by what it holds, not by its age:
+
+| state | removable | why |
+|---|---|---|
+| `clean` | yes | the recording holds no in-between and Git reports nothing uncommitted, so every file is described by a commit |
+| `missing` | yes | the directory is gone; the row was a promise about nothing |
+| `recorded` | no | the in-between exists only as ops — dropping the row drops the only pointer to it |
+| `dirty` | no | the disk holds work the recording has not seen |
+| `leased` | no | something is recording or checking out right now; the refusal names the holder |
+| `kept-by-git` | no | `git worktree remove` refused — the main worktree, the one you are standing in, or the one holding a file Git does not know |
+
+The directory goes through `git worktree remove`, so git's own refusals are the
+guard rather than a copy of them kept here. `clean` is deliberately **not** the same
+question as *merged*: a prune loses a directory and a row, never a commit — the
+commits stay in the repository behind their branch, and `worktree checkout` rebuilds
+the directory from the row's base. Ignored files are the one thing `clean` cannot
+see, and git removes them without complaint, which is right for `target/` and is why
+`--name` exists for the one worktree holding something a commit does not describe.
+
 What it deliberately does not do, yet:
 
 - **Plain directories.** A worktree is a Git worktree; there is no cheap base for
