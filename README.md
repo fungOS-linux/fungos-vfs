@@ -223,6 +223,35 @@ A clean repository of one file attaches as **one tree pointer and zero bytes
 written**. Change a file and the next attach writes that file — the rest is
 still the tree's.
 
+## Pieces
+
+A blob is fetched in pieces, from any source that has them — the one idea worth
+taking from BitTorrent. The difference is not speed on a good day: it is whether
+a machine holding **half** of something is useful to a machine holding the other
+half.
+
+```rust
+let manifest = Manifest::of(&bytes);
+let mut have = empty_have(&manifest);
+let assembled = fetch(&manifest, &[&studio, &agora_one], &mut have)?;
+```
+
+- **256 KiB pieces**, the UnixFS default, so a UnixFS producer could become one
+  more `PieceSource` without changing anything here.
+- **Each piece carries its own blake3 id**, so it is verifiable on its own and no
+  single peer has to be trusted. A source that answers with the wrong bytes is
+  refused and the next one asked.
+- **`have` is the resume state.** An interrupted fill keeps what it already
+  verified, and a later attempt asks only for the gaps — resumption is a
+  consequence of the representation, not a separate feature.
+- **The whole thing is still checked at the end**: a complete set of individually
+  valid pieces in the wrong order is a `WholeBlobMismatch`, not a corrupt file.
+
+The wire already carried ranges (`unibus.content.fetch.v1`, bounded by
+`MAX_RANGE_BYTES`); what was missing was a manifest making each range
+independently checkable, which is what lets the ranges come from different peers
+instead of being concatenated from one.
+
 ## Next
 
 1. File Provider / Cloud Files adapter for a signed macOS app.
