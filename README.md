@@ -267,21 +267,39 @@ Nothing is shared between the two machines but the wire:
 
 ```sh
 # where the work is
-fungos-vfs --root ~/fungos worktree record --name fix-parser
-fungos-vfs --root ~/fungos project attach ~/src/soil
+fungos-vfs --root ~/fungos worktree materialize \
+  --project ~/src/bob --name bob-thread --path ~/src/bob/.delta/worktrees/<t>/bob
+fungos-vfs --root ~/fungos worktree record --name bob-thread
+fungos-vfs --root ~/fungos project attach  ~/src/bob
 
 # where the work is wanted
-fungos-vfs --root ~/fungos sync pull --remote agora-one --remote-root ~/fungos \
-  --remote-bin fungos-vfs
-git clone agora-one:src/soil ~/src/soil
-git -C ~/src/soil checkout <the recording's base>
-fungos-vfs --root ~/fungos worktree checkout --name fix-parser --path ~/src/soil
+fungos-vfs --root ~/fungos sync pull --remote <peer> --remote-root /Users/<you>/fungos \
+  --remote-bin /Users/<you>/.local/bin/fungos-vfs
+git -C ~/src/bob fetch <peer>:src/bob/.delta/clones/<t>/bob.git <base>
+git -C ~/src/bob worktree add --detach ~/work/bob-thread <base>
+fungos-vfs --root ~/fungos worktree checkout --name bob-thread \
+  --path ~/work/bob-thread --project ~/src/bob
 ```
 
-Verified both ways between a Mac and `agora-one`: three edits recorded on one
-side reached the other as three modified files and nine untouched; an edit made
-on the far side came back over QUIC and was laid over the near side's checkout
-without disturbing its own three (`kept: 3, replaced: 1`).
+Three things about that sequence are load-bearing:
+
+- **The base commit has to reach the far side by Git.** The recording carries the
+  diff, never the tree, so the peer needs a checkout of the base — fetch it from
+  whoever has it. `materialize` adopts a checkout of *any* clone of the work, which
+  is what lets a worktree that belongs to another tool be recorded here at all;
+- **`sync pull` runs where the work is wanted**, because that is where the content
+  is missing. There is no push: the puller decides when bytes move.
+- **`checkout --project <dir>` names the attached project**, not the worktree: the
+  namespace is read out of the marker, and the marker is what `project attach`
+  wrote — including recorded worktrees whose checkouts belong to another clone.
+
+Verified over Tailscale between a Mac Studio and a MacBook (`averys-macbook-neo`),
+in both directions. A Delta thread worktree was adopted writing nothing, two edits
+recorded as two ops and 17,770 bytes, pulled (`3 entries, 38,386 bytes`), and laid
+into a fresh checkout on the far side: `replaced: 2`, forty files otherwise
+untouched, both files byte-identical by SHA-256. An edit made on the far side came
+back the same way (`1 op, 389 bytes`, `replaced: 2`) and its first `record` wrote
+no op for the file it had just received (`unchanged: 1`).
 
 `checkout` has three outcomes per path and one refusal: nothing there (write it),
 already the recorded content (nothing to do), the base commit's version (replace
