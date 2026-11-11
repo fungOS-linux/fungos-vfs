@@ -244,6 +244,41 @@ fungos-vfs --root ~/fungos-local worktree changes --name fix-parser
 fungos-vfs --root ~/fungos-local worktree list
 ```
 
+**Handing a worktree to another machine.** `record` writes the work, `checkout`
+puts it back into a working tree somewhere else. The address and the base travel
+in the project marker that `project attach` synced; the bytes travel as content.
+Nothing is shared between the two machines but the wire:
+
+```sh
+# where the work is
+fungos-vfs --root ~/fungos worktree record --name fix-parser
+fungos-vfs --root ~/fungos project attach ~/src/soil
+
+# where the work is wanted
+fungos-vfs --root ~/fungos sync pull --remote agora-one --remote-root ~/fungos \
+  --remote-bin fungos-vfs
+git clone agora-one:src/soil ~/src/soil
+git -C ~/src/soil checkout <the recording's base>
+fungos-vfs --root ~/fungos worktree checkout --name fix-parser --path ~/src/soil
+```
+
+Verified both ways between a Mac and `agora-one`: three edits recorded on one
+side reached the other as three modified files and nine untouched; an edit made
+on the far side came back over QUIC and was laid over the near side's checkout
+without disturbing its own three (`kept: 3, replaced: 1`).
+
+`checkout` has three outcomes per path and one refusal: nothing there (write it),
+already the recorded content (nothing to do), the base commit's version (replace
+it, because that is what "changed this file" means), and anything else — **refuse**,
+name the paths, and write nothing at all. A file that is neither what was recorded
+nor what the commit says is somebody else's edit; a refusal that still wrote half
+the plan would be worse than no checkout.
+
+It writes files, never namespace entries, and it records a row so the far side
+becomes a peer rather than a reader: its first `record` adopts the synced state in
+one pass writing no ops, and the next edit reaches the other machine with that
+machine's actor on it.
+
 **Recording costs the diff, not the tree.** `record` asks Git which paths differ
 from the base commit, hashes only those, and writes one op for each that differs
 from what the namespace already holds. Three edits in a 678-file checkout cost
