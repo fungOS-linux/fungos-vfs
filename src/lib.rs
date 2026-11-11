@@ -48,6 +48,7 @@ pub use vfs::{
     migrate_storage, migrate_storage_with_cas,
 };
 pub use worktree::{
-    ChangePage, DEFAULT_LEASE_MS, MaterializeReport, RecordOptions, RecordReport, WorktreeChange,
-    WorktreeState, changes as worktree_changes, materialize, namespace_for, record, worktrees,
+    ChangePage, CheckoutOptions, CheckoutReport, DEFAULT_LEASE_MS, MaterializeReport,
+    RecordOptions, RecordReport, WorktreeChange, WorktreeState, changes as worktree_changes,
+    checkout, materialize, namespace_for, record, worktrees,
 };

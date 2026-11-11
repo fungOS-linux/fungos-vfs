@@ -58,7 +58,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 
 use crate::{
-    ContentId, Expect, GitPointer, IngestReport, PathClass, PathPolicy, SyncOpKind, Vfs,
+    ContentId, Expect, GitPointer, Hydration, IngestReport, PathClass, PathPolicy, SyncOpKind, Vfs,
     project::{attach_policy, git},
     transfer::media_type_for,
 };
@@ -129,6 +129,40 @@ impl RecordOptions {
             lease_ms: DEFAULT_LEASE_MS,
         }
     }
+}
+
+/// What `worktree checkout` did.
+#[derive(Debug, Default, Serialize)]
+pub struct CheckoutReport {
+    pub name: String,
+    pub path: PathBuf,
+    /// The namespace the in-between came from.
+    pub namespace: String,
+    pub base_commit: String,
+    /// Placed where nothing was.
+    pub written: usize,
+    /// Already held the recorded content.
+    pub kept: usize,
+    /// Were the base commit's version, so laying the in-between over them is not
+    /// a loss.
+    pub replaced: usize,
+}
+
+/// How `worktree checkout` behaves.
+#[derive(Clone, Debug)]
+pub struct CheckoutOptions {
+    pub name: String,
+    pub path: PathBuf,
+    /// The attached project to read the address from; defaults to the name of
+    /// the repository directory at `path`.
+    pub project: Option<String>,
+    pub prefix: String,
+    /// Lay the in-between over this base instead of the recorded one.
+    pub commit: Option<String>,
+    /// Write over files that are neither the recorded content nor the base's.
+    pub force: bool,
+    pub owner: String,
+    pub lease_ms: u64,
 }
 
 /// What `worktree record` did.
@@ -492,6 +526,236 @@ pub fn materialize(
     )?;
 
     Ok(report)
+}
+
+/// Lay a recorded worktree's in-between over a checkout on **this** machine.
+///
+/// The other half of a handoff. [`record`] writes what changed into the
+/// namespace; this puts it back into a working tree somewhere else, so the agent
+/// on the far side has files instead of a namespace. It is deliberately not
+/// `materialize`: that one makes a checkout from a local recording, and the whole
+/// point here is that the local recording is the thing that did not travel.
+///
+/// What travels is the project marker — `project attach` records where each
+/// worktree lives and the commit it is based on — plus the in-between, as ops.
+/// So the address and the base come from the marker, and the bytes come from the
+/// content store.
+///
+/// Three outcomes per path, and one refusal:
+///
+/// - nothing there — write it;
+/// - already the recorded content — nothing to do;
+/// - the base commit's content — replace it, because that is what "the worktree
+///   changed this file" means;
+/// - anything else — **refuse**, naming the paths, and write nothing at all. A
+///   file that is neither what was recorded nor what the commit says is somebody
+///   else's edit, and laying a recording over it loses work silently.
+///
+/// It writes files, not namespace entries: the content is already in the
+/// namespace, and a checkout that enqueued an op per file would tell every peer
+/// the work had changed again.
+pub fn checkout(vfs: &mut Vfs, options: &CheckoutOptions) -> Result<CheckoutReport> {
+    let path = &options.path;
+    if !path.is_dir() {
+        bail!("{} is not a directory", path.display());
+    }
+    let project = match &options.project {
+        Some(name) => name.clone(),
+        None => path
+            .canonicalize()
+            .unwrap_or_else(|_| path.clone())
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .ok_or_else(|| anyhow!("{} has no name to attach to", path.display()))?,
+    };
+
+    let marker = format!("{}/{project}.json", crate::project::PROJECTS_DIR);
+    let bytes = vfs
+        .get(&marker)
+        .with_context(|| format!("no attached project {project:?} here ({marker})"))?;
+    let record: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let namespace = recorded_namespace(&record, &project, &options.name, &options.prefix)?;
+
+    let head = git(path, &["rev-parse", "HEAD"])?.trim().to_string();
+    let base = match &options.commit {
+        Some(commit) => git(path, &["rev-parse", &format!("{commit}^{{commit}}")])?
+            .trim()
+            .to_string(),
+        None => recorded_head(&record, &namespace)?,
+    };
+    if head != base && options.commit.is_none() {
+        bail!(
+            "{} is checked out at {head}, and the recording is based on {base}; \
+             check out the recording's base first, or pass --commit {head} to lay \
+             it over what is there",
+            path.display()
+        );
+    }
+
+    // The same lease a record takes: a checkout writes the working tree, and a
+    // record that ran alongside it would describe a half-applied tree.
+    vfs.lease(&namespace, &options.owner, options.lease_ms)?;
+    let outcome = checkout_leased(vfs, options, &namespace, &base);
+    let released = vfs.release(&namespace, &options.owner);
+    let report = outcome?;
+    released?;
+    Ok(report)
+}
+
+fn checkout_leased(
+    vfs: &mut Vfs,
+    options: &CheckoutOptions,
+    namespace: &str,
+    base: &str,
+) -> Result<CheckoutReport> {
+    let needle = format!("{}/", namespace.trim_matches('/'));
+    let entries: Vec<_> = vfs
+        .list(namespace)?
+        .into_iter()
+        .filter(|entry| entry.path.starts_with(&needle) && entry.hydration == Hydration::Present)
+        .collect();
+
+    let mut plan: Vec<(String, ContentId, PathBuf)> = Vec::new();
+    let mut conflicts = Vec::new();
+    let mut report = CheckoutReport {
+        name: options.name.clone(),
+        path: options.path.clone(),
+        namespace: namespace.to_string(),
+        base_commit: base.to_string(),
+        ..CheckoutReport::default()
+    };
+
+    for entry in entries {
+        let rel = entry.path[needle.len()..].to_string();
+        let target = options.path.join(&rel);
+        match fs::read(&target) {
+            Ok(bytes) if ContentId::from_bytes(&bytes) == entry.content_id => {
+                report.kept += 1;
+            }
+            Ok(_) => {
+                // It exists and it is not what was recorded. Whether replacing it
+                // loses work is not a guess: the base commit already says what
+                // this path should be, so a file matching the base is pristine.
+                let pristine = is_pristine(&options.path, base, &rel);
+                if pristine || options.force {
+                    plan.push((rel, entry.content_id, target));
+                    report.replaced += 1;
+                } else {
+                    conflicts.push(rel);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                plan.push((rel, entry.content_id, target));
+                report.written += 1;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", target.display()));
+            }
+        }
+    }
+
+    if !conflicts.is_empty() {
+        conflicts.sort();
+        bail!(
+            "{} path(s) in {} hold changes the recording does not know about: {}\n\
+             nothing was written; move them aside, or pass --force to replace them",
+            conflicts.len(),
+            options.path.display(),
+            conflicts.join(", ")
+        );
+    }
+
+    for (_rel, content_id, target) in plan {
+        place(vfs, &content_id, &target)?;
+    }
+
+    // This machine now has a recording of its own: the same address, the same
+    // base, and an overlay that is empty because the in-between is already in the
+    // namespace. Its first `record` adopts that state in one pass and writes no
+    // ops, which is what makes the far side a peer rather than a reader.
+    let tree = git(&options.path, &["rev-parse", &format!("{base}^{{tree}}")])?
+        .trim()
+        .to_string();
+    let now = now_ms();
+    vfs.db.execute(
+        "INSERT INTO worktrees(name,path,prefix,base_commit,base_tree,created_at_ms,updated_at_ms)
+         VALUES(?1,?2,?3,?4,?5,?6,?6)
+         ON CONFLICT(name) DO UPDATE SET path=excluded.path, prefix=excluded.prefix,
+           base_commit=excluded.base_commit, base_tree=excluded.base_tree,
+           updated_at_ms=excluded.updated_at_ms",
+        rusqlite::params![
+            options.name,
+            options.path.to_string_lossy(),
+            namespace,
+            base,
+            tree,
+            now
+        ],
+    )?;
+    Ok(report)
+}
+
+/// Whether the file at `rel` still matches the base commit.
+///
+/// An untracked file never matches: the commit has no opinion about it, so
+/// overwriting it would be overwriting something nobody has a copy of.
+fn is_pristine(path: &Path, base: &str, rel: &str) -> bool {
+    if git(path, &["ls-files", "--error-unmatch", "--", rel]).is_err() {
+        return false;
+    }
+    git(path, &["diff", "--quiet", base, "--", rel]).is_ok()
+}
+
+/// The namespace a marker says this worktree lives at.
+fn recorded_namespace(
+    record: &serde_json::Value,
+    project: &str,
+    name: &str,
+    prefix: &str,
+) -> Result<String> {
+    let main = namespace_for(prefix, Path::new(project), project, true);
+    let wanted = crate::project::label(Some(name), Path::new(name));
+    let mut found: Vec<String> = Vec::new();
+    for entry in record["worktrees"].as_array().into_iter().flatten() {
+        let Some(namespace) = entry["namespace"].as_str() else {
+            continue;
+        };
+        let last = namespace.rsplit('/').next().unwrap_or_default();
+        if name == "main" || name == project {
+            if namespace == main {
+                found.push(namespace.to_string());
+            }
+        } else if last == wanted {
+            found.push(namespace.to_string());
+        }
+    }
+    match found.len() {
+        0 => bail!(
+            "the attached project {project:?} has no worktree named {name:?}; \
+             its marker names {:?}",
+            record["worktrees"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry["namespace"].as_str())
+                .collect::<Vec<_>>()
+        ),
+        1 => Ok(found.remove(0)),
+        _ => bail!("{name:?} matches more than one worktree: {found:?}"),
+    }
+}
+
+fn recorded_head(record: &serde_json::Value, namespace: &str) -> Result<String> {
+    for entry in record["worktrees"].as_array().into_iter().flatten() {
+        if entry["namespace"].as_str() == Some(namespace) {
+            let head = entry["head"].as_str().unwrap_or_default();
+            if head.is_empty() {
+                bail!("the marker has no commit for {namespace}");
+            }
+            return Ok(head.to_string());
+        }
+    }
+    bail!("the marker does not name {namespace}")
 }
 
 /// Record what changed in a worktree's directory since its recorded base.
@@ -1133,6 +1397,16 @@ mod tests {
         Vfs::open_with(base.join("vfs"), NodeRole::Full, Some(&base.join("cas"))).unwrap()
     }
 
+    /// A root of its own on the shared content store: two machines, one machine.
+    fn open_root(base: &Path, tag: &str) -> Vfs {
+        Vfs::open_with(
+            base.join(tag).join("vfs"),
+            NodeRole::Full,
+            Some(&base.join("cas")),
+        )
+        .unwrap()
+    }
+
     fn write(path: &Path, body: &str) {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
@@ -1275,6 +1549,155 @@ mod tests {
         assert_eq!(again.changed, 0);
         assert_eq!(again.removed, 0);
         assert_eq!(again.unchanged, 2);
+    }
+
+    #[test]
+    fn a_second_store_lays_the_recording_over_its_own_checkout() {
+        let base = scratch("handoff");
+        let (repo, _) = repository(&base, 10);
+        let mut a = open_root(&base, "a");
+        let mut b = open_root(&base, "b");
+        b.set_actor("agent-b");
+
+        // A has the work: three edits, recorded, and the project attached so the
+        // address travels with the ops.
+        for index in [2usize, 5, 8] {
+            write(
+                &repo.join(format!("src/file{index:03}.txt")),
+                &body(index, " (edited)"),
+            );
+        }
+        materialize(&mut a, &repo, "main", &repo, None, "projects").unwrap();
+        assert_eq!(
+            record(&mut a, "main", &RecordOptions::new("agent-a"))
+                .unwrap()
+                .upserted,
+            3
+        );
+        crate::attach_project(&mut a, &repo, None, "projects", false).unwrap();
+
+        // B learns everything A knows, over the sync protocol.
+        let request = crate::SyncRequest::new(b.sync_cursor().unwrap(), 500);
+        let response = a.serve_sync(&request).unwrap();
+        assert_eq!(b.apply_sync(&response).unwrap().len(), response.ops.len());
+
+        // B has its own pristine checkout of the same base, like a fresh clone on
+        // another machine, and lays the recording over it.
+        let clone = base.join("b-checkout");
+        assert!(
+            std::process::Command::new("git")
+                .args(["clone", "-q"])
+                .arg(&repo)
+                .arg(&clone)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let report = checkout(
+            &mut b,
+            &CheckoutOptions {
+                name: "main".to_string(),
+                path: clone.clone(),
+                project: Some("repo".to_string()),
+                prefix: "projects".to_string(),
+                commit: None,
+                force: false,
+                owner: "agent-b:1".to_string(),
+                lease_ms: DEFAULT_LEASE_MS,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.replaced, 3, "{report:#?}");
+        assert_eq!(report.written, 0);
+        assert_eq!(report.base_commit, report.base_commit.trim());
+        assert_eq!(
+            fs::read(clone.join("src/file005.txt")).unwrap(),
+            body(5, " (edited)").into_bytes()
+        );
+        assert_eq!(
+            fs::read(clone.join("src/file000.txt")).unwrap(),
+            body(0, "").into_bytes(),
+            "the other seven are still the commit's"
+        );
+
+        // B is a peer now, not a reader: recording here writes no ops it should
+        // not, and the next change reaches A with B's name on it.
+        let adopt = record(&mut b, "main", &RecordOptions::new("agent-b")).unwrap();
+        assert_eq!(adopt.planned, 0, "{adopt:#?}");
+        write(&clone.join("src/file003.txt"), &body(3, " (from b)"));
+        assert_eq!(
+            record(&mut b, "main", &RecordOptions::new("agent-b"))
+                .unwrap()
+                .upserted,
+            1
+        );
+
+        let request = crate::SyncRequest::new(a.sync_cursor().unwrap(), 500);
+        let response = b.serve_sync(&request).unwrap();
+        a.apply_sync(&response).unwrap();
+        let page = changes(&a, "main", 0, 100).unwrap();
+        let last = page.changes.last().expect("B's edit reached A");
+        assert_eq!(last.path, "src/file003.txt");
+        assert_eq!(last.author, "agent-b");
+        assert_eq!(
+            a.get(&format!("{}/src/file003.txt", page.prefix)).unwrap(),
+            body(3, " (from b)").into_bytes()
+        );
+    }
+
+    #[test]
+    fn a_checkout_refuses_to_lay_a_recording_over_someone_elses_edit() {
+        let base = scratch("checkout-conflict");
+        let (repo, _) = repository(&base, 4);
+        let mut a = open_root(&base, "a");
+        let mut b = open_root(&base, "b");
+
+        write(&repo.join("src/file001.txt"), &body(1, " (edited)"));
+        materialize(&mut a, &repo, "main", &repo, None, "projects").unwrap();
+        record(&mut a, "main", &RecordOptions::new("agent-a")).unwrap();
+        crate::attach_project(&mut a, &repo, None, "projects", false).unwrap();
+        let request = crate::SyncRequest::new(b.sync_cursor().unwrap(), 500);
+        let response = a.serve_sync(&request).unwrap();
+        b.apply_sync(&response).unwrap();
+
+        let clone = base.join("b-checkout");
+        assert!(
+            std::process::Command::new("git")
+                .args(["clone", "-q"])
+                .arg(&repo)
+                .arg(&clone)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // Somebody else's uncommitted work, on the path the recording would write.
+        write(
+            &clone.join("src/file001.txt"),
+            "neither the base nor the recording\n",
+        );
+
+        let error = checkout(
+            &mut b,
+            &CheckoutOptions {
+                name: "main".to_string(),
+                path: clone.clone(),
+                project: Some("repo".to_string()),
+                prefix: "projects".to_string(),
+                commit: None,
+                force: false,
+                owner: "agent-b:1".to_string(),
+                lease_ms: DEFAULT_LEASE_MS,
+            },
+        )
+        .unwrap_err();
+        let message = format!("{error}");
+        assert!(message.contains("src/file001.txt"), "{message}");
+        assert!(
+            fs::read_to_string(clone.join("src/file001.txt"))
+                .unwrap()
+                .contains("neither the base"),
+            "a refused checkout writes nothing"
+        );
     }
 
     #[test]

@@ -2,9 +2,10 @@ use std::{fs, io::Write, path::PathBuf};
 
 use clap::{Parser, Subcommand};
 use fungos_vfs::{
-    ApplyOutcome, ContentId, Expect, NodeRole, PathPolicy, RecordOptions, SourceMode, SyncServer,
-    Vfs, attach_project, export_dir, ingest_dir_with_policy, list_projects, materialize,
-    migrate_storage_with_cas, pull_over_quic, pull_over_ssh, record, worktree_changes, worktrees,
+    ApplyOutcome, CheckoutOptions, ContentId, Expect, NodeRole, PathPolicy, RecordOptions,
+    SourceMode, SyncServer, Vfs, attach_project, checkout, export_dir, ingest_dir_with_policy,
+    list_projects, materialize, migrate_storage_with_cas, pull_over_quic, pull_over_ssh, record,
+    worktree_changes, worktrees,
 };
 
 #[derive(Parser)]
@@ -210,7 +211,7 @@ enum Command {
     },
     /// Worktrees on a real disk, recorded by the difference.
     Worktree {
-        /// `materialize`, `list`, `record`, or `changes`.
+        /// `materialize`, `checkout`, `list`, `record`, or `changes`.
         mode: String,
         #[arg(long)]
         name: Option<String>,
@@ -236,6 +237,10 @@ enum Command {
         since: i64,
         #[arg(long, default_value_t = 100)]
         limit: usize,
+        /// Lay a recording over files that are neither its content nor the base
+        /// commit's version.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -560,6 +565,7 @@ fn run() -> anyhow::Result<()> {
             lease_ms,
             since,
             limit,
+            force,
         } => match mode.as_str() {
             "materialize" => {
                 let project = project
@@ -587,8 +593,35 @@ fn run() -> anyhow::Result<()> {
                     serde_json::to_string_pretty(&worktree_changes(&vfs, &name, since, limit)?)?
                 );
             }
+            "checkout" => {
+                let name = name.ok_or_else(|| anyhow::anyhow!("worktree checkout needs --name"))?;
+                let path = path.ok_or_else(|| anyhow::anyhow!("worktree checkout needs --path"))?;
+                let owner = owner
+                    .unwrap_or_else(|| format!("{}:{}", vfs.writer().actor, std::process::id()));
+                // `--project` names a directory everywhere else in this CLI, and a
+                // project is named after its directory; asking for the name a
+                // second way would be two vocabularies for one thing.
+                let project = project
+                    .as_ref()
+                    .and_then(|dir| dir.file_name())
+                    .map(|name| name.to_string_lossy().into_owned());
+                let report = checkout(
+                    &mut vfs,
+                    &CheckoutOptions {
+                        name,
+                        path,
+                        project,
+                        prefix,
+                        commit,
+                        force,
+                        owner,
+                        lease_ms,
+                    },
+                )?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
             other => anyhow::bail!(
-                "worktree mode must be materialize, list, record or changes, not {other}"
+                "worktree mode must be materialize, checkout, list, record or changes, not {other}"
             ),
         },
         // Handled before the store is opened, above.
