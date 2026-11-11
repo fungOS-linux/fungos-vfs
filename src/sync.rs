@@ -640,21 +640,28 @@ impl Vfs {
                     self.mark_diverged(&op.store, op.hlc, &op.path, bytes, &op.actor, &op.origin)?;
                     return Ok(ApplyOutcome::Diverged);
                 }
-                self.apply_put(&op.path, bytes, current.as_ref(), &op.actor, &op.origin)?;
+                self.apply_put(
+                    &op.path,
+                    bytes,
+                    current.as_ref(),
+                    &op.actor,
+                    &op.origin,
+                    &op.worktree,
+                )?;
             }
             SyncOpKind::Remove => {
                 if self.file(&op.path)?.is_some() {
-                    self.apply_remove(&op.path)?;
+                    self.apply_remove(&op.path, &op.actor, &op.origin, &op.worktree)?;
                 }
             }
             SyncOpKind::Mkdir => {
                 if matches!(self.is_directory(&op.path), Ok(false)) {
-                    self.apply_mkdir(&op.path)?;
+                    self.apply_mkdir(&op.path, &op.actor, &op.origin, &op.worktree)?;
                 }
             }
             SyncOpKind::Rmdir => {
                 if matches!(self.is_directory(&op.path), Ok(true)) {
-                    self.apply_rmdir(&op.path)?;
+                    self.apply_rmdir(&op.path, &op.actor, &op.origin, &op.worktree)?;
                 }
             }
         }
@@ -1808,7 +1815,8 @@ mod tests {
         // the op — but the horizon must not reach a divergence whose bytes are
         // gone. This is the case expiry cannot rescue: nothing is on disk to
         // keep, so forgetting the record would swallow the write below.
-        b.apply_remove(&divergences[0].copy_path()).unwrap();
+        b.apply_remove(&divergences[0].copy_path(), "test", "test", "")
+            .unwrap();
         wait_past(op.hlc);
         let report = b.compact(std::time::Duration::ZERO).unwrap();
         assert!(
@@ -2183,7 +2191,7 @@ mod tests {
 
         // Without the bytes there is nothing to keep, so the record must go on
         // pinning rather than being expired into the void.
-        b.apply_remove(&copy).unwrap();
+        b.apply_remove(&copy, "test", "test", "").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
         let pinned = b.compact(std::time::Duration::from_millis(1)).unwrap();
         assert!(pinned.expired_divergences.is_empty());

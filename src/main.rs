@@ -2,9 +2,9 @@ use std::{fs, io::Write, path::PathBuf};
 
 use clap::{Parser, Subcommand};
 use fungos_vfs::{
-    ApplyOutcome, ContentId, Expect, NodeRole, PathPolicy, SourceMode, SyncServer, Vfs,
-    attach_project, export_dir, ingest_dir_with_policy, list_projects, migrate_storage_with_cas,
-    pull_over_quic, pull_over_ssh,
+    ApplyOutcome, ContentId, Expect, NodeRole, PathPolicy, RecordOptions, SourceMode, SyncServer,
+    Vfs, attach_project, export_dir, ingest_dir_with_policy, list_projects, materialize,
+    migrate_storage_with_cas, pull_over_quic, pull_over_ssh, record, worktree_changes, worktrees,
 };
 
 #[derive(Parser)]
@@ -207,6 +207,35 @@ enum Command {
     Export {
         prefix: String,
         dest: PathBuf,
+    },
+    /// Worktrees on a real disk, recorded by the difference.
+    Worktree {
+        /// `materialize`, `list`, `record`, or `changes`.
+        mode: String,
+        #[arg(long)]
+        name: Option<String>,
+        /// The repository for `materialize`.
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// The directory to check out into, for `materialize`.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// The commit to check out; defaults to the repository's HEAD.
+        #[arg(long)]
+        commit: Option<String>,
+        /// Namespace prefix; defaults to `projects`, the same as `project attach`.
+        #[arg(long, default_value = "projects")]
+        prefix: String,
+        /// Who holds the lease while `record` runs. Defaults to this actor and pid.
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long, default_value_t = fungos_vfs::DEFAULT_LEASE_MS)]
+        lease_ms: u64,
+        /// Cursor from a previous `changes` page. `0` starts from the beginning.
+        #[arg(long, default_value_t = 0)]
+        since: i64,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
     },
 }
 
@@ -520,6 +549,48 @@ fn run() -> anyhow::Result<()> {
             let report = export_dir(&mut vfs, &prefix, &dest)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        Command::Worktree {
+            mode,
+            name,
+            project,
+            path,
+            commit,
+            prefix,
+            owner,
+            lease_ms,
+            since,
+            limit,
+        } => match mode.as_str() {
+            "materialize" => {
+                let project = project
+                    .ok_or_else(|| anyhow::anyhow!("worktree materialize needs --project"))?;
+                let name =
+                    name.ok_or_else(|| anyhow::anyhow!("worktree materialize needs --name"))?;
+                let path =
+                    path.ok_or_else(|| anyhow::anyhow!("worktree materialize needs --path"))?;
+                let report =
+                    materialize(&mut vfs, &project, &name, &path, commit.as_deref(), &prefix)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            "list" => println!("{}", serde_json::to_string_pretty(&worktrees(&vfs)?)?),
+            "record" => {
+                let name = name.ok_or_else(|| anyhow::anyhow!("worktree record needs --name"))?;
+                let owner = owner
+                    .unwrap_or_else(|| format!("{}:{}", vfs.writer().actor, std::process::id()));
+                let report = record(&mut vfs, &name, &RecordOptions { owner, lease_ms })?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            "changes" => {
+                let name = name.ok_or_else(|| anyhow::anyhow!("worktree changes needs --name"))?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&worktree_changes(&vfs, &name, since, limit)?)?
+                );
+            }
+            other => anyhow::bail!(
+                "worktree mode must be materialize, list, record or changes, not {other}"
+            ),
+        },
         // Handled before the store is opened, above.
         Command::Migrate => unreachable!(),
     }

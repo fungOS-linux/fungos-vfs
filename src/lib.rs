@@ -18,6 +18,7 @@ mod stream;
 mod sync;
 mod transfer;
 mod vfs;
+mod worktree;
 
 pub use bus::{
     CONTENT_AVAILABLE_KIND, CONTENT_DATA_KIND, CONTENT_ERROR_KIND, CONTENT_FETCH_KIND,
@@ -42,7 +43,11 @@ pub use transfer::{
     ingest_dir_with_policy,
 };
 pub use vfs::{
-    Expect, FileEntry, Hlc, Hydration, LEGACY_STATE_DIR, Lease, LodPolicy, NodeRole, STATE_DIR,
-    StorageMigration, SyncOp, SyncOpKind, Version, Vfs, VfsError, Writer, migrate_storage,
-    migrate_storage_with_cas,
+    Change, Expect, FileEntry, Hlc, Hydration, LEGACY_STATE_DIR, Lease, LodPolicy, NodeRole,
+    STATE_DIR, StorageMigration, SyncOp, SyncOpKind, Version, Vfs, VfsError, Writer,
+    migrate_storage, migrate_storage_with_cas,
+};
+pub use worktree::{
+    ChangePage, DEFAULT_LEASE_MS, MaterializeReport, RecordOptions, RecordReport, WorktreeChange,
+    WorktreeState, changes as worktree_changes, materialize, namespace_for, record, worktrees,
 };

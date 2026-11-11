@@ -135,7 +135,7 @@ pub struct ProjectReport {
     pub dry_run: bool,
 }
 
-fn git(root: &Path, args: &[&str]) -> Result<String> {
+pub(crate) fn git(root: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)

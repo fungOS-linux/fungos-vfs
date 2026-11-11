@@ -163,6 +163,15 @@ impl ContentStore {
         }
     }
 
+    /// Whether these bytes are already filed, without reading them back.
+    ///
+    /// Distinct from [`Self::get`] on purpose: deciding whether a write costs
+    /// anything is a question about existence, and answering it by reading every
+    /// object turns a bookkeeping check into the transfer it was meant to avoid.
+    pub fn has(&self, id: &ContentId) -> bool {
+        self.path_for(id).is_file() || self.legacy_path_for(id).is_some_and(|path| path.is_file())
+    }
+
     /// The bytes at `path`, or `None` when nothing is there.
     fn read(&self, path: &Path) -> Result<Option<Vec<u8>>, VfsError> {
         match fs::read(path) {

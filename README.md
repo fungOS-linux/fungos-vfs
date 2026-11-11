@@ -223,6 +223,66 @@ A clean repository of one file attaches as **one tree pointer and zero bytes
 written**. Change a file and the next attach writes that file — the rest is
 still the tree's.
 
+## Worktrees
+
+A worktree is where work happens; the namespace is where it is recorded. A
+worktree is a real directory on the local filesystem — `cargo`, an editor, and
+`rg` behave exactly as they always have, and `target/` survives between builds
+because nothing is remounting it. The VFS sits beside that directory, not under
+it: it holds the base, the diff, and the history.
+
+```sh
+fungos-vfs --root ~/fungos-local worktree materialize \
+  --project ~/src/soil --name fix-parser --path ~/src/soil-fix-parser
+fungos-vfs --root ~/fungos-local worktree record  --name fix-parser
+fungos-vfs --root ~/fungos-local worktree changes --name fix-parser
+fungos-vfs --root ~/fungos-local worktree list
+```
+
+**Recording costs the diff, not the tree.** `record` asks Git which paths differ
+from the base commit, hashes only those, and writes one op for each that differs
+from what the namespace already holds. Three edits in a 678-file checkout cost
+three ops and zero bytes for the other 675 — the rest is still the commit's
+tree, which Git already content-addresses. A second `record` with nothing changed
+is **zero ops and zero bytes written**.
+
+**Materializing is nearly free.** Files the commit covers come from Git's own
+checkout. Only the recorded in-between is streamed out of the content store, and
+on APFS it is placed by `clonefile` — a reflink, not a copy. The report says which
+happened (`placed` against `cloned`).
+
+Two rules make an interrupted record safe:
+
+1. **The plan is written before it is applied.** Every op lands in the journal in
+   one transaction, with its content already filed. A run that dies leaves a plan
+   the next run finishes — no duplicate ops, no lost file.
+2. **Ops are committed before the base advances.** Each op is its own transaction;
+   the recorded base moves only after they have all landed, in the same transaction
+   that clears the journal. An op that already landed is recognised by looking at
+   the namespace, not by trusting a flag that could itself be what was lost.
+
+A record holds a **lease** on the worktree for as long as it runs. A second record
+is refused and names the holder, which is the same rule as an open-file lease one
+level up: two writers to one working tree is a conflict pretending to be a diff.
+
+**The change feed** is what a harness polls. `changes --since <cursor>` returns
+`{path, op, author, origin}` for everything that happened after a cursor, including
+ops that arrived from a peer and removals — which are recorded as tombstones,
+because Git's tree pointer covers files the namespace never held.
+
+What it deliberately does not do, yet:
+
+- **Plain directories.** A worktree is a Git worktree; there is no cheap base for
+  anything else, and inventing a per-file one would cost a hash of everything on
+  every record. Refused rather than approximated.
+- **Ignored files.** Git does not report them, and the attached policy excludes
+  build output anyway. Same rule as `project attach`, same policy.
+- **Renames** are recorded as a removal and an upsert — one blob, which is what a
+  rename costs to store.
+- Attaching a *dirty* worktree still stores its whole checkout as blobs. The
+  recording now knows better, so `project attach` should prefer a recorded base
+  when one exists.
+
 ## Pieces
 
 A blob is fetched in pieces, from any source that has them — the one idea worth

@@ -161,6 +161,25 @@ pub struct SyncOp {
     pub base_content_id: Option<ContentId>,
 }
 
+/// One entry in the change feed.
+///
+/// The cursor is this store's own row id, not a clock: a feed reader is asking
+/// "what happened after what I last saw here", and a local counter answers that
+/// exactly, including for ops that arrived from a peer carrying a clock this
+/// store never issued.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Change {
+    pub id: i64,
+    pub path: String,
+    pub op: SyncOpKind,
+    pub content_id: Option<ContentId>,
+    pub actor: String,
+    pub origin: String,
+    /// The worktree the write was attributed to, empty when it was not.
+    pub worktree: String,
+    pub at_ms: i64,
+}
+
 /// One revision in a file's history.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Version {
@@ -325,6 +344,28 @@ struct Stamp {
     store: String,
     worktree: String,
     hlc: Hlc,
+}
+
+impl Stamp {
+    /// Who this stamp attributes a write to, for the change feed.
+    fn who(&self) -> Attribution<'_> {
+        Attribution {
+            actor: &self.actor,
+            origin: &self.origin,
+            worktree: &self.worktree,
+        }
+    }
+}
+
+/// The attribution a change carries: who, where, and for which worktree.
+///
+/// Borrowed rather than owned because it is passed straight through to a single
+/// insert — and because a remote op's attribution arrives as borrowed fields of
+/// the op, not as a stamp this store made.
+struct Attribution<'a> {
+    actor: &'a str,
+    origin: &'a str,
+    worktree: &'a str,
 }
 
 /// The directory that holds one root's own state.
@@ -791,6 +832,45 @@ impl Vfs {
                destination TEXT NOT NULL,
                recorded_at_ms INTEGER NOT NULL,
                PRIMARY KEY(content_id, destination)
+             );
+             CREATE TABLE IF NOT EXISTS changes(
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               path TEXT NOT NULL,
+               op TEXT NOT NULL,
+               content_id TEXT,
+               actor TEXT NOT NULL,
+               origin TEXT NOT NULL,
+               worktree TEXT NOT NULL DEFAULT '',
+               at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS worktrees(
+               name TEXT PRIMARY KEY,
+               path TEXT NOT NULL,
+               prefix TEXT NOT NULL,
+               base_commit TEXT NOT NULL,
+               base_tree TEXT NOT NULL,
+               created_at_ms INTEGER NOT NULL,
+               updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS worktree_overrides(
+               worktree TEXT NOT NULL,
+               path TEXT NOT NULL,
+               op TEXT NOT NULL,
+               content_id TEXT,
+               media_type TEXT NOT NULL,
+               size INTEGER NOT NULL,
+               PRIMARY KEY(worktree, path)
+             );
+             CREATE TABLE IF NOT EXISTS worktree_journal(
+               worktree TEXT NOT NULL,
+               path TEXT NOT NULL,
+               op TEXT NOT NULL,
+               apply INTEGER NOT NULL DEFAULT 1,
+               content_id TEXT,
+               media_type TEXT NOT NULL,
+               size INTEGER NOT NULL,
+               base_content_id TEXT,
+               PRIMARY KEY(worktree, path)
              );",
         )?;
         self.db.execute(
@@ -985,6 +1065,7 @@ impl Vfs {
                 stamp.store,
             ],
         )?;
+        note_change(&tx, &path, "upsert", Some(&content_id), &stamp.who(), now)?;
         tx.commit()?;
         self.file(&path)?.ok_or_else(|| VfsError::NotFound(path))
     }
@@ -1142,6 +1223,42 @@ impl Vfs {
                 stamp.store,
             ],
         )?;
+        note_change(&tx, &path, "remove", None, &stamp.who(), now_ms())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Queue a removal for a path this namespace does not hold.
+    ///
+    /// A removal is a fact whether or not the file was here: Git's tree pointer
+    /// covers files that never became blobs, so a file deleted from a worktree has
+    /// nothing in the namespace to delete. Dropping the op would leave every
+    /// reader believing the file is still there, so the op is recorded and peers
+    /// apply it as the no-op it is for them.
+    pub fn tombstone(&mut self, path: &str) -> Result<(), VfsError> {
+        if self.role == NodeRole::Cache {
+            return Err(VfsError::ReadOnly);
+        }
+        let path = normalize_path(path)?;
+        let now = now_ms();
+        let stamp = self.stamp()?;
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "INSERT INTO sync_queue(op,path,version,content_id,created_at_ms,actor,origin,
+                                    hlc_ms,hlc_counter,worktree,store)
+             VALUES('remove',?1,0,NULL,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                path,
+                now,
+                stamp.actor,
+                stamp.origin,
+                stamp.hlc.ms,
+                i64::from(stamp.hlc.counter),
+                stamp.worktree,
+                stamp.store,
+            ],
+        )?;
+        note_change(&tx, &path, "remove", None, &stamp.who(), now)?;
         tx.commit()?;
         Ok(())
     }
@@ -1184,6 +1301,7 @@ impl Vfs {
                 stamp.store,
             ],
         )?;
+        note_change(&tx, &path, "mkdir", None, &stamp.who(), now_ms())?;
         tx.commit()?;
         Ok(())
     }
@@ -1225,6 +1343,7 @@ impl Vfs {
                 stamp.store,
             ],
         )?;
+        note_change(&tx, &path, "rmdir", None, &stamp.who(), now_ms())?;
         tx.commit()?;
         Ok(())
     }
@@ -1318,6 +1437,18 @@ impl Vfs {
                 stamp.worktree,
                 stamp.store,
             ],
+        )?;
+        // Two changes, not one: the feed answers "what happened to this path",
+        // and a reader watching the destination and a reader watching the source
+        // are both right.
+        note_change(&tx, &from, "remove", None, &stamp.who(), now)?;
+        note_change(
+            &tx,
+            &to,
+            "upsert",
+            Some(&current.content_id),
+            &stamp.who(),
+            now,
         )?;
         tx.commit()?;
         let mut entry = current;
@@ -1437,15 +1568,17 @@ impl Vfs {
         let bytes = self.get(&copy)?;
         let current = self.file(&divergence.path)?;
         let stamp = self.stamp()?;
+        let worktree = stamp.worktree.clone();
         self.apply_put(
             &divergence.path,
             &bytes,
             current.as_ref(),
             &stamp.actor,
             &stamp.origin,
+            &worktree,
         )?;
         self.resolve_divergence(store, hlc)?;
-        self.apply_remove(&copy)?;
+        self.apply_remove(&copy, &stamp.actor, &stamp.origin, &worktree)?;
         Ok(true)
     }
 
@@ -1476,7 +1609,8 @@ impl Vfs {
         let detected_at_ms = now_ms();
         let copy = crate::sync::conflict_path(path, store, detected_at_ms);
         let current = self.file(&copy)?;
-        self.apply_put(&copy, bytes, current.as_ref(), actor, origin)?;
+        let worktree = self.worktree.clone();
+        self.apply_put(&copy, bytes, current.as_ref(), actor, origin, &worktree)?;
 
         let tx = self.db.unchecked_transaction()?;
         tx.execute(
@@ -1535,6 +1669,7 @@ impl Vfs {
         current: Option<&FileEntry>,
         actor: &str,
         origin: &str,
+        worktree: &str,
     ) -> Result<(), VfsError> {
         let path = normalize_path(path)?;
         let content_id = self.blobs.put(bytes)?;
@@ -1572,30 +1707,105 @@ impl Vfs {
                 origin
             ],
         )?;
+        // The local delivery queue stays untouched — this op is not ours to
+        // forward — but the change feed is a record of what happened here, and a
+        // peer's write happened here.
+        note_change(
+            &tx,
+            &path,
+            "upsert",
+            Some(&content_id),
+            &Attribution {
+                actor,
+                origin,
+                worktree,
+            },
+            now,
+        )?;
         tx.commit()?;
         Ok(())
     }
 
-    pub(crate) fn apply_remove(&mut self, path: &str) -> Result<(), VfsError> {
+    pub(crate) fn apply_remove(
+        &mut self,
+        path: &str,
+        actor: &str,
+        origin: &str,
+        worktree: &str,
+    ) -> Result<(), VfsError> {
         let path = normalize_path(path)?;
-        self.db
-            .execute("DELETE FROM files WHERE path=?1", params![path])?;
-        Ok(())
-    }
-
-    pub(crate) fn apply_mkdir(&mut self, path: &str) -> Result<(), VfsError> {
-        let path = normalize_path(path)?;
-        self.db.execute(
-            "INSERT OR IGNORE INTO directories(path,created_at_ms) VALUES(?1,?2)",
-            params![path, now_ms()],
+        let tx = self.db.transaction()?;
+        tx.execute("DELETE FROM files WHERE path=?1", params![path])?;
+        note_change(
+            &tx,
+            &path,
+            "remove",
+            None,
+            &Attribution {
+                actor,
+                origin,
+                worktree,
+            },
+            now_ms(),
         )?;
+        tx.commit()?;
         Ok(())
     }
 
-    pub(crate) fn apply_rmdir(&mut self, path: &str) -> Result<(), VfsError> {
+    pub(crate) fn apply_mkdir(
+        &mut self,
+        path: &str,
+        actor: &str,
+        origin: &str,
+        worktree: &str,
+    ) -> Result<(), VfsError> {
         let path = normalize_path(path)?;
-        self.db
-            .execute("DELETE FROM directories WHERE path=?1", params![path])?;
+        let now = now_ms();
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "INSERT OR IGNORE INTO directories(path,created_at_ms) VALUES(?1,?2)",
+            params![path, now],
+        )?;
+        note_change(
+            &tx,
+            &path,
+            "mkdir",
+            None,
+            &Attribution {
+                actor,
+                origin,
+                worktree,
+            },
+            now,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn apply_rmdir(
+        &mut self,
+        path: &str,
+        actor: &str,
+        origin: &str,
+        worktree: &str,
+    ) -> Result<(), VfsError> {
+        let path = normalize_path(path)?;
+        let now = now_ms();
+        let tx = self.db.transaction()?;
+        tx.execute("DELETE FROM directories WHERE path=?1", params![path])?;
+        note_change(
+            &tx,
+            &path,
+            "rmdir",
+            None,
+            &Attribution {
+                actor,
+                origin,
+                worktree,
+            },
+            now,
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1641,6 +1851,62 @@ impl Vfs {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// What changed here after `since`, newest last.
+    ///
+    /// `prefix` scopes the answer to a subtree of the namespace and `worktree`
+    /// to ops that were attributed to one; either matches, because a write made
+    /// through the plain namespace API under a worktree's prefix is still a
+    /// change to that worktree, and a worktree's record is still that worktree's
+    /// even if a path moved out from under it. An empty prefix with an empty
+    /// worktree asks for everything.
+    pub fn changes(
+        &self,
+        since: i64,
+        prefix: &str,
+        worktree: &str,
+        limit: usize,
+    ) -> Result<Vec<Change>, VfsError> {
+        let needle = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", prefix.trim_matches('/'))
+        };
+        let mut statement = self.db.prepare(
+            "SELECT id,path,op,content_id,actor,origin,worktree,at_ms FROM changes
+             WHERE id>?1 AND (?2<>'' AND worktree=?2 OR substr(path,1,?3)=?4)
+             ORDER BY id LIMIT ?5",
+        )?;
+        let rows = statement.query_map(
+            params![
+                since,
+                worktree,
+                needle.chars().count() as i64,
+                needle,
+                limit as i64
+            ],
+            |row| {
+                let op: String = row.get(2)?;
+                Ok(Change {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    op: match op.as_str() {
+                        "upsert" => SyncOpKind::Upsert,
+                        "remove" => SyncOpKind::Remove,
+                        "mkdir" => SyncOpKind::Mkdir,
+                        "rmdir" => SyncOpKind::Rmdir,
+                        _ => return Err(rusqlite::Error::InvalidQuery),
+                    },
+                    content_id: row.get::<_, Option<String>>(3)?.map(ContentId),
+                    actor: row.get(4)?,
+                    origin: row.get(5)?,
+                    worktree: row.get(6)?,
+                    at_ms: row.get(7)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(VfsError::from)
     }
 
     pub fn cache_bytes(&self) -> Result<u64, VfsError> {
@@ -1770,6 +2036,38 @@ fn reachable_at(root: &Path) -> Result<Option<BTreeSet<ContentId>>, VfsError> {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     reachable_in(&db).map(Some)
+}
+
+/// Append one entry to the change feed.
+///
+/// Written inside the same transaction as the mutation it describes, so the feed
+/// and the namespace can never disagree about what happened. Deliberately not the
+/// delivery queue: an op leaves `sync_queue` once a peer has it and the log is
+/// compacted, while a reader of the feed is asking what changed here — a pull to
+/// another machine is not an answer to that question, and a compaction must not
+/// be one either.
+fn note_change(
+    db: &Connection,
+    path: &str,
+    op: &str,
+    content_id: Option<&ContentId>,
+    who: &Attribution<'_>,
+    at_ms: i64,
+) -> Result<(), VfsError> {
+    db.execute(
+        "INSERT INTO changes(path,op,content_id,actor,origin,worktree,at_ms)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            path,
+            op,
+            content_id.map(ToString::to_string),
+            who.actor,
+            who.origin,
+            who.worktree,
+            at_ms
+        ],
+    )?;
+    Ok(())
 }
 
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileEntry> {

@@ -370,7 +370,7 @@ fn walk_files(dir: &Path) -> Result<Vec<String>> {
 
 /// Media types are a display hint here, not an authority: the VFS keys on the
 /// content id. Unknown extensions stay opaque rather than guessing.
-fn media_type_for(path: &str) -> &'static str {
+pub(crate) fn media_type_for(path: &str) -> &'static str {
     let ext = path.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
     match ext.to_ascii_lowercase().as_str() {
         "md" | "markdown" => "text/markdown",
