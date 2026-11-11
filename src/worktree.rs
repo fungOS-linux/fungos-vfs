@@ -426,15 +426,25 @@ pub fn materialize(
         bail!("a worktree needs a name");
     }
     let root = PathBuf::from(git(project, &["rev-parse", "--show-toplevel"])?.trim());
-    let commit = match commit {
-        Some(spec) => git(&root, &["rev-parse", &format!("{spec}^{{commit}}")])?
-            .trim()
-            .to_string(),
-        None => git(&root, &["rev-parse", "HEAD"])?.trim().to_string(),
+    let requested = match commit {
+        Some(spec) => {
+            // The project may not have the commit: a checkout of somebody else's
+            // clone is the usual case for a Delta worktree, and the commit it is
+            // standing on may exist nowhere else on this machine.
+            let rev = format!("{spec}^{{commit}}");
+            let resolved = git(&root, &["rev-parse", &rev])
+                .or_else(|_| git(dest, &["rev-parse", &rev]))
+                .with_context(|| {
+                    format!(
+                        "resolving {spec} in {} or {}",
+                        root.display(),
+                        dest.display()
+                    )
+                })?;
+            Some(resolved.trim().to_string())
+        }
+        None => None,
     };
-    let tree = git(&root, &["rev-parse", &format!("{commit}^{{tree}}")])?
-        .trim()
-        .to_string();
     // The repository's main worktree has a different address from every other
     // one, and the directory that is about to exist is the only thing that can
     // say which this is.
@@ -454,6 +464,56 @@ pub fn materialize(
         );
     }
 
+    let present = dest.is_dir();
+    let empty = present
+        && fs::read_dir(dest)
+            .with_context(|| format!("reading {}", dest.display()))?
+            .next()
+            .is_none();
+    // A checkout that is already there is the authority on its own base. It is not
+    // always a checkout of *this* clone: a Delta worktree is a checkout of a
+    // per-thread clone that this project has never seen, and asking the project
+    // for the commit would fail on it. The recording is addressed by commit and
+    // content, never by a path, so the clone it came from does not matter — as
+    // long as the directory really is a checkout root, which is what keeps
+    // `git status` in `record` reporting paths relative to it.
+    let adopting = present && !empty && existing.is_none() && is_checkout_root(dest);
+    let checked_out = if adopting {
+        Some(git(dest, &["rev-parse", "HEAD"])?.trim().to_string())
+    } else {
+        None
+    };
+    if let (Some(on), Some(want)) = (&checked_out, &requested)
+        && on != want
+    {
+        bail!(
+            "{} is checked out at {on}, not {want}; pass --commit {on} to \
+             record what is there",
+            dest.display()
+        );
+    }
+    let (commit, tree) = match (&checked_out, &requested) {
+        (Some(on), _) => {
+            let tree = git(dest, &["rev-parse", &format!("{on}^{{tree}}")])?
+                .trim()
+                .to_string();
+            (on.clone(), tree)
+        }
+        (None, Some(want)) => (
+            want.clone(),
+            git(&root, &["rev-parse", &format!("{want}^{{tree}}")])?
+                .trim()
+                .to_string(),
+        ),
+        (None, None) => {
+            let head = git(&root, &["rev-parse", "HEAD"])?.trim().to_string();
+            let tree = git(&root, &["rev-parse", &format!("{head}^{{tree}}")])?
+                .trim()
+                .to_string();
+            (head, tree)
+        }
+    };
+
     let mut report = MaterializeReport {
         name: name.to_string(),
         path: dest.to_path_buf(),
@@ -463,13 +523,6 @@ pub fn materialize(
         ..MaterializeReport::default()
     };
 
-    let present = dest.is_dir();
-    let empty = present
-        && fs::read_dir(dest)
-            .with_context(|| format!("reading {}", dest.display()))?
-            .next()
-            .is_none();
-
     if present && !empty && existing.is_none() {
         // A checkout somebody already has is the common case: a worktree exists
         // because an agent or an editor made it, and the recording arrives after.
@@ -477,25 +530,10 @@ pub fn materialize(
         // commit" and the next `record` describes whatever is already different.
         // Refusing instead would mean the only way into the recording was to
         // throw away the work in the directory first.
-        let head = git(dest, &["rev-parse", "--show-toplevel"])
-            .map(|top| top.trim().to_string())
-            .ok()
-            .is_some_and(|top| Path::new(&top) == root.as_path());
-        if !head {
+        if !adopting {
             bail!(
-                "{} is not a worktree of {}; materialize writes into a directory \
-                 it creates, or adopts one of this repository's",
-                dest.display(),
-                root.display()
-            );
-        }
-        let on = git(dest, &["rev-parse", "HEAD"])
-            .map(|value| value.trim().to_string())
-            .unwrap_or_default();
-        if on != commit {
-            bail!(
-                "{} is checked out at {on}, not {commit}; pass --commit {on} to \
-                 record what is there",
+                "{} is not a Git checkout; materialize writes into a directory it \
+                 creates, or adopts an existing checkout",
                 dest.display()
             );
         }
@@ -916,6 +954,22 @@ fn lease_holder(vfs: &Vfs, prefix: &str) -> Result<Option<String>> {
             |row| row.get::<_, String>(0),
         )
         .optional()?)
+}
+
+/// Whether `path` is the root of a Git checkout, rather than a plain directory or
+/// a subdirectory of somebody else's repository.
+///
+/// The root matters because `record` reads `git status` there and treats its paths
+/// as the worktree's: inside a subdirectory, git reports paths relative to a root
+/// that is not the directory the recording describes.
+fn is_checkout_root(path: &Path) -> bool {
+    let top = git(path, &["rev-parse", "--show-toplevel"])
+        .map(|top| top.trim().to_string())
+        .ok();
+    match (top, fs::canonicalize(path)) {
+        (Some(top), Ok(here)) => fs::canonicalize(top).is_ok_and(|there| there == here),
+        _ => false,
+    }
 }
 
 /// Whether a checkout holds anything a commit does not describe.
@@ -1659,16 +1713,92 @@ mod tests {
         assert_eq!(recorded.planned, 1, "{recorded:#?}");
         assert_eq!(overrides(&vfs, "main").unwrap().len(), 1);
 
-        // A directory that is not a worktree of this repository is refused, not
-        // silently adopted.
+        // A directory that is not a Git checkout is refused, not silently adopted.
         let stranger = base.join("stranger");
         fs::create_dir_all(&stranger).unwrap();
         write(&stranger.join("x.txt"), "x\n");
         let error = materialize(&mut vfs, &repo, "other", &stranger, None, "projects").unwrap_err();
         assert!(
-            format!("{error}").contains("is not a worktree of"),
+            format!("{error}").contains("is not a Git checkout"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_checkout_of_someone_elses_clone_is_adopted() {
+        let base = scratch("adopt-clone");
+        let (repo, head) = repository(&base, 5);
+        // A Delta worktree is a checkout of a clone this project has never seen, so
+        // the commit has to come from the checkout rather than from the project.
+        let clone = base.join("clone");
+        crate::project::git(
+            &base,
+            &[
+                "clone",
+                "-q",
+                &repo.to_string_lossy(),
+                &clone.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+        write(&clone.join("src/f2.txt"), &body(2, " (edited)"));
+        let mut vfs = open_vfs(&base);
+
+        let report = materialize(&mut vfs, &repo, "thread", &clone, None, "projects").unwrap();
+        assert!(report.adopted, "{report:#?}");
+        assert_eq!(
+            report.commit, head,
+            "the checkout said which commit it is at"
+        );
+        assert_eq!(report.placed, 0);
+        assert_eq!(report.bytes, 0);
+        // And it recorded the one edit the clone's owner had already made.
+        let recorded = record(&mut vfs, "thread", &RecordOptions::new("agent")).unwrap();
+        assert_eq!(recorded.planned, 1, "{recorded:#?}");
+    }
+
+    #[test]
+    fn adopting_a_checkout_at_another_commit_says_which_commit_to_pass() {
+        let base = scratch("adopt-moved");
+        let (repo, at) = repository(&base, 4);
+        let clone = base.join("clone");
+        crate::project::git(
+            &base,
+            &[
+                "clone",
+                "-q",
+                &repo.to_string_lossy(),
+                &clone.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+        write(
+            &clone.join("src/f0.txt"),
+            &body(0, " (committed over there)"),
+        );
+        commit_all(&clone, "ahead");
+        let ahead = crate::project::git(&clone, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let mut vfs = open_vfs(&base);
+
+        // Naming a commit the checkout is not on is the one thing that cannot be
+        // guessed, so the refusal names the commit to pass instead.
+        let error =
+            materialize(&mut vfs, &repo, "thread", &clone, Some(&at), "projects").unwrap_err();
+        let message = format!("{error}");
+        assert!(message.contains("pass --commit"), "{message}");
+        assert!(
+            message.contains(&ahead),
+            "the hint names the commit it is on: {message}"
+        );
+
+        // And passing it adopts the checkout at its own commit.
+        let report =
+            materialize(&mut vfs, &repo, "thread", &clone, Some(&ahead), "projects").unwrap();
+        assert!(report.adopted);
+        assert_eq!(report.commit, ahead);
     }
 
     #[test]
