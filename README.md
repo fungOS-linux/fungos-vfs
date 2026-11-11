@@ -109,6 +109,22 @@ fungos-vfs --root ~/fungos-local sync pull --quic agora-one:7701 \
   --fingerprint <hex>
 ```
 
+`--remote` is whatever `ssh` accepts, because `ssh` is what runs — unless
+`FUNGOS_VFS_SSH` names another carrier. A Boat sandbox is reached with
+`boat-ssh <id> <command>`, which takes the same two arguments and none of ssh's
+options:
+
+```sh
+FUNGOS_VFS_SSH=boat-ssh fungos-vfs --root ~/fungos sync pull \
+  --remote bx_j9txh4ms --remote-root /home/user/vfs --remote-bin /home/user/fungos-vfs
+```
+
+That is what lets a VM holding no keys for anything be a peer rather than a place
+to copy files into. Verified end to end on a Boat sandbox: two edits recorded on
+the VM, pulled here over `boat-ssh`, and laid over a checkout of the same base
+with `checkout` — `replaced: 2`, eight files untouched.
+
+
 `pull` reports what happened to each op:
 
 ```json
