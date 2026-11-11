@@ -2,8 +2,9 @@ use std::{fs, io::Write, path::PathBuf};
 
 use clap::{Parser, Subcommand};
 use fungos_vfs::{
-    ApplyOutcome, ContentId, Expect, NodeRole, PathPolicy, SourceMode, SyncServer, Vfs, export_dir,
-    ingest_dir_with_policy, migrate_storage_with_cas, pull_over_quic, pull_over_ssh,
+    ApplyOutcome, ContentId, Expect, NodeRole, PathPolicy, SourceMode, SyncServer, Vfs,
+    attach_project, export_dir, ingest_dir_with_policy, list_projects, migrate_storage_with_cas,
+    pull_over_quic, pull_over_ssh,
 };
 
 #[derive(Parser)]
@@ -143,6 +144,23 @@ enum Command {
         /// Ingest every path as a blob, ignoring any policy.
         #[arg(long)]
         no_policy: bool,
+    },
+    /// Attach a Git repository to this desktop, or list what is attached.
+    ///
+    /// Attach records where the worktrees are and ingests the in-between; the
+    /// tracked tree becomes one Git pointer, never a blob per file.
+    Project {
+        /// `attach` or `list`.
+        mode: String,
+        /// A repository, or any path inside one, for `attach`.
+        path: Option<PathBuf>,
+        /// Name under the projects prefix; defaults to the directory's name.
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, default_value = "projects")]
+        prefix: String,
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Exchange ops with a peer store.
     Sync {
@@ -361,6 +379,24 @@ fn run() -> anyhow::Result<()> {
                 ingest_dir_with_policy(&mut vfs, &source, &prefix, mode, dry_run, &policy)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        Command::Project {
+            mode,
+            path,
+            name,
+            prefix,
+            dry_run,
+        } => match mode.as_str() {
+            "attach" => {
+                let path = path.ok_or_else(|| anyhow::anyhow!("project attach needs a path"))?;
+                let report = attach_project(&mut vfs, &path, name.as_deref(), &prefix, dry_run)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            "list" => println!(
+                "{}",
+                serde_json::to_string_pretty(&list_projects(&mut vfs)?)?
+            ),
+            other => anyhow::bail!("project mode must be attach or list, not {other}"),
+        },
         Command::Sync {
             mode,
             remote,
