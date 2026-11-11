@@ -35,6 +35,12 @@ pub const PROJECTS_DIR: &str = ".fungos/projects";
 /// `git: **` first, then the exclusions, because the last matching rule wins:
 /// a repository that commits its build output (some do) must not have that
 /// output treated as source.
+///
+/// Note what a dirty worktree costs: a tree id describes a commit, not the disk,
+/// so a checkout with any change at all cannot use the pointer and its whole
+/// tree is stored as blobs. The content store deduplicates them across
+/// worktrees and desktops, but the cost is the checkout's size, not the size of
+/// the diff. A clean checkout is the cheap case and should be the common one.
 #[must_use]
 pub fn attach_policy() -> &'static str {
     "\

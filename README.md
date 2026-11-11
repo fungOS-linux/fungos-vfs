@@ -198,8 +198,10 @@ What attach records:
 - the **Git pointer** — commit and tree — instead of one blob per tracked file;
 - the **worktrees** Git knows about, so the desktop can see what is checked out
   and where, without a second copy of any object;
-- the **in-between** Git cannot hold: a dirty worktree falls back to blobs for
-  the files that changed, and the report says `git.dirty` so the difference is
+the **in-between** Git cannot hold: a dirty worktree cannot be described by a
+  tree id, so its whole checkout is stored as blobs — deduplicated by the
+  content store, and not narrowed to the changed files — and the report says
+  `git.dirty` so the difference is
   never implied.
 
 The policy it attaches, in full:
