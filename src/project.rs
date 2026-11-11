@@ -381,6 +381,50 @@ pub fn attach(
         attached.push(entry);
     }
 
+    // Git knows the worktrees of *this* clone. A recording can be of a checkout of
+    // another clone — a Delta thread's worktree is exactly that — and it is a
+    // worktree of the project all the same. Leaving it out of the marker strands
+    // the recording on the far side, where `worktree checkout` can only restore
+    // what the marker names.
+    let known_paths: BTreeSet<PathBuf> = attached
+        .iter()
+        .map(|entry| {
+            let path = PathBuf::from(&entry.path);
+            std::fs::canonicalize(&path).unwrap_or(path)
+        })
+        .collect();
+    for known in crate::worktree::worktrees(vfs)? {
+        if !known.prefix.starts_with(&format!("{prefix}/")) {
+            continue;
+        }
+        let canonical = std::fs::canonicalize(&known.path).unwrap_or_else(|_| known.path.clone());
+        if known_paths.contains(&canonical) {
+            continue;
+        }
+        let present = known.path.is_dir();
+        let mut entry = AttachedWorktree {
+            path: known.path.display().to_string(),
+            branch: None,
+            head: known.base_commit.clone(),
+            bare: false,
+            namespace: Some(known.prefix.clone()),
+            recorded: true,
+            skipped: if present {
+                None
+            } else {
+                Some("missing".to_owned())
+            },
+            ingest: None,
+        };
+        if present {
+            let (namespace, report, _) =
+                attach_one(vfs, &known.path, &known.prefix, &policy, dry_run)?;
+            entry.namespace = Some(namespace);
+            entry.ingest = Some(IngestSummary::from(&report));
+        }
+        attached.push(entry);
+    }
+
     let marker = format!("{PROJECTS_DIR}/{name}.json");
     if !dry_run {
         let record = serde_json::json!({
@@ -552,6 +596,45 @@ mod tests {
             "{after:#?}"
         );
         assert_eq!(vfs.list(&after.prefix).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_recording_of_another_clone_is_in_the_marker() {
+        let base = scratch("marker-clone");
+        let repo = dirty_repository(&base, 6, &[2]);
+        let mut vfs = open_vfs(&base);
+
+        // A checkout of a clone the project has never seen: `git worktree list`
+        // there knows nothing about it, so the marker has to learn it from the
+        // recording or the far side cannot name it.
+        let clone = base.join("thread-clone");
+        crate::project::git(
+            &base,
+            &[
+                "clone",
+                "-q",
+                &repo.to_string_lossy(),
+                &clone.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+        crate::worktree::materialize(&mut vfs, &repo, "thread", &clone, None, "projects").unwrap();
+        write(&clone.join("src/f04.txt"), &body(4, " (thread)"));
+        record(&mut vfs, "thread", &RecordOptions::new("agent")).unwrap();
+
+        let report = attach(&mut vfs, &repo, None, "projects", false).unwrap();
+        let thread = report
+            .worktrees
+            .iter()
+            .find(|entry| entry.namespace.as_deref() == Some("projects/repo/worktrees/thread"))
+            .unwrap_or_else(|| panic!("the recording is in the marker: {report:#?}"));
+        assert!(thread.recorded);
+        assert_eq!(thread.path, clone.display().to_string());
+        assert_eq!(
+            vfs.get("projects/repo/worktrees/thread/src/f04.txt")
+                .unwrap(),
+            body(4, " (thread)").into_bytes()
+        );
     }
 
     #[test]
