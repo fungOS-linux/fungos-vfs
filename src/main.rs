@@ -242,6 +242,26 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// The build cache: content this root may forget.
+    Cache {
+        /// `put`, `ls`, `pin`, `unpin`, or `evict`.
+        mode: String,
+        /// The file to file, for `put`.
+        file: Option<PathBuf>,
+        /// What produced it, for `put`. A label, never an address.
+        #[arg(long)]
+        path: Option<String>,
+        /// The content id, for `pin` and `unpin`.
+        #[arg(long)]
+        content_id: Option<String>,
+        #[arg(long, default_value = "application/octet-stream")]
+        media_type: String,
+        /// The ceiling to evict down to, for `evict`.
+        #[arg(long)]
+        max_bytes: Option<u64>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() {
@@ -623,6 +643,65 @@ fn run() -> anyhow::Result<()> {
             other => anyhow::bail!(
                 "worktree mode must be materialize, checkout, list, record or changes, not {other}"
             ),
+        },
+        Command::Cache {
+            mode,
+            file,
+            path,
+            content_id,
+            media_type,
+            max_bytes,
+            json,
+        } => match mode.as_str() {
+            "put" => {
+                let file = file.ok_or_else(|| anyhow::anyhow!("cache put needs a file"))?;
+                let label = path.unwrap_or_else(|| file.to_string_lossy().into_owned());
+                let bytes = fs::read(&file)?;
+                let content_id = vfs.put_cache(&label, &bytes, &media_type)?;
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "path": label,
+                        "content_id": content_id.to_string(),
+                        "size": bytes.len(),
+                        "cached_bytes": vfs.cached_bytes()?,
+                    })
+                );
+            }
+            "ls" => {
+                let entries = vfs.cache_entries()?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&entries)?);
+                } else {
+                    for entry in entries {
+                        println!(
+                            "{}\t{}\t{}{}",
+                            entry.content_id,
+                            entry.size,
+                            entry.path,
+                            if entry.pinned { "\t(pinned)" } else { "" }
+                        );
+                    }
+                }
+            }
+            "pin" | "unpin" => {
+                let id =
+                    content_id.ok_or_else(|| anyhow::anyhow!("cache {mode} needs --content-id"))?;
+                let id = ContentId::parse(&id).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                vfs.pin_cache(&id, mode == "pin")?;
+            }
+            "evict" => {
+                let max =
+                    max_bytes.ok_or_else(|| anyhow::anyhow!("cache evict needs --max-bytes"))?;
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "evicted": vfs.evict_cache_to(max)?,
+                        "cached_bytes": vfs.cached_bytes()?,
+                    })
+                );
+            }
+            other => anyhow::bail!("cache mode must be put, ls, pin, unpin or evict, not {other}"),
         },
         // Handled before the store is opened, above.
         Command::Migrate => unreachable!(),

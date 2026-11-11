@@ -359,6 +359,55 @@ What it deliberately does not do, yet:
   approximated — a content-addressed store for plain files is the other half of
   the story, and it is a different one.
 
+## The cache class
+
+Build output is the largest thing on a developer machine and the only large thing
+a namespace has no business versioning. A fourth class stores it without making it
+a fact:
+
+```text
+cache: target/      stored in the CAS, never versioned, evictable
+```
+
+| | `Git` | `Blob` | `Cache` | `Exclude` |
+|---|---|---|---|---|
+| in the CAS | no (tree id) | yes | yes | no |
+| version history | tree | yes | **no** | no |
+| in the op log | yes | yes | **no** | no |
+| a reader fetches it by | tree | path | **content id** | — |
+| dropped by | nothing | reachability (`gc`) | **size (`evict`)** | — |
+
+```sh
+fungos-vfs --root ~/fungos cache put target/debug/app --path target/debug/app
+fungos-vfs --root ~/fungos cache ls
+fungos-vfs --root ~/fungos cache pin   --content-id blake3:<hex>
+fungos-vfs --root ~/fungos cache evict --max-bytes 20000000000
+```
+
+Four rules, and each is the reason the class exists:
+
+- **A cache write is not an op.** No namespace entry, no version, no author, no
+  row for a peer to replay: a compiler's scratch files are not edits. What you get
+  back is a `ContentId`, and that is the only handle — cache content is fetched by
+  id, never by path.
+- **`gc` keeps cache content; `evict` is what forgets it.** Collecting it in both
+  places would be two collectors racing to delete the same bytes on different
+  rules. Reachability is the rule for everything else; the ceiling is the rule for
+  this.
+- **Eviction is by size, oldest-use first.** Age alone is the wrong axis: a
+  twelve-hour-old build tree may be the only copy of an hour of work. Pinned
+  entries are skipped, so a changeset can name an artifact and have it survive the
+  ceiling.
+- **Eviction forgets the entry, not the bytes.** The store is shared, so dropping
+  one root's claim leaves the content to the next `gc` — which is what makes
+  eviction cheap and safe to run while other roots are working.
+
+Two things are deliberately not done yet, and both are about a build that is
+*running*: a tree-scoped lease (today `Lease` holds one path, so `evict` can drop
+the tree under a build), and who renews it — the build by heartbeat, or the caller
+for its lifetime. Neither changes the storage rule above; both matter before this
+turns into a mount.
+
 ## Pieces
 
 A blob is fetched in pieces, from any source that has them — the one idea worth

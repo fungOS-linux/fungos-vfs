@@ -180,6 +180,25 @@ pub struct Change {
     pub at_ms: i64,
 }
 
+/// One entry of the build cache: content in the store that this root may forget.
+///
+/// There is no version and no history here, because there is nothing to version:
+/// the entry is a hint that some bytes exist, and losing it costs a rebuild
+/// rather than information.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CacheEntry {
+    pub content_id: ContentId,
+    /// The path the content was last produced at. A label for a human reading
+    /// `cache ls`, never an address: cache content is fetched by [`CacheEntry::content_id`].
+    pub path: String,
+    pub media_type: String,
+    pub size: u64,
+    /// Content a changeset names: eviction skips it.
+    pub pinned: bool,
+    pub created_at_ms: i64,
+    pub last_used_ms: i64,
+}
+
 /// One revision in a file's history.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Version {
@@ -842,6 +861,15 @@ impl Vfs {
                origin TEXT NOT NULL,
                worktree TEXT NOT NULL DEFAULT '',
                at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS cache(
+               content_id TEXT PRIMARY KEY,
+               path TEXT NOT NULL,
+               media_type TEXT NOT NULL,
+               size INTEGER NOT NULL,
+               pinned INTEGER NOT NULL DEFAULT 0,
+               created_at_ms INTEGER NOT NULL,
+               last_used_ms INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS worktrees(
                name TEXT PRIMARY KEY,
@@ -1918,6 +1946,122 @@ impl Vfs {
         Ok(bytes.max(0) as u64)
     }
 
+    /// File a build's output in the store, and nowhere else.
+    ///
+    /// Deliberately not [`Vfs::put`]: no namespace entry, no version, no op, and
+    /// therefore no authorship. A build's intermediate output is not something
+    /// anyone wrote, and putting it in the op log would make every peer replay a
+    /// compiler's scratch files as if they were edits.
+    ///
+    /// What a reader gets back is the [`ContentId`], and that is the only handle:
+    /// cache content is fetched by id, never by path. The path is recorded so a
+    /// human reading `cache ls` can tell what produced the bytes.
+    pub fn put_cache(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        media_type: &str,
+    ) -> Result<ContentId, VfsError> {
+        if self.role == NodeRole::Cache {
+            return Err(VfsError::ReadOnly);
+        }
+        let content_id = self.blobs.put(bytes)?;
+        let now = now_ms();
+        self.db.execute(
+            "INSERT INTO cache(content_id,path,media_type,size,pinned,created_at_ms,last_used_ms)
+             VALUES(?1,?2,?3,?4,0,?5,?5)
+             ON CONFLICT(content_id) DO UPDATE SET path=excluded.path,
+               last_used_ms=excluded.last_used_ms",
+            params![
+                content_id.to_string(),
+                path,
+                media_type,
+                bytes.len() as i64,
+                now
+            ],
+        )?;
+        Ok(content_id)
+    }
+
+    /// Mark cache content as named by a changeset, so eviction leaves it alone.
+    pub fn pin_cache(&self, content_id: &ContentId, pinned: bool) -> Result<(), VfsError> {
+        self.db.execute(
+            "UPDATE cache SET pinned=?1 WHERE content_id=?2",
+            params![i64::from(pinned), content_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn cache_entries(&self) -> Result<Vec<CacheEntry>, VfsError> {
+        let mut statement = self.db.prepare(
+            "SELECT content_id,path,media_type,size,pinned,created_at_ms,last_used_ms
+             FROM cache ORDER BY last_used_ms",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(CacheEntry {
+                content_id: ContentId(row.get(0)?),
+                path: row.get(1)?,
+                media_type: row.get(2)?,
+                size: row.get::<_, i64>(3)? as u64,
+                pinned: row.get::<_, i64>(4)? != 0,
+                created_at_ms: row.get(5)?,
+                last_used_ms: row.get(6)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(VfsError::from)
+    }
+
+    pub fn cached_bytes(&self) -> Result<u64, VfsError> {
+        let bytes: i64 =
+            self.db
+                .query_row("SELECT COALESCE(SUM(size),0) FROM cache", [], |row| {
+                    row.get(0)
+                })?;
+        Ok(bytes.max(0) as u64)
+    }
+
+    /// Drop cache entries until the cache class fits in `max_bytes`, oldest first.
+    ///
+    /// Size is the axis, not age: a twelve-hour-old build tree may be the only
+    /// copy of an hour of work. What makes that safe is the class — a cache entry
+    /// is the one thing whose loss costs a rebuild and nothing else.
+    ///
+    /// Only the entry goes; the bytes stay until a later [`Vfs::gc`], because the
+    /// store is shared and another root may hold the same content. Eviction is
+    /// this root forgetting its claim, not the machine deleting data.
+    ///
+    /// Pinned entries are skipped, which is what lets a changeset name an artifact
+    /// and have it survive the ceiling. A build in progress is *not* protected
+    /// here yet: the tree-scoped lease that would do it is a follow-up, and until
+    /// it exists eviction can drop the tree under a running build.
+    pub fn evict_cache_to(&self, max_bytes: u64) -> Result<usize, VfsError> {
+        let mut total = self.cached_bytes()?;
+        if total <= max_bytes {
+            return Ok(0);
+        }
+        let victims: Vec<(String, u64)> = {
+            let mut statement = self.db.prepare(
+                "SELECT content_id,size FROM cache WHERE pinned=0
+                 ORDER BY last_used_ms, created_at_ms",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut evicted = 0;
+        for (content_id, size) in victims {
+            if total <= max_bytes {
+                break;
+            }
+            self.db
+                .execute("DELETE FROM cache WHERE content_id=?1", params![content_id])?;
+            total = total.saturating_sub(size);
+            evicted += 1;
+        }
+        Ok(evicted)
+    }
+
     /// Evict oldest unpinned, unleased present files until the cache fits.
     ///
     /// The bytes are not deleted: they are shared with every other root on the
@@ -2004,6 +2148,17 @@ fn reachable_in(db: &Connection) -> Result<BTreeSet<ContentId>, VfsError> {
     // A store written before exports existed simply has a smaller reachable set.
     if table_exists(db, "exports")? {
         let mut statement = db.prepare("SELECT content_id FROM exports")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            reachable.insert(ContentId(row?));
+        }
+    }
+    // Cache content is reachable *to gc* and survivable only through eviction.
+    // Collecting it here and evicting it there would be two collectors racing to
+    // delete the same bytes, each undoing the other's policy: the ceiling is the
+    // rule for cache content, and reachability is the rule for everything else.
+    if table_exists(db, "cache")? {
+        let mut statement = db.prepare("SELECT content_id FROM cache")?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
         for row in rows {
             reachable.insert(ContentId(row?));
@@ -2213,6 +2368,111 @@ mod tests {
         fs::create_dir_all(to.parent().unwrap()).unwrap();
         fs::rename(from, to).unwrap();
         entry.content_id
+    }
+
+    #[test]
+    fn cache_content_is_stored_but_never_versioned() {
+        let (temp, mut vfs) = workspace();
+        let bytes = b"compiled artifact\0\x01";
+
+        let first = vfs
+            .put_cache(
+                "target/debug/libfoo.rlib",
+                bytes,
+                "application/octet-stream",
+            )
+            .expect("cache put");
+        assert_eq!(first, ContentId::from_bytes(bytes));
+
+        // Same bytes, same id, one row: a build that produces identical output
+        // twice costs nothing the second time.
+        let second = vfs
+            .put_cache(
+                "target/debug/libfoo.rlib",
+                bytes,
+                "application/octet-stream",
+            )
+            .expect("cache put again");
+        assert_eq!(first, second);
+        assert_eq!(vfs.cache_entries().unwrap().len(), 1);
+
+        // None of the things a real write creates. This is the whole distinction
+        // from `put`: no namespace entry, no version, no op for a peer to replay.
+        assert!(
+            vfs.file("target/debug/libfoo.rlib").unwrap().is_none(),
+            "cache content is not namespace state"
+        );
+        assert!(vfs.history("target/debug/libfoo.rlib").unwrap().is_empty());
+        assert!(vfs.pending(100).unwrap().is_empty(), "nothing to sync");
+        assert!(vfs.changes(0, "", "", 100).unwrap().is_empty());
+
+        // And it is a real object in the shared store.
+        assert!(!object_files(&temp.path().join("cas")).is_empty());
+        assert!(
+            vfs.get("target/debug/libfoo.rlib").is_err(),
+            "there is no path to read it back by"
+        );
+        assert!(vfs.content(&first).is_ok(), "the content id is the handle");
+    }
+
+    #[test]
+    fn gc_keeps_cache_content_and_eviction_is_what_forgets_it() {
+        let (temp, vfs) = workspace();
+        let cas = temp.path().join("cas");
+        let bytes = vec![7u8; 4096];
+        let id = vfs
+            .put_cache("target/debug/app", &bytes, "application/octet-stream")
+            .expect("cache put");
+
+        // Nothing in the namespace names it, but it is not garbage: the ceiling
+        // is the rule for cache content, so gc leaves it alone.
+        assert_eq!(vfs.gc().unwrap(), 0);
+        assert!(!object_files(&cas).is_empty(), "gc kept the object");
+        assert!(vfs.content(&id).is_ok());
+
+        // Forgetting the entry makes the bytes collectable on the next pass.
+        assert_eq!(vfs.evict_cache_to(0).unwrap(), 1);
+        assert!(vfs.cache_entries().unwrap().is_empty());
+        assert_eq!(vfs.cached_bytes().unwrap(), 0);
+        assert_eq!(vfs.gc().unwrap(), 1);
+        assert!(object_files(&cas).is_empty());
+    }
+
+    #[test]
+    fn cache_eviction_is_by_size_and_spares_pinned_content() {
+        let (temp, vfs) = workspace();
+        let keep = vfs
+            .put_cache("target/artifact.tar", &vec![1u8; 1000], "application/x-tar")
+            .expect("put pinned");
+        vfs.pin_cache(&keep, true).unwrap();
+        let first = vfs
+            .put_cache("target/one", &vec![2u8; 1000], "application/octet-stream")
+            .expect("put one");
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let second = vfs
+            .put_cache("target/two", &vec![3u8; 1000], "application/octet-stream")
+            .expect("put two");
+        assert_eq!(vfs.cached_bytes().unwrap(), 3000);
+
+        // Down to 2000: one unpinned entry goes, and it is the least recently
+        // used one, not the largest and not the oldest-created.
+        assert_eq!(vfs.evict_cache_to(2000).unwrap(), 1);
+        let left: Vec<ContentId> = vfs
+            .cache_entries()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.content_id)
+            .collect();
+        assert_eq!(left.len(), 2);
+        assert!(left.contains(&keep), "pinned content survives the ceiling");
+        assert!(left.contains(&second), "the newer entry is used last");
+        assert!(!left.contains(&first));
+
+        // A ceiling below the pinned content cannot be met, and says so by not
+        // deleting what it must not: the pin wins over the number.
+        assert_eq!(vfs.evict_cache_to(0).unwrap(), 1);
+        assert_eq!(vfs.cached_bytes().unwrap(), 1000);
+        let _ = temp;
     }
 
     #[test]

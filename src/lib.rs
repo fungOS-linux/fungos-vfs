@@ -43,8 +43,8 @@ pub use transfer::{
     ingest_dir_with_policy,
 };
 pub use vfs::{
-    Change, Expect, FileEntry, Hlc, Hydration, LEGACY_STATE_DIR, Lease, LodPolicy, NodeRole,
-    STATE_DIR, StorageMigration, SyncOp, SyncOpKind, Version, Vfs, VfsError, Writer,
+    CacheEntry, Change, Expect, FileEntry, Hlc, Hydration, LEGACY_STATE_DIR, Lease, LodPolicy,
+    NodeRole, STATE_DIR, StorageMigration, SyncOp, SyncOpKind, Version, Vfs, VfsError, Writer,
     migrate_storage, migrate_storage_with_cas,
 };
 pub use worktree::{

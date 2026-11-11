@@ -49,6 +49,8 @@ pub struct IngestReport {
     pub unchanged: usize,
     pub skipped: usize,
     pub excluded: usize,
+    /// Paths stored as cache content: in the store, not in the namespace.
+    pub cached: usize,
     /// Paths covered by a Git tree id instead of being copied.
     pub git_skipped: usize,
     /// Present when the source is a Git repository and the policy asked for it.
@@ -178,6 +180,11 @@ pub fn ingest_dir_with_policy(
             }
             _ => {}
         }
+        // A cache path is read like any other and then filed by content id rather
+        // than written into the namespace. Rebuildable output belongs in the store
+        // where it can be deduplicated and evicted, not in a namespace that would
+        // give it a version, an author, and a peer to replay to.
+        let cache_class = matches!(policy.classify(&rel), PathClass::Cache);
 
         let absolute = source.join(&rel);
         // A symlink is not content: following it would import bytes from
@@ -199,6 +206,15 @@ pub fn ingest_dir_with_policy(
             }
         };
         let content_id = ContentId::from_bytes(&bytes);
+
+        if cache_class {
+            if !dry_run {
+                vfs.put_cache(&virtual_path, &bytes, media_type_for(&rel))?;
+            }
+            report.cached += 1;
+            report.bytes_written += bytes.len() as u64;
+            continue;
+        }
 
         match vfs.file(&virtual_path)? {
             Some(entry) if entry.content_id == content_id => report.unchanged += 1,
@@ -504,6 +520,41 @@ mod tests {
         assert!(vfs.file("p/src/main.rs").unwrap().is_some());
         assert!(vfs.file("p/target/debug/blob.o").unwrap().is_none());
         assert!(vfs.file("p/huge.iso").unwrap().is_none());
+    }
+
+    #[test]
+    fn cache_class_paths_land_in_the_store_instead_of_the_namespace() {
+        let base = scratch("policy-cache");
+        let source = base.join("source");
+        write(&source.join("src/main.rs"), "fn main() {}\n");
+        write(&source.join("target/debug/app"), "linked binary\n");
+
+        let policy = PathPolicy::parse("cache: target/\n");
+        let mut vfs = open_vfs(&base);
+        let report =
+            ingest_dir_with_policy(&mut vfs, &source, "p", SourceMode::All, false, &policy)
+                .unwrap();
+
+        assert_eq!(report.added, 1, "only the source is namespace state");
+        assert_eq!(report.cached, 1, "the build output is cache content");
+        assert!(vfs.file("p/src/main.rs").unwrap().is_some());
+        assert!(
+            vfs.file("p/target/debug/app").unwrap().is_none(),
+            "a cache entry must not become a namespace fact"
+        );
+        let cached = vfs.cache_entries().unwrap();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].path, "p/target/debug/app");
+        assert_eq!(
+            vfs.content(&cached[0].content_id).unwrap(),
+            b"linked binary\n",
+            "the bytes are in the store, reachable by content id"
+        );
+        // Ingesting again is free: same bytes, same id, one entry.
+        let again = ingest_dir_with_policy(&mut vfs, &source, "p", SourceMode::All, false, &policy)
+            .unwrap();
+        assert_eq!(again.cached, 1);
+        assert_eq!(vfs.cache_entries().unwrap().len(), 1);
     }
 
     #[test]
