@@ -182,6 +182,45 @@ for the ones still holding the pass back.
   kept as a copy so the decision can be made by reading both.
 - **Not a server.** No node is authoritative; any store can pull from any other.
 
+## Projects
+
+Attaching a repository is how a desktop gets content. It does **not** copy the
+repository: Git already content-addresses its own tree, so a clean checkout
+becomes one pointer.
+
+```sh
+fungos-vfs --root ~/fungos-local project attach ~/src/soil
+fungos-vfs --root ~/fungos-local project list
+```
+
+What attach records:
+
+- the **Git pointer** — commit and tree — instead of one blob per tracked file;
+- the **worktrees** Git knows about, so the desktop can see what is checked out
+  and where, without a second copy of any object;
+- the **in-between** Git cannot hold: a dirty worktree falls back to blobs for
+  the files that changed, and the report says `git.dirty` so the difference is
+  never implied.
+
+The policy it attaches, in full:
+
+```text
+git: **
+
+exclude: target/
+exclude: node_modules/
+exclude: .venv/
+exclude: dist/
+exclude: build/
+```
+
+Last matching rule wins, which is why the exclusions come second: a repository
+that commits its build output must not have that output treated as source.
+
+A clean repository of one file attaches as **one tree pointer and zero bytes
+written**. Change a file and the next attach writes that file — the rest is
+still the tree's.
+
 ## Next
 
 1. File Provider / Cloud Files adapter for a signed macOS app.

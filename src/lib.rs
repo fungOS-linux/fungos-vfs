@@ -10,6 +10,7 @@ mod content;
 mod hydrate;
 mod path;
 mod policy;
+mod project;
 mod quic;
 mod store;
 mod stream;
@@ -26,6 +27,7 @@ pub use content::ContentId;
 pub use hydrate::Hydrator;
 pub use path::normalize_path;
 pub use policy::{PathClass, PathPolicy};
+pub use project::{ProjectReport, WorktreeRef, attach as attach_project, list as list_projects};
 pub use quic::{SyncServer, pull_over_quic};
 pub use stream::{MAX_FRAME, PullClient, Resume, STREAM_VERSION, SnapshotHeader, StreamRequest};
 pub use sync::{
