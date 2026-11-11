@@ -36,6 +36,14 @@ pub const PROJECTS_DIR: &str = ".fungos/projects";
 /// a repository that commits its build output (some do) must not have that
 /// output treated as source.
 ///
+/// Build output is **excluded here, not cached**. `cache: target/` would also be
+/// legal — the class exists for exactly this shape of data — but attaching walks
+/// `git ls-files`, which never lists an ignored `target/`, so the only case the
+/// change would reach is a repository that tracks its own build output, and there
+/// the bytes are already in the git tree. Storing them again is a cost with no
+/// benefit. The cache is for the thing that produces build output, which is the
+/// builder: it knows the ceiling and writes [crate::PathClass::Cache] entries.
+///
 /// Note what a dirty worktree costs: a tree id describes a commit, not the disk,
 /// so a checkout with any change at all cannot use the pointer and its whole
 /// tree is stored as blobs. The content store deduplicates them across
@@ -568,7 +576,12 @@ mod tests {
             policy.classify("crates/soil-spore/src/lib.rs"),
             crate::PathClass::Git
         );
-        // Build output: nobody's.
+        // Build output: nobody's. Deliberately `Exclude` rather than `Cache`:
+        // attaching walks `git ls-files`, which never lists an ignored `target/`,
+        // so caching it here would only ever store a repository's *tracked* build
+        // output — bytes the git tree already names. The builder fills the cache
+        // instead. Changing this to `Cache` should mean deciding that attaching a
+        // checkout of build output is worth the bytes.
         assert_eq!(
             policy.classify("target/debug/fungos-vfs"),
             crate::PathClass::Exclude

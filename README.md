@@ -408,6 +408,13 @@ the tree under a build), and who renews it — the build by heartbeat, or the ca
 for its lifetime. Neither changes the storage rule above; both matter before this
 turns into a mount.
 
+**`project attach` still says `exclude: target/`, and should.** Attaching walks
+`git ls-files`, which never lists an ignored `target/`, so switching that rule to
+`cache:` would only ever reach a repository that tracks its own build output — and
+there the bytes are already in the git tree. *Source* is what attaching is for.
+The cache is for the thing that produces build output, which is the builder: it
+knows the ceiling and files ``PathClass::Cache`` entries itself.
+
 ## Pieces
 
 A blob is fetched in pieces, from any source that has them — the one idea worth
