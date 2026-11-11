@@ -115,7 +115,14 @@ pub struct FileEntry {
     pub hydration: Hydration,
     pub pinned: bool,
     pub updated_at_ms: i64,
+    /// Permission bits (`0o755`), not a full `st_mode`. A namespace that can
+    /// hold a built executable has to remember that it is executable, or every
+    /// materialization hands back a file nobody can run.
+    pub mode: u32,
 }
+
+/// What a file is when nobody said otherwise: readable, not executable.
+pub const DEFAULT_MODE: u32 = 0o644;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Lease {
@@ -729,7 +736,8 @@ impl Vfs {
                version INTEGER NOT NULL,
                hydration TEXT NOT NULL,
                pinned INTEGER NOT NULL,
-               updated_at_ms INTEGER NOT NULL
+               updated_at_ms INTEGER NOT NULL,
+               mode INTEGER NOT NULL DEFAULT 420
              );
              CREATE TABLE IF NOT EXISTS directories(
                path TEXT PRIMARY KEY,
@@ -817,6 +825,10 @@ impl Vfs {
         self.ensure_column("sync_queue", "base_content_id", "TEXT")?;
         self.ensure_column("sync_queue", "worktree", "TEXT NOT NULL DEFAULT ''")?;
         self.ensure_column("sync_queue", "store", "TEXT NOT NULL DEFAULT ''")?;
+        // Executability arrived after the first roots were written. A root that
+        // predates it reads every file as a plain, non-executable file rather
+        // than guessing from the bytes.
+        self.ensure_column("files", "mode", "INTEGER NOT NULL DEFAULT 420")?;
 
         // Receipts were keyed on origin, which two stores on one host share.
         // The table is only a record of what has been applied, so rebuilding it
@@ -909,6 +921,28 @@ impl Vfs {
         media_type: &str,
         expect: Expect<'_>,
     ) -> Result<FileEntry, VfsError> {
+        // Replacing bytes keeps the mode: rewriting a script must not make it
+        // stop being executable. A path nobody has written starts readable.
+        let mode = self
+            .file(path)?
+            .map(|entry| entry.mode)
+            .unwrap_or(DEFAULT_MODE);
+        self.put_with_mode(path, bytes, media_type, mode, expect)
+    }
+
+    /// `put`, with the permission bits spelled out.
+    ///
+    /// A caller that materialized a real file — the overlay applying a binary it
+    /// just built — knows its mode. A caller that only has bytes does not, and
+    /// uses [`Vfs::put`].
+    pub fn put_with_mode(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        media_type: &str,
+        mode: u32,
+        expect: Expect<'_>,
+    ) -> Result<FileEntry, VfsError> {
         if self.role == NodeRole::Cache {
             return Err(VfsError::ReadOnly);
         }
@@ -947,12 +981,20 @@ impl Vfs {
         let base = current.as_ref().map(|entry| entry.content_id.0.clone());
         let tx = self.db.transaction()?;
         tx.execute(
-            "INSERT INTO files(path,content_id,size,media_type,version,hydration,pinned,updated_at_ms)
-             VALUES(?1,?2,?3,?4,?5,'present',0,?6)
+            "INSERT INTO files(path,content_id,size,media_type,version,hydration,pinned,updated_at_ms,mode)
+             VALUES(?1,?2,?3,?4,?5,'present',0,?6,?7)
              ON CONFLICT(path) DO UPDATE SET content_id=excluded.content_id,size=excluded.size,
                media_type=excluded.media_type,version=excluded.version,hydration='present',
-               updated_at_ms=excluded.updated_at_ms",
-            params![path, content_id.to_string(), bytes.len() as i64, media_type, version as i64, now],
+               updated_at_ms=excluded.updated_at_ms,mode=excluded.mode",
+            params![
+                path,
+                content_id.to_string(),
+                bytes.len() as i64,
+                media_type,
+                version as i64,
+                now,
+                i64::from(mode & 0o7777)
+            ],
         )?;
         tx.execute(
             "INSERT INTO versions(path,version,content_id,size,created_at_ms,actor,origin)
@@ -986,6 +1028,25 @@ impl Vfs {
             ],
         )?;
         tx.commit()?;
+        self.file(&path)?.ok_or_else(|| VfsError::NotFound(path))
+    }
+
+    /// Change a file's permission bits without touching its content.
+    ///
+    /// A mode belongs to the entry, not to one version of the bytes, so this
+    /// creates no version: `chmod +x` on an unchanged script should not read as
+    /// a content rewrite in history. It is host-local metadata — sync carries
+    /// versions by content id, and a mode has no content id to carry — so a
+    /// mode is re-established wherever the file is materialized, not replicated.
+    pub fn set_mode(&self, path: &str, mode: u32) -> Result<FileEntry, VfsError> {
+        let path = normalize_path(path)?;
+        let changed = self.db.execute(
+            "UPDATE files SET mode=?2, updated_at_ms=?3 WHERE path=?1",
+            params![path, i64::from(mode & 0o7777), now_ms()],
+        )?;
+        if changed == 0 {
+            return Err(VfsError::NotFound(path));
+        }
         self.file(&path)?.ok_or_else(|| VfsError::NotFound(path))
     }
 
@@ -1061,7 +1122,7 @@ impl Vfs {
         let path = normalize_path(path)?;
         self.db
             .query_row(
-                "SELECT path,content_id,size,media_type,version,hydration,pinned,updated_at_ms
+                "SELECT path,content_id,size,media_type,version,hydration,pinned,updated_at_ms,mode
                  FROM files WHERE path=?1",
                 params![path],
                 row_to_entry,
@@ -1073,7 +1134,7 @@ impl Vfs {
     pub fn find_by_content(&self, content_id: &ContentId) -> Result<Option<FileEntry>, VfsError> {
         self.db
             .query_row(
-                "SELECT path,content_id,size,media_type,version,hydration,pinned,updated_at_ms
+                "SELECT path,content_id,size,media_type,version,hydration,pinned,updated_at_ms,mode
                  FROM files WHERE content_id=?1 LIMIT 1",
                 params![content_id.to_string()],
                 row_to_entry,
@@ -1089,7 +1150,7 @@ impl Vfs {
             normalize_path(prefix)?
         };
         let mut statement = self.db.prepare(
-            "SELECT path,content_id,size,media_type,version,hydration,pinned,updated_at_ms
+            "SELECT path,content_id,size,media_type,version,hydration,pinned,updated_at_ms,mode
              FROM files WHERE path LIKE ?1 ORDER BY path",
         )?;
         let rows = statement.query_map(params![format!("{prefix}%")], row_to_entry)?;
@@ -1787,6 +1848,7 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileEntry> {
         },
         pinned: row.get::<_, i64>(6)? != 0,
         updated_at_ms: row.get(7)?,
+        mode: row.get::<_, i64>(8)? as u32,
     })
 }
 
@@ -2134,6 +2196,70 @@ mod tests {
         let conflict = vfs.put("docs/a.md", b"three", "text/markdown", Expect::Version(1));
         assert!(matches!(conflict, Err(VfsError::Conflict { .. })));
         assert_eq!(vfs.list("docs").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn mode_survives_a_rewrite_and_chmod_is_not_a_version() {
+        let (_temp, mut vfs) = workspace();
+        let entry = vfs
+            .put("bin/tool", b"#!/bin/sh\n", "text/x-shellscript", Expect::Any)
+            .unwrap();
+        assert_eq!(entry.mode, DEFAULT_MODE, "a new file is data, not a program");
+        assert_eq!(vfs.set_mode("bin/tool", 0o755).unwrap().mode, 0o755);
+        // Rewriting the bytes keeps the bit: a rebuilt script is still a script.
+        let entry = vfs
+            .put(
+                "bin/tool",
+                b"#!/bin/sh\necho hi\n",
+                "text/x-shellscript",
+                Expect::Any,
+            )
+            .unwrap();
+        assert_eq!(entry.mode, 0o755);
+        // A caller that knows the mode (the overlay applying a build) says so.
+        let entry = vfs
+            .put_with_mode(
+                "bin/other",
+                b"built",
+                "application/octet-stream",
+                0o755,
+                Expect::Any,
+            )
+            .unwrap();
+        assert_eq!(entry.mode, 0o755);
+        // `chmod` changes the entry, not the content, so history does not grow.
+        let versions = vfs.history("bin/tool").unwrap().len();
+        assert_eq!(vfs.set_mode("bin/tool", 0o644).unwrap().mode, 0o644);
+        assert_eq!(vfs.history("bin/tool").unwrap().len(), versions);
+    }
+
+    #[test]
+    fn set_mode_reports_a_missing_path() {
+        let (_temp, vfs) = workspace();
+        assert!(matches!(
+            vfs.set_mode("nope", 0o755),
+            Err(VfsError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn a_root_written_before_mode_reads_every_file_as_plain() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let cas = temp.path().join("cas");
+        {
+            let mut vfs = Vfs::open_with(&root, NodeRole::Full, Some(&cas)).unwrap();
+            vfs.put("a.txt", b"a", "text/plain", Expect::Any)
+                .unwrap();
+        }
+        // Rewind the schema to the shape a build without `mode` wrote.
+        let db = Connection::open(StateLayout::new(&root).db_path()).unwrap();
+        db.execute("ALTER TABLE files DROP COLUMN mode", [])
+            .unwrap();
+        drop(db);
+        let mut vfs = Vfs::open_with(&root, NodeRole::Full, Some(&cas)).unwrap();
+        assert_eq!(vfs.file("a.txt").unwrap().unwrap().mode, DEFAULT_MODE);
+        assert_eq!(vfs.set_mode("a.txt", 0o755).unwrap().mode, 0o755);
     }
 
     #[test]
