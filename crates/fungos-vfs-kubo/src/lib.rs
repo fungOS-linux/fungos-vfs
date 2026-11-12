@@ -16,7 +16,8 @@
 use std::time::Duration;
 
 use fungos_vfs::{
-    CODEC_DAG_CBOR, ContentId, Hydrator, VfsError, cid_bytes, cid_string, content_id_to_cid,
+    CODEC_DAG_CBOR, ContentId, Hydrator, Replica, Stored, VfsError, cid_bytes, cid_string,
+    content_id_to_cid,
 };
 
 /// The environment variable naming the Kubo API endpoint to hydrate from.
@@ -110,6 +111,92 @@ impl Hydrator for KuboHydrator {
             return Err(VfsError::InvalidContentId(content_id.to_string()));
         }
         Ok(bytes)
+    }
+}
+
+/// A Kubo node as a [`Replica`]: the same node that hydrates a placeholder can
+/// also hold the copy of record.
+///
+/// Two reads matter, and they are the same node seen twice. `block/get` answers
+/// with the bytes whose blake3 name we already computed, which is why nothing
+/// here needs a lookup index. `block/stat` answers whether a block is already
+/// there, which is what makes `put` report honestly instead of claiming a write it
+/// did not have to make.
+pub struct KuboReplica {
+    name: String,
+    api: String,
+    hydrator: KuboHydrator,
+    writable: bool,
+}
+
+impl KuboReplica {
+    pub fn new(name: impl Into<String>, api: impl Into<String>) -> Self {
+        let api = api.into().trim_end_matches('/').to_string();
+        Self {
+            name: name.into(),
+            hydrator: KuboHydrator::new(api.clone()),
+            api,
+            writable: true,
+        }
+    }
+
+    /// A node that is read from but never pinned to: somebody else's copy.
+    #[must_use]
+    pub fn read_only(mut self) -> Self {
+        self.writable = false;
+        self
+    }
+
+    /// Whether the node already holds this block.
+    fn has(&self, content_id: &ContentId) -> Result<bool, VfsError> {
+        let cid = content_id_to_cid(content_id)?;
+        let response = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_default()
+            .post(format!("{}/api/v0/block/stat", self.api))
+            .query(&[("arg", cid.as_str())])
+            .send()
+            .map_err(|error| VfsError::Transport(format!("kubo block/stat {cid}: {error}")))?;
+        match response.status().as_u16() {
+            200 => Ok(true),
+            // A node that has never seen the block says so with a 4xx, and that
+            // is an answer rather than a failure.
+            400..=499 => Ok(false),
+            _ => Err(VfsError::Transport(format!(
+                "kubo block/stat {cid}: HTTP {}",
+                response.status()
+            ))),
+        }
+    }
+}
+
+impl Replica for KuboReplica {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn fetch(&self, content_id: &ContentId, size: u64) -> Result<Vec<u8>, VfsError> {
+        self.hydrator.fetch("", content_id, size)
+    }
+
+    fn put(&self, content_id: &ContentId, bytes: &[u8]) -> Result<Stored, VfsError> {
+        if !self.writable {
+            return Err(VfsError::ReadOnly);
+        }
+        if self.has(content_id)? {
+            return Ok(Stored::AlreadyPresent);
+        }
+        let mut batch = CarBatch::new();
+        batch.add(content_id, bytes.to_vec())?;
+        // Pinned on import: a block that is not reachable from a pin is reclaimed
+        // by the node's next GC, which would make this a backup that expires.
+        batch.import(&self.api)?;
+        Ok(Stored::Added)
+    }
+
+    fn writable(&self) -> bool {
+        self.writable
     }
 }
 
@@ -414,6 +501,146 @@ mod tests {
             .fetch("any", &content_id, payload.len() as u64)
             .unwrap();
         assert_eq!(fetched, payload);
+    }
+
+    /// One canned HTTP/1.1 responder, so the adapter is exercised without a
+    /// node: the same shape as the tests in `unibus-ipfs`, and the only way to
+    /// check the failure paths at all.
+    /// A canned reply: which requests it answers, the status, and the body.
+    type Canned = (fn(&str) -> bool, u16, Vec<u8>);
+
+    fn stub(responses: Vec<Canned>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..responses.len() {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => head.push(byte[0]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&head).into_owned();
+                let request_line = text.lines().next().unwrap_or_default().to_owned();
+                let length = text
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0u8; length];
+                if length > 0 {
+                    let _ = stream.read_exact(&mut body);
+                }
+                seen.push(request_line.clone());
+                let (status, payload) = responses
+                    .iter()
+                    .find(|(matches, _, _)| matches(&request_line))
+                    .map(|(_, status, payload)| (*status, payload.clone()))
+                    .unwrap_or((404, b"no route".to_vec()));
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ = stream.write_all(&payload);
+                let _ = stream.flush();
+            }
+            seen
+        });
+        (endpoint, handle)
+    }
+
+    #[test]
+    fn a_replica_takes_a_block_and_reads_it_back() {
+        let payload = b"a block worth pinning".to_vec();
+        let content_id = ContentId::from_bytes(&payload);
+        let served = payload.clone();
+        let (api, seen) = stub(vec![
+            (
+                |line| line.contains("block/stat"),
+                404,
+                b"no such block".to_vec(),
+            ),
+            (|line| line.contains("dag/import"), 200, b"{}".to_vec()),
+            (|line| line.contains("block/get"), 200, served),
+        ]);
+        let replica = KuboReplica::new("kubo", &api);
+
+        assert_eq!(replica.put(&content_id, &payload).unwrap(), Stored::Added);
+        assert_eq!(
+            replica.fetch(&content_id, payload.len() as u64).unwrap(),
+            payload
+        );
+        let requests = seen.join().unwrap();
+        assert_eq!(requests.len(), 3, "{requests:#?}");
+        assert!(requests[0].contains("block/stat"), "{requests:?}");
+        assert!(requests[1].contains("dag/import"), "{requests:?}");
+        assert!(requests[2].contains("block/get"), "{requests:?}");
+    }
+
+    #[test]
+    fn a_block_the_node_already_holds_is_not_re_imported() {
+        let payload = b"already pinned here".to_vec();
+        let content_id = ContentId::from_bytes(&payload);
+        let (api, seen) = stub(vec![(
+            |line| line.contains("block/stat"),
+            200,
+            b"{}".to_vec(),
+        )]);
+        let replica = KuboReplica::new("kubo", &api);
+
+        assert_eq!(
+            replica.put(&content_id, &payload).unwrap(),
+            Stored::AlreadyPresent
+        );
+        let requests = seen.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "a second copy costs one question, not a write"
+        );
+    }
+
+    #[test]
+    fn a_node_returning_the_wrong_block_is_refused() {
+        let wanted = b"the block that was asked for".to_vec();
+        let content_id = ContentId::from_bytes(&wanted);
+        let (api, seen) = stub(vec![(
+            |line| line.contains("block/get"),
+            200,
+            b"some other block entirely".to_vec(),
+        )]);
+        let replica = KuboReplica::new("kubo", &api);
+
+        let error = replica.fetch(&content_id, wanted.len() as u64).unwrap_err();
+        assert!(matches!(error, VfsError::InvalidContentId(_)), "{error:?}");
+        seen.join().unwrap();
+    }
+
+    #[test]
+    fn a_read_only_node_refuses_to_be_written_to() {
+        let payload = b"not ours to pin".to_vec();
+        let content_id = ContentId::from_bytes(&payload);
+        let (api, _seen) = stub(vec![]);
+        let replica = KuboReplica::new("peer", &api).read_only();
+        assert!(!replica.writable());
+        assert!(matches!(
+            replica.put(&content_id, &payload),
+            Err(VfsError::ReadOnly)
+        ));
     }
 
     /// Live check against a running node. `KUBO_API` selects it, e.g.

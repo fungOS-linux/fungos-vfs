@@ -32,13 +32,20 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ContentId, Hydration, Vfs, VfsError};
+use crate::{ContentId, Hydration, ProviderReplica, Vfs, VfsError};
 
 /// Whether a copy had to be written or was already there.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Stored {
     Added,
     AlreadyPresent,
+}
+
+/// One bounded read, and whether it reached the end.
+#[derive(Clone, Debug)]
+pub struct FetchedRange {
+    pub bytes: Vec<u8>,
+    pub eof: bool,
 }
 
 /// One place content can live besides this machine's own store.
@@ -52,6 +59,29 @@ pub trait Replica: Send + Sync {
 
     /// The bytes, verified against `id` by the implementation.
     fn fetch(&self, id: &ContentId, size: u64) -> Result<Vec<u8>, VfsError>;
+
+    /// A bounded read, for providers that serve ranges rather than whole objects.
+    ///
+    /// The default asks for the whole object and slices it: correct for a file
+    /// that is already open, and wasteful for a bucket that can answer a range in
+    /// one request. Sources that can do better override it — a range read is what
+    /// keeps a 64 MiB object from costing 64 MiB to answer one 64 KiB question.
+    fn fetch_range(
+        &self,
+        id: &ContentId,
+        offset: u64,
+        length: u32,
+    ) -> Result<FetchedRange, VfsError> {
+        let bytes = self.fetch(id, 0)?;
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        let end = start.saturating_add(length as usize).min(bytes.len());
+        Ok(FetchedRange {
+            eof: end >= bytes.len(),
+            bytes: bytes[start..end].to_vec(),
+        })
+    }
 
     /// File the bytes under their own digest. Must be idempotent.
     fn put(&self, id: &ContentId, bytes: &[u8]) -> Result<Stored, VfsError>;
@@ -114,6 +144,16 @@ impl Replicas {
 
     pub fn names(&self) -> Vec<&str> {
         self.sources.iter().map(|source| source.name()).collect()
+    }
+
+    /// One source by name, so a single replica can be served or asked about
+    /// without going through the whole set.
+    #[must_use]
+    pub fn source(&self, name: &str) -> Option<Arc<dyn Replica>> {
+        self.sources
+            .iter()
+            .find(|source| source.name() == name)
+            .cloned()
     }
 
     /// Every source is asked at once and the first verified answer wins.
@@ -250,6 +290,42 @@ impl Replica for DiskReplica {
         }
     }
 
+    /// A seek and a read, so answering one range costs one range.
+    fn fetch_range(
+        &self,
+        id: &ContentId,
+        offset: u64,
+        length: u32,
+    ) -> Result<FetchedRange, VfsError> {
+        let path = self.path_for(id);
+        let mut file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(VfsError::NotHydrated(id.to_string()));
+            }
+            Err(error) => return Err(VfsError::Io(error)),
+        };
+        let total = file.metadata()?.len();
+        if offset > total {
+            return Err(VfsError::InvalidPath(format!(
+                "{} starts beyond the end of {}",
+                offset,
+                path.display()
+            )));
+        }
+        let wanted = u64::from(length).min(total - offset);
+        let mut bytes = vec![0u8; usize::try_from(wanted).unwrap_or(0)];
+        if wanted > 0 {
+            use std::io::{Read, Seek, SeekFrom};
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(&mut bytes)?;
+        }
+        Ok(FetchedRange {
+            eof: offset + wanted >= total,
+            bytes,
+        })
+    }
+
     fn put(&self, id: &ContentId, bytes: &[u8]) -> Result<Stored, VfsError> {
         if !self.writable {
             return Err(VfsError::ReadOnly);
@@ -286,11 +362,15 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReplicaSpec {
     pub name: String,
-    /// `disk` today. `kubo` and `r2` are adapters over the same trait, and a
-    /// kind this build has no adapter for is refused rather than ignored.
+    /// `disk` and `provider` today. `kubo` and `r2` are adapters that start a
+    /// provider, and a kind this build has no adapter for is refused rather than
+    /// ignored.
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
+    /// Where a `provider` replica listens, `host:port`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     #[serde(default)]
     pub read_only: bool,
 }
@@ -369,10 +449,22 @@ impl ReplicaConfig {
                         Arc::new(disk)
                     }
                 }
+                "provider" => {
+                    let endpoint = spec.endpoint.clone().ok_or_else(|| {
+                        VfsError::Config(format!(
+                            "replica {:?} is a provider and needs an endpoint",
+                            spec.name
+                        ))
+                    })?;
+                    // Introduced before it is trusted: a provider that is not
+                    // answering is a configuration error now, not a backup that
+                    // has been failing quietly.
+                    Arc::new(ProviderReplica::connect(&endpoint)?)
+                }
                 other => {
                     return Err(VfsError::Config(format!(
                         "replica {:?} is kind {other:?}, which this build has no adapter for \
-                         (disk is built in)",
+                         (disk and provider are built in)",
                         spec.name
                     )));
                 }
@@ -441,6 +533,7 @@ mod tests {
             name: name.to_owned(),
             kind: "disk".to_owned(),
             path: Some(root.to_path_buf()),
+            endpoint: None,
             read_only,
         }
     }
@@ -593,6 +686,7 @@ mod tests {
                 name: "cold".to_owned(),
                 kind: "r2".to_owned(),
                 path: None,
+                endpoint: None,
                 read_only: false,
             }],
         };

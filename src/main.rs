@@ -284,6 +284,13 @@ enum Command {
         /// Where a `disk` replica keeps its objects.
         #[arg(long)]
         path: Option<PathBuf>,
+        /// Where a `provider` replica listens, `host:port`. For `serve`, where to
+        /// listen.
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// `replica serve`: the address to serve on.
+        #[arg(long)]
+        listen: Option<String>,
         /// Read from this replica, never write to it.
         #[arg(long)]
         read_only: bool,
@@ -759,6 +766,8 @@ fn run() -> anyhow::Result<()> {
             name,
             kind,
             path,
+            endpoint,
+            listen,
             read_only,
             prefix,
             dry_run,
@@ -771,6 +780,7 @@ fn run() -> anyhow::Result<()> {
                     name: name.clone(),
                     kind: kind.clone(),
                     path,
+                    endpoint,
                     read_only,
                 });
                 // Built before it is saved: a replica this build cannot reach is
@@ -872,7 +882,28 @@ fn run() -> anyhow::Result<()> {
                     })
                 );
             }
-            other => anyhow::bail!("replica mode must be add, list, remove or push, not {other}"),
+            "serve" => {
+                // One replica, served to whoever can reach the address. This is how a
+                // RAID shelf or a peer's store becomes a replica on another machine
+                // without either side learning a new protocol.
+                let name = name.ok_or_else(|| anyhow::anyhow!("replica serve needs --name"))?;
+                let listen = listen.unwrap_or_else(|| "127.0.0.1:7200".to_owned());
+                let config = ReplicaConfig::load(&cli.root)?;
+                let replicas = config.build()?;
+                let source = replicas
+                    .source(&name)
+                    .ok_or_else(|| anyhow::anyhow!("no replica named {name}"))?;
+                let server = fungos_vfs::ProviderServer::bind(listen.as_str())?;
+                eprintln!(
+                    "fungos-vfs: serving {name} on {} ({} bytes per range)",
+                    server.local_addr()?,
+                    fungos_vfs::MAX_RANGE_BYTES
+                );
+                server.serve(&*source)?;
+            }
+            other => {
+                anyhow::bail!("replica mode must be add, list, remove, push or serve, not {other}")
+            }
         },
         Command::Fetch {
             path,

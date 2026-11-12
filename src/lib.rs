@@ -12,6 +12,7 @@ mod path;
 mod piece;
 mod policy;
 mod project;
+mod provider;
 mod quic;
 mod replica;
 mod store;
@@ -32,10 +33,14 @@ pub use path::normalize_path;
 pub use piece::{Have, Manifest, PIECE_SIZE, Piece, PieceError, PieceSource, empty_have, fetch};
 pub use policy::{PathClass, PathPolicy};
 pub use project::{ProjectReport, WorktreeRef, attach as attach_project, list as list_projects};
+pub use provider::{
+    MAX_PROVIDER_FRAME, PROVIDER_VERSION, ProviderReplica, ProviderReply, ProviderRequest,
+    ProviderServer,
+};
 pub use quic::{SyncServer, pull_over_quic};
 pub use replica::{
-    DiskReplica, Fetched, Hydrated, Replica, ReplicaConfig, ReplicaSpec, Replicas, Replicated,
-    Stored, config_path as replica_config_path,
+    DiskReplica, Fetched, FetchedRange, Hydrated, Replica, ReplicaConfig, ReplicaSpec, Replicas,
+    Replicated, Stored, config_path as replica_config_path,
 };
 pub use stream::{MAX_FRAME, PullClient, Resume, STREAM_VERSION, SnapshotHeader, StreamRequest};
 pub use sync::{

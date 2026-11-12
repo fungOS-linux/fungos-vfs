@@ -1,0 +1,23 @@
+[package]
+name = "fungos-vfs-r2"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "GPL-3.0-or-later"
+description = "S3/R2 content replica for fungOS VFS"
+repository = "https://github.com/fungOS-linux/fungos-vfs"
+
+[dependencies]
+fungos-vfs = { path = "../.." }
+clap = { version = "4", features = ["derive"] }
+# `ring` is already in the tree through rustls: SigV4 is SHA-256 and HMAC-SHA256,
+# and both are there rather than in a second crypto dependency.
+ring = "0.17"
+reqwest = { version = "0.13", default-features = false, features = [
+    "blocking",
+    "rustls",
+] }
+
+[[bin]]
+name = "fungos-vfs-r2-provider"
+path = "src/bin/fungos-vfs-r2-provider.rs"
