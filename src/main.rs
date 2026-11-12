@@ -1,11 +1,16 @@
-use std::{fs, io::Write, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    io::Write,
+    path::PathBuf,
+};
 
 use clap::{Parser, Subcommand};
 use fungos_vfs::{
-    ApplyOutcome, CheckoutOptions, ContentId, Expect, NodeRole, PathPolicy, RecordOptions,
-    SourceMode, SyncServer, Vfs, attach_project, checkout, export_dir, ingest_dir_with_policy,
-    list_projects, materialize, migrate_storage_with_cas, pull_over_quic, pull_over_ssh, record,
-    worktree_changes, worktrees,
+    ApplyOutcome, CheckoutOptions, ContentId, Expect, Hydration, NodeRole, PathPolicy,
+    RecordOptions, ReplicaConfig, ReplicaSpec, SourceMode, SyncServer, Vfs, attach_project,
+    checkout, export_dir, ingest_dir_with_policy, list_projects, materialize,
+    migrate_storage_with_cas, pull_over_quic, pull_over_ssh, record, worktree_changes, worktrees,
 };
 
 #[derive(Parser)]
@@ -264,6 +269,44 @@ enum Command {
         max_bytes: Option<u64>,
         #[arg(long)]
         json: bool,
+    },
+    /// Where content is replicated besides this machine: disks, and adapters
+    /// over the same trait for buckets and nodes.
+    Replica {
+        /// `add`, `list`, `remove`, or `push`.
+        mode: String,
+        /// The replica's name, for `add` and `remove`.
+        #[arg(long)]
+        name: Option<String>,
+        /// What kind it is. `disk` is built in.
+        #[arg(long, default_value = "disk")]
+        kind: String,
+        /// Where a `disk` replica keeps its objects.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Read from this replica, never write to it.
+        #[arg(long)]
+        read_only: bool,
+        /// Only the prefix to push.
+        #[arg(long, default_value = "")]
+        prefix: String,
+        /// Report what `push` would upload, and upload nothing.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fill placeholders from the configured replicas.
+    Fetch {
+        /// One namespace path.
+        #[arg(long)]
+        path: Option<String>,
+        /// Every placeholder under this prefix.
+        #[arg(long, default_value = "")]
+        prefix: String,
+        /// Name what is missing without fetching it.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -711,6 +754,179 @@ fn run() -> anyhow::Result<()> {
             }
             other => anyhow::bail!("cache mode must be put, ls, pin, unpin or evict, not {other}"),
         },
+        Command::Replica {
+            mode,
+            name,
+            kind,
+            path,
+            read_only,
+            prefix,
+            dry_run,
+            json,
+        } => match mode.as_str() {
+            "add" => {
+                let name = name.ok_or_else(|| anyhow::anyhow!("replica add needs --name"))?;
+                let mut config = ReplicaConfig::load(&cli.root)?;
+                config.upsert(ReplicaSpec {
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    path,
+                    read_only,
+                });
+                // Built before it is saved: a replica this build cannot reach is
+                // a typo to fix now, not a backup that has been failing for a week.
+                let replicas = config.build()?;
+                config.save(&cli.root)?;
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "added": name,
+                        "kind": kind,
+                        "replicas": replicas.names(),
+                        "config": fungos_vfs::replica_config_path(&cli.root).display().to_string(),
+                    })
+                );
+            }
+            "list" => {
+                let config = ReplicaConfig::load(&cli.root)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&config.replicas)?);
+                } else if config.replicas.is_empty() {
+                    println!("no replicas; `replica add --name <name> --path <dir>` starts one");
+                } else {
+                    for spec in &config.replicas {
+                        println!(
+                            "{}\t{}\t{}{}",
+                            spec.name,
+                            spec.kind,
+                            spec.path
+                                .as_ref()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_default(),
+                            if spec.read_only { "\t(read-only)" } else { "" }
+                        );
+                    }
+                }
+            }
+            "remove" => {
+                let name = name.ok_or_else(|| anyhow::anyhow!("replica remove needs --name"))?;
+                let mut config = ReplicaConfig::load(&cli.root)?;
+                if !config.remove(&name) {
+                    anyhow::bail!("no replica named {name}");
+                }
+                config.save(&cli.root)?;
+                println!("{}", serde_json::json!({ "removed": name }));
+            }
+            "push" => {
+                let config = ReplicaConfig::load(&cli.root)?;
+                let replicas = config.build()?;
+                if replicas.is_empty() {
+                    anyhow::bail!("no replicas configured; nothing to push to");
+                }
+                // Pushed by content id, not by path: the same bytes live under
+                // many paths, and a namespace entry is a name for content, not
+                // the content itself.
+                let mut seen: BTreeSet<String> = BTreeSet::new();
+                let mut ids: Vec<ContentId> = Vec::new();
+                for entry in vfs.list(&prefix)? {
+                    if entry.hydration != Hydration::Present {
+                        continue;
+                    }
+                    if seen.insert(entry.content_id.to_string()) {
+                        ids.push(entry.content_id);
+                    }
+                }
+                let mut outcomes: Vec<serde_json::Value> = Vec::new();
+                let mut added = 0;
+                let mut already = 0;
+                let mut failed = 0;
+                for id in &ids {
+                    if dry_run {
+                        outcomes.push(serde_json::json!({
+                            "content_id": id.to_string(),
+                            "outcome": "would-push",
+                        }));
+                        continue;
+                    }
+                    let bytes = vfs.content(id)?;
+                    for outcome in replicas.put_all(id, &bytes) {
+                        match outcome.outcome {
+                            "added" => added += 1,
+                            "already" => already += 1,
+                            "failed" => failed += 1,
+                            _ => {}
+                        }
+                        outcomes.push(serde_json::to_value(&outcome)?);
+                    }
+                }
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "replicas": replicas.names(),
+                        "content_ids": ids.len(),
+                        "added": added,
+                        "already": already,
+                        "failed": failed,
+                        "dry_run": dry_run,
+                        "outcomes": outcomes,
+                    })
+                );
+            }
+            other => anyhow::bail!("replica mode must be add, list, remove or push, not {other}"),
+        },
+        Command::Fetch {
+            path,
+            prefix,
+            dry_run,
+        } => {
+            let config = ReplicaConfig::load(&cli.root)?;
+            let replicas = config.build()?;
+            match path {
+                Some(path) => {
+                    if dry_run {
+                        let entry = vfs
+                            .file(&path)?
+                            .ok_or_else(|| anyhow::anyhow!("no such path: {path}"))?;
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "path": entry.path,
+                                "content_id": entry.content_id.to_string(),
+                                "hydration": format!("{:?}", entry.hydration),
+                                "replicas": replicas.names(),
+                            })
+                        );
+                    } else {
+                        let hydrated = vfs.hydrate_from_replicas(&path, &replicas)?;
+                        println!("{}", serde_json::to_string_pretty(&hydrated)?);
+                    }
+                }
+                None => {
+                    let missing = vfs.placeholders(&prefix)?;
+                    let mut hydrated = 0;
+                    let mut bytes = 0usize;
+                    let mut sources: BTreeMap<String, usize> = BTreeMap::new();
+                    if !dry_run {
+                        for (path, _, _) in &missing {
+                            let done = vfs.hydrate_from_replicas(path, &replicas)?;
+                            hydrated += 1;
+                            bytes += done.size;
+                            *sources.entry(done.source).or_default() += 1;
+                        }
+                    }
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "placeholders": missing.len(),
+                            "hydrated": hydrated,
+                            "bytes": bytes,
+                            "sources": sources,
+                            "dry_run": dry_run,
+                        })
+                    );
+                }
+            }
+        }
         // Handled before the store is opened, above.
         Command::Migrate => unreachable!(),
     }

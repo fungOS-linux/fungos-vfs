@@ -462,6 +462,56 @@ there the bytes are already in the git tree. *Source* is what attaching is for.
 The cache is for the thing that produces build output, which is the builder: it
 knows the ceiling and files ``PathClass::Cache`` entries itself.
 
+## Replicas
+
+A backup is a copy of content, not a copy of history, and that distinction is why
+this is safe where a peer push is not. Content is immutable and named by its own
+digest: a copy is a copy, `put` is idempotent, there is no order to agree on, and a
+source that is down is a source to skip rather than a conflict to resolve. Ops have
+an order; content does not.
+
+```sh
+fungos-vfs --root ~/fungos replica add --name shelf --path /Volumes/RAID/fungos
+fungos-vfs --root ~/fungos replica add --name peer  --path ~/mnt/neo/fungos --read-only
+fungos-vfs --root ~/fungos replica list
+fungos-vfs --root ~/fungos replica push            # everything present, by content id
+fungos-vfs --root ~/fungos replica push --dry-run
+```
+
+The list lives in `<root>/.fungos/replicas.json`, device-local on purpose: a RAID
+path is not a fact that travels with a namespace, and a bucket is reached with this
+machine's credentials.
+
+Three properties are load-bearing:
+
+- **Every byte is checked.** A replica that hands back the wrong block is worse
+  than one that is down, because the byte is about to become a file. The digest is
+  verified on read; a mismatch fails and names the file it was found in.
+- **Reads race, writes mirror.** Every source is asked at once and the first
+  verified answer wins, so four slow replicas add up to one fast one rather than
+  the sum of their latencies. `push` writes everywhere it can and reports each
+  outcome separately.
+- **A source that fails says which one it was.** A failure report that only counts
+  is a backup you cannot audit.
+
+```sh
+fungos-vfs --root ~/fungos fetch                     # every placeholder
+fungos-vfs --root ~/fungos fetch --path docs/plan.md # one file, from any replica
+fungos-vfs --root ~/fungos fetch --dry-run           # what is missing
+```
+
+**Kinds.** `disk` is built in, and a disk replica is also a network export, a RAID
+shelf, or another machine's store directory — the layout is the local store's own
+(`<root>/<first two hex>/<hex>`), because a mirror that sorts its objects
+differently is a second format to debug at the worst moment. `kubo` and `r2` are
+adapters over the same `Replica` trait, and a kind this build has no adapter for is
+refused by name at `replica add` time rather than ignored until the day you need
+it.
+
+What it deliberately does not do: **no push of ops.** Replication here moves
+immutable content and nothing else, which is why it needs no merge policy. Moving
+the log is `sync pull`, and it stays pull.
+
 ## Pieces
 
 A blob is fetched in pieces, from any source that has them — the one idea worth
