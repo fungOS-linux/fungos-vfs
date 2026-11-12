@@ -660,6 +660,49 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_that_fanned_out_projects_every_call() {
+        // Pi answers one assistant message with several calls and then files one
+        // result per call. A record that kept one call lost the rest, and every
+        // extra result arrived with nothing to answer.
+        let (temp, mut vfs) = store();
+        let mut session = session(&mut vfs);
+        let second_args = vfs.put_blob(br#"{"path":"SECURITY.md"}"#).unwrap();
+        let second_result = vfs.put_blob(b"read the other one").unwrap();
+        let first = session.turns[2].tools.remove(0);
+        session.turns[2].tools = vec![
+            first,
+            ToolCall {
+                name: "read".to_owned(),
+                arguments: second_args,
+                result: Some(second_result.clone()),
+                failed: false,
+            },
+        ];
+        let mut second = session.turns[3].clone();
+        second.text = Some(second_result.clone());
+        second.index = 4;
+        second.tools.clear();
+        session.turns.push(second);
+
+        let projection =
+            to_operator(&vfs, &session, &temp.path().join("runs"), None, false).unwrap();
+        assert!(
+            projection.report.skipped.is_empty(),
+            "no result is orphaned"
+        );
+
+        let lines = lines(&projection.path);
+        let calls = &lines[3]["tool_calls"];
+        assert_eq!(calls.as_array().unwrap().len(), 2);
+        assert_eq!(calls[0]["id"], "call-2-0");
+        assert_eq!(calls[1]["id"], "call-2-1");
+        assert_eq!(calls[1]["args"]["path"], "SECURITY.md");
+        assert_eq!(lines[4]["tool_call_id"], "call-2-0");
+        assert_eq!(lines[5]["tool_call_id"], "call-2-1");
+        assert_eq!(lines[5]["tool_name"], "read");
+    }
+
+    #[test]
     fn a_result_with_nothing_to_say_still_names_its_call() {
         // Pi files no payload for a command that printed nothing, so the result
         // cannot be matched by digest. Dropping its linkage would leave a
