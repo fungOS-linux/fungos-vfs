@@ -5,6 +5,7 @@
 //! pull-through cache. Distributed transport is deliberately outside this crate.
 
 mod bus;
+mod carry;
 mod cid;
 mod content;
 mod hydrate;
@@ -26,6 +27,7 @@ pub use bus::{
     CONTENT_AVAILABLE_KIND, CONTENT_DATA_KIND, CONTENT_ERROR_KIND, CONTENT_FETCH_KIND,
     ContentAvailable, ContentData, ContentError, ContentFetch, MAX_CONTENT_BYTES, MAX_RANGE_BYTES,
 };
+pub use carry::{CARRY_REF, Carried, ensure_commit as ensure_carried_commit};
 pub use cid::{CODEC_DAG_CBOR, CODEC_RAW, cid_bytes, cid_string, content_id_to_cid};
 pub use content::ContentId;
 pub use hydrate::Hydrator;

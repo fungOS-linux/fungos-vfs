@@ -111,6 +111,10 @@ pub struct MaterializeReport {
     /// Paths the recording knows are absent and removed after the checkout.
     pub removed: usize,
     pub bytes: u64,
+    /// Bytes of carried commit fetched in first, when this repository had never
+    /// seen the base.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carried_bytes: Option<u64>,
 }
 
 /// How one `record` behaves.
@@ -120,6 +124,9 @@ pub struct RecordOptions {
     /// should say which process it is rather than which human.
     pub owner: String,
     pub lease_ms: u64,
+    /// Carry the commit no remote has, as a bundle, so the far side can be a
+    /// checkout rather than a directory of files.
+    pub carry: bool,
 }
 
 impl RecordOptions {
@@ -128,6 +135,7 @@ impl RecordOptions {
         Self {
             owner: format!("{actor}:{}", std::process::id()),
             lease_ms: DEFAULT_LEASE_MS,
+            carry: true,
         }
     }
 }
@@ -147,6 +155,13 @@ pub struct CheckoutReport {
     /// Were the base commit's version, so laying the in-between over them is not
     /// a loss.
     pub replaced: usize,
+    /// Bytes of carried commit fetched into this repository first, when it had
+    /// never seen the base.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carried_bytes: Option<u64>,
+    /// The commit the checkout was moved to, when it was standing somewhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moved_to: Option<String>,
 }
 
 /// What `worktree prune` found, and what it did about it.
@@ -188,6 +203,10 @@ pub struct CheckoutOptions {
     pub commit: Option<String>,
     /// Write over files that are neither the recorded content nor the base's.
     pub force: bool,
+    /// Move the checkout to the recording's base when it is standing somewhere
+    /// else. On by default: a handoff that leaves the checkout on another commit
+    /// has delivered files, not a checkout.
+    pub to_base: bool,
     pub owner: String,
     pub lease_ms: u64,
 }
@@ -220,6 +239,18 @@ pub struct RecordReport {
     pub hashed_bytes: u64,
     /// Bytes newly filed in the content store, so `0` for a repeat record.
     pub written_bytes: u64,
+    /// The commit carried with this recording, when no remote had it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carried: Option<CarriedReport>,
+}
+
+/// A commit that only this machine had, carried as a bundle so the far side can
+/// check the worktree out at all.
+#[derive(Clone, Debug, Serialize)]
+pub struct CarriedReport {
+    pub commit: String,
+    pub content_id: String,
+    pub bytes: u64,
 }
 
 /// One page of the change feed, relative to the worktree's own root.
@@ -492,6 +523,20 @@ pub fn materialize(
             dest.display()
         );
     }
+    // The commit may have travelled with the recording: a thread's shallow clone
+    // can hold commits no remote has. Bring it in before resolving the tree it
+    // names, and only when the project is the one that has to supply it — a commit
+    // read out of the checkout is already in the checkout.
+    let carried_bytes = if checked_out.is_none() {
+        let wanted = match &requested {
+            Some(want) => want.clone(),
+            None => git(&root, &["rev-parse", "HEAD"])?.trim().to_string(),
+        };
+        crate::carry::ensure_commit(vfs, &namespace, &root, &wanted)?
+    } else {
+        None
+    };
+
     let (commit, tree) = match (&checked_out, &requested) {
         (Some(on), _) => {
             let tree = git(dest, &["rev-parse", &format!("{on}^{{tree}}")])?
@@ -522,6 +567,7 @@ pub fn materialize(
         tree: tree.clone(),
         ..MaterializeReport::default()
     };
+    report.carried_bytes = carried_bytes;
 
     if present && !empty && existing.is_none() {
         // A checkout somebody already has is the common case: a worktree exists
@@ -641,20 +687,47 @@ pub fn checkout(vfs: &mut Vfs, options: &CheckoutOptions) -> Result<CheckoutRepo
     let record: serde_json::Value = serde_json::from_slice(&bytes)?;
     let namespace = recorded_namespace(&record, &project, &options.name, &options.prefix)?;
 
-    let head = git(path, &["rev-parse", "HEAD"])?.trim().to_string();
     let base = match &options.commit {
         Some(commit) => git(path, &["rev-parse", &format!("{commit}^{{commit}}")])?
             .trim()
             .to_string(),
         None => recorded_head(&record, &namespace)?,
     };
+    // The base may be a commit this machine has never seen: a thread's shallow
+    // clone can hold commits no remote has, and a recording carries them as a
+    // bundle. Fetch it before asking questions about files, because until it is
+    // here the branch comparison below is a comparison with nothing.
+    let carried_bytes =
+        crate::carry::ensure_commit(vfs, &namespace, path, &base).with_context(|| {
+            format!(
+                "making the recording's base {base} available in {}",
+                path.display()
+            )
+        })?;
+
+    let head = git(path, &["rev-parse", "HEAD"])?.trim().to_string();
+    let mut moved_to = None;
     if head != base && options.commit.is_none() {
-        bail!(
-            "{} is checked out at {head}, and the recording is based on {base}; \
-             check out the recording's base first, or pass --commit {head} to lay \
-             it over what is there",
-            path.display()
-        );
+        if options.to_base {
+            // Standing the checkout on the recording's commit is what makes this a
+            // real checkout rather than a diff applied to whatever was there. A
+            // dirty checkout makes `git checkout` refuse, which is the correct
+            // answer: the work in it is somebody's, and it is not ours to drop.
+            git(path, &["checkout", "--quiet", "--detach", &base]).with_context(|| {
+                format!(
+                    "moving {} to the recording's base {base}; commit or stash what is there first",
+                    path.display()
+                )
+            })?;
+            moved_to = Some(base.clone());
+        } else {
+            bail!(
+                "{} is checked out at {head}, and the recording is based on {base}; \
+                 check out the recording's base first, pass --commit {head} to lay \
+                 it over what is there, or drop --stay to let it move",
+                path.display()
+            );
+        }
     }
 
     // The same lease a record takes: a checkout writes the working tree, and a
@@ -662,8 +735,10 @@ pub fn checkout(vfs: &mut Vfs, options: &CheckoutOptions) -> Result<CheckoutRepo
     vfs.lease(&namespace, &options.owner, options.lease_ms)?;
     let outcome = checkout_leased(vfs, options, &namespace, &base);
     let released = vfs.release(&namespace, &options.owner);
-    let report = outcome?;
+    let mut report = outcome?;
     released?;
+    report.carried_bytes = carried_bytes;
+    report.moved_to = moved_to;
     Ok(report)
 }
 
@@ -1042,6 +1117,25 @@ fn record_leased(
     }
     apply_journal(vfs, known, &rows, options, &mut report)?;
     report.base_advanced_to = advance(vfs, known, &rows)?;
+
+    // Whatever commit the recording is now addressed by may exist nowhere else: a
+    // thread works in a shallow clone, and a commit made there is on no remote. If
+    // nobody else has it, it travels with the recording — otherwise the far side
+    // receives a diff against a commit it cannot obtain.
+    if options.carry {
+        let at = report
+            .base_advanced_to
+            .clone()
+            .unwrap_or_else(|| report.base_commit.clone());
+        if let Some(carried) = crate::carry::carry(vfs, &known.prefix, Path::new(&known.path), &at)?
+        {
+            report.carried = Some(CarriedReport {
+                commit: carried.commit,
+                content_id: carried.content_id.to_string(),
+                bytes: carried.bytes,
+            });
+        }
+    }
     Ok(report)
 }
 
@@ -1951,6 +2045,206 @@ mod tests {
         assert_eq!(worktrees(&vfs).unwrap().len(), 1, "the row stays with it");
     }
 
+    /// A thread clone exactly as Delta gives one out: a clone of the project, and
+    /// a worktree of it where the work happens.
+    fn thread_clone(base: &Path, origin: &Path, shallow: bool) -> (PathBuf, PathBuf) {
+        let thread = base.join("thread");
+        let source = if shallow {
+            format!("file://{}", origin.display())
+        } else {
+            origin.to_string_lossy().into_owned()
+        };
+        let destination = thread.to_string_lossy().into_owned();
+        let mut args = vec!["clone", "-q"];
+        if shallow {
+            args.push("--depth");
+            args.push("1");
+        }
+        args.push(source.as_str());
+        args.push(destination.as_str());
+        crate::project::git(base, &args).unwrap();
+        let wt = base.join("thread-wt");
+        crate::project::git(
+            &thread,
+            &["worktree", "add", "-q", "-b", "work", &wt.to_string_lossy()],
+        )
+        .unwrap();
+        (thread, wt)
+    }
+
+    fn head_of(repo: &Path) -> String {
+        crate::project::git(repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn a_commit_no_remote_has_travels_with_the_recording() {
+        let base = scratch("carry-commit");
+        let (origin, _) = repository(&base, 3);
+        let (thread, wt) = thread_clone(&base, &origin, false);
+        let mut vfs = open_vfs(&base);
+        materialize(&mut vfs, &thread, "wt", &wt, None, "projects").unwrap();
+
+        // A commit that exists in this clone and on no remote, which is the whole
+        // reason a recording cannot rely on the far side fetching it.
+        write(&wt.join("src/f000.txt"), &body(0, " (thread only)"));
+        commit_all(&wt, "thread only");
+        let commit = head_of(&wt);
+
+        let recorded = record(&mut vfs, "wt", &RecordOptions::new("agent")).unwrap();
+        let carried = recorded
+            .carried
+            .as_ref()
+            .unwrap_or_else(|| panic!("the commit travels with the recording: {recorded:#?}"));
+        assert_eq!(carried.commit, commit);
+        assert!(
+            carried.bytes > 0,
+            "an empty bundle is the shallow-clone trap"
+        );
+        assert!(
+            vfs.file(&crate::carry::key_for(&recorded.prefix, &commit))
+                .unwrap()
+                .is_some(),
+            "the bundle is in the namespace, so sync carries it"
+        );
+
+        // The far side: a fresh clone that has never seen the thread's commit.
+        let far = base.join("far");
+        crate::project::git(
+            &base,
+            &[
+                "clone",
+                "-q",
+                origin.to_string_lossy().as_ref(),
+                far.to_string_lossy().as_ref(),
+            ],
+        )
+        .unwrap();
+        assert!(crate::project::git(&far, &["cat-file", "-e", &commit]).is_err());
+        crate::project::attach(&mut vfs, &thread, None, "projects", false).unwrap();
+
+        let report = checkout(
+            &mut vfs,
+            &CheckoutOptions {
+                name: "wt".to_owned(),
+                path: far.clone(),
+                project: Some("thread".to_owned()),
+                prefix: "projects".to_owned(),
+                commit: None,
+                force: false,
+                to_base: true,
+                owner: "agent:1".to_owned(),
+                lease_ms: DEFAULT_LEASE_MS,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.moved_to.as_deref(), Some(commit.as_str()));
+        assert!(report.carried_bytes.unwrap_or(0) > 0);
+        assert_eq!(head_of(&far), commit, "the far side is a real checkout");
+        assert_eq!(
+            fs::read_to_string(far.join("src/f000.txt")).unwrap(),
+            body(0, " (thread only)")
+        );
+    }
+
+    #[test]
+    fn a_shallow_clone_can_still_carry_its_commit() {
+        let base = scratch("carry-shallow");
+        let (origin, _) = repository(&base, 3);
+        // Depth one, which is what a Delta thread clone is. Bundling a *range*
+        // here produces "Refusing to create empty bundle"; bundling the ref does
+        // not, and this test exists so that stays true.
+        let (thread, wt) = thread_clone(&base, &origin, true);
+        assert_eq!(
+            crate::project::git(&thread, &["rev-list", "--count", "HEAD"])
+                .unwrap()
+                .trim(),
+            "1"
+        );
+        let mut vfs = open_vfs(&base);
+        materialize(&mut vfs, &thread, "wt", &wt, None, "projects").unwrap();
+        write(&wt.join("src/f001.txt"), &body(1, " (shallow thread)"));
+        commit_all(&wt, "one commit on a shallow clone");
+
+        let recorded = record(&mut vfs, "wt", &RecordOptions::new("agent")).unwrap();
+        let carried = recorded.carried.as_ref().unwrap_or_else(|| {
+            panic!("a shallow clone must still carry its commit: {recorded:#?}")
+        });
+        assert!(carried.bytes > 0);
+    }
+
+    #[test]
+    fn a_commit_a_remote_already_has_is_not_carried() {
+        let base = scratch("carry-none");
+        let (origin, _) = repository(&base, 3);
+        let (thread, wt) = thread_clone(&base, &origin, false);
+        let mut vfs = open_vfs(&base);
+        materialize(&mut vfs, &thread, "wt", &wt, None, "projects").unwrap();
+        write(&wt.join("src/f002.txt"), &body(2, " (uncommitted)"));
+
+        // The base is the remote's own commit: the far side can fetch it from
+        // there, so a bundle would be waste.
+        let recorded = record(&mut vfs, "wt", &RecordOptions::new("agent")).unwrap();
+        assert!(recorded.carried.is_none(), "{recorded:#?}");
+        let git_entries = vfs.list("git").unwrap();
+        assert!(git_entries.is_empty(), "{git_entries:#?}");
+    }
+
+    #[test]
+    fn checkout_says_what_is_missing_when_nothing_was_carried() {
+        let base = scratch("carry-missing");
+        let (origin, _) = repository(&base, 3);
+        let (thread, wt) = thread_clone(&base, &origin, false);
+        let mut vfs = open_vfs(&base);
+        materialize(&mut vfs, &thread, "wt", &wt, None, "projects").unwrap();
+        write(&wt.join("src/f000.txt"), &body(0, " (thread only)"));
+        commit_all(&wt, "thread only");
+        let commit = head_of(&wt);
+        // Opting out of the carry is allowed; being surprised later is not.
+        let options = RecordOptions {
+            carry: false,
+            ..RecordOptions::new("agent")
+        };
+        let recorded = record(&mut vfs, "wt", &options).unwrap();
+        assert!(recorded.carried.is_none());
+
+        let far = base.join("far");
+        crate::project::git(
+            &base,
+            &[
+                "clone",
+                "-q",
+                origin.to_string_lossy().as_ref(),
+                far.to_string_lossy().as_ref(),
+            ],
+        )
+        .unwrap();
+        crate::project::attach(&mut vfs, &thread, None, "projects", false).unwrap();
+        let error = checkout(
+            &mut vfs,
+            &CheckoutOptions {
+                name: "wt".to_owned(),
+                path: far.clone(),
+                project: Some("thread".to_owned()),
+                prefix: "projects".to_owned(),
+                commit: None,
+                force: false,
+                to_base: true,
+                owner: "agent:1".to_owned(),
+                lease_ms: DEFAULT_LEASE_MS,
+            },
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains(&commit), "{message}");
+        assert!(
+            message.contains("fetch it from the machine that made it"),
+            "{message}"
+        );
+    }
+
     #[test]
     fn a_second_store_lays_the_recording_over_its_own_checkout() {
         let base = scratch("handoff");
@@ -2002,6 +2296,7 @@ mod tests {
                 prefix: "projects".to_string(),
                 commit: None,
                 force: false,
+                to_base: true,
                 owner: "agent-b:1".to_string(),
                 lease_ms: DEFAULT_LEASE_MS,
             },
@@ -2085,6 +2380,7 @@ mod tests {
                 prefix: "projects".to_string(),
                 commit: None,
                 force: false,
+                to_base: true,
                 owner: "agent-b:1".to_string(),
                 lease_ms: DEFAULT_LEASE_MS,
             },
