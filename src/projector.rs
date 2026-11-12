@@ -258,8 +258,17 @@ pub fn to_operator(
 
 /// A bundle is one file named after the session; the same record projects to the
 /// same name, so a second projection replaces rather than duplicates.
+///
+/// The start time alone is not enough to name one: two conversations can begin in
+/// the same millisecond, and the second would silently overwrite the first. The
+/// digest of the harness's own id makes the name unique and still deterministic.
 fn run_id(session: &Session) -> String {
-    format!("{:016x}-import", session.started_at_ms.max(0))
+    let digest = ContentId::from_bytes(session.native_id.as_bytes());
+    format!(
+        "{:016x}-{}-import",
+        session.started_at_ms.max(0),
+        &digest.hex()[..8]
+    )
 }
 
 /// The digest of the record, as sixteen hex digits. See the module note for why
@@ -596,6 +605,23 @@ mod tests {
             .filter_map(|entry| entry.ok())
             .collect();
         assert_eq!(bundles.len(), 1, "one session, one file");
+    }
+
+    #[test]
+    fn two_sessions_that_started_at_the_same_moment_are_two_bundles() {
+        // A millisecond is not an identity. Two Pi sessions opened together would
+        // otherwise project onto one filename, and the second would quietly win.
+        let (temp, mut vfs) = store();
+        let one = session(&mut vfs);
+        let mut two = one.clone();
+        two.native_id = "s-2".to_owned();
+        let out = temp.path().join("runs");
+
+        let first = to_operator(&vfs, &one, &out, None, false).unwrap();
+        let second = to_operator(&vfs, &two, &out, None, false).unwrap();
+        assert_ne!(first.path, second.path);
+        let bundles = fs::read_dir(&out).unwrap().filter_map(|e| e.ok()).count();
+        assert_eq!(bundles, 2);
     }
 
     #[test]
