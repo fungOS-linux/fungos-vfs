@@ -48,6 +48,9 @@ pub struct ImportReport {
     /// Files an incremental run did not open, because they had not changed since
     /// the last one. The point of the number is that a timer is not a full re-read.
     pub files_skipped: usize,
+    /// The harness ids of the sessions this run wrote. What a caller that keeps a
+    /// projection per session needs to rebuild, and nothing else.
+    pub changed: Vec<String>,
     /// Record kinds this schema has no home for, counted by kind.
     pub unnormalized: BTreeMap<String, u64>,
 }
@@ -142,6 +145,7 @@ fn import_since(
                 }
                 if vfs.put_session(&session)? {
                     report.written += 1;
+                    report.changed.push(session.native_id.clone());
                 } else {
                     report.unchanged += 1;
                 }

@@ -1027,7 +1027,27 @@ fn run() -> anyhow::Result<()> {
                 let mut projected = 0usize;
                 let mut rewritten = 0usize;
                 let mut skipped = report.unnormalized.clone();
-                for summary in vfs.sessions(Some(&harness))? {
+                let summaries = vfs.sessions(Some(&harness))?;
+                // Rebuild only what moved. A timer fires whether or not anybody
+                // wrote anything, and projecting 140 unchanged sessions costs a
+                // minute of hashing to produce 140 identical files. A runs
+                // directory that is missing bundles — first run, or somebody
+                // cleaned it — gets everything again.
+                let bundles = fs::read_dir(&out)
+                    .map(|entries| {
+                        entries
+                            .filter_map(|entry| entry.ok())
+                            .filter(|entry| {
+                                entry.path().extension().is_some_and(|ext| ext == "ndjson")
+                            })
+                            .count()
+                    })
+                    .unwrap_or_default();
+                let project_all = bundles < summaries.len();
+                for summary in &summaries {
+                    if !project_all && !report.changed.contains(&summary.native_id) {
+                        continue;
+                    }
                     let Some(session) = vfs.session(&harness, &summary.native_id)? else {
                         continue;
                     };
