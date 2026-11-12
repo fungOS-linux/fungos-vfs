@@ -19,6 +19,9 @@ repository = "https://github.com/fungOS-linux/fungos-vfs"
 
 [dependencies]
 anyhow = "1"
+# Pi writes image blocks base64-encoded; the store keeps bytes, and decoding is a
+# library's job rather than a hand-rolled one.
+base64 = "0.22"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.41", default-features = false, features = ["bundled", "cache"] }

@@ -575,6 +575,55 @@ The wire already carried ranges (`unibus.content.fetch.v1`, bounded by
 independently checkable, which is what lets the ranges come from different peers
 instead of being concatenated from one.
 
+## Sessions
+
+A conversation is evidence: what was asked, what ran, what came back, and which
+model was standing at the time. Every harness keeps that in its own shape, in its own
+place, on one machine. The point of this section is that the shape stops being the
+harness's business — an **importer** reads a native store and writes one record, and a
+**projector** renders a record into whatever the reader wants.
+
+```sh
+# Pi, from its own JSONL store, into one root
+time cargo run -- --root ~/.local/share/fungos-vfs/sessions \
+  session import --harness pi --path ~/.pi/agent/sessions
+
+cargo run -- --root ~/.local/share/fungos-vfs/sessions session list
+cargo run -- --root ~/.local/share/fungos-vfs/sessions \
+  session show --harness pi --id 01a1bdea-6672-706b-9cbb-d66eb9eb6c69
+```
+
+One record per conversation, at `sessions/<harness>/<native-id>/session.json`, and it
+holds pointers rather than prose:
+
+- **Turns reference content, they do not contain it.** Every text, thinking block,
+tool argument and tool result is filed in the content store under its own digest. The
+same prompt pasted into two sessions is stored once, a record stays tens of kilobytes
+however long the conversation was, and a turn's text is fetched with `turn_text`.
+- **`extras` is opaque, and load-bearing.** Whatever the harness has that this schema
+has no field for is carried as JSON rather than dropped, so importing never loses a
+fact and never invents one. From Pi that is the session's format version, every image
+the user pasted (the bytes, not the base64), and — per turn — the error a model
+returned and the stop reason when it was not `stop` or `toolUse`.
+- **Unnormalized is counted, not swallowed.** Pi's `custom`, `custom_message`,
+`context_edit`, `compaction` and `thinking_level_change` records have no home here.
+They are counted per kind (and per `customType`, so an autopilot state blob is not
+merged with a message shown to the user) and reported by the import. A malformed line
+is counted too, and the session around it still imports.
+- **A re-import is free.** A session is keyed by the id the harness gave it, so a
+conversation copied to a second machine or a second directory is one record, and
+payloads already in the store are not written again. A record whose bytes did not
+change is not rewritten, so it gains no version.
+
+Measured on this machine's Pi corpus: 140 sessions, 83,430 turns, 107,692 payloads,
+281.6 MiB, 11 minutes cold (I/O-bound: 108k small objects against a `synchronous=FULL`
+WAL). The second run added **no** payloads and changed nothing it did not have to.
+
+What it deliberately does not do: no ranking, no search, no transcript format. This is
+the record; rendering is somebody else's function — which is why an `operator`
+projector can read this and a Delta importer can write it without either knowing about
+the other.
+
 ## Next
 
 1. File Provider / Cloud Files adapter for a signed macOS app.

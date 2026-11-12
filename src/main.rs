@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 use fungos_vfs::{
     ApplyOutcome, CheckoutOptions, ContentId, Expect, Hydration, NodeRole, PathPolicy,
     RecordOptions, ReplicaConfig, ReplicaSpec, SourceMode, SyncServer, Vfs, attach_project,
-    checkout, export_dir, ingest_dir_with_policy, list_projects, materialize,
+    checkout, export_dir, import_pi, ingest_dir_with_policy, list_projects, materialize,
     migrate_storage_with_cas, pull_over_quic, pull_over_ssh, record, worktree_changes, worktrees,
 };
 
@@ -306,6 +306,25 @@ enum Command {
         #[arg(long, default_value = "")]
         prefix: String,
         /// Report what `push` would upload, and upload nothing.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Conversations as records: import them from a harness, list them, show one.
+    Session {
+        /// `import`, `list`, or `show`.
+        mode: String,
+        /// Which harness, for `import` (`pi`) and to filter `list`.
+        #[arg(long)]
+        harness: Option<String>,
+        /// The harness's own store, for `import`.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// The session's native id, for `show`.
+        #[arg(long)]
+        id: Option<String>,
+        /// Count what an import would write, and write nothing.
         #[arg(long)]
         dry_run: bool,
         #[arg(long)]
@@ -927,6 +946,71 @@ fn run() -> anyhow::Result<()> {
                 anyhow::bail!("replica mode must be add, list, remove, push or serve, not {other}")
             }
         },
+        Command::Session {
+            mode,
+            harness,
+            path,
+            id,
+            dry_run,
+            json,
+        } => match mode.as_str() {
+            "import" => {
+                let root = path.ok_or_else(|| anyhow::anyhow!("session import needs --path"))?;
+                let harness = harness.unwrap_or_else(|| "pi".to_owned());
+                let report = match harness.as_str() {
+                    "pi" => import_pi(&mut vfs, &root, dry_run)?,
+                    other => anyhow::bail!("no importer for {other}; this build has pi"),
+                };
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!(
+                        "{harness}: {} sessions ({} written, {} unchanged), {} turns, \
+                         {} new payloads, {:.1} MiB",
+                        report.sessions,
+                        report.written,
+                        report.unchanged,
+                        report.turns,
+                        report.blobs,
+                        report.bytes as f64 / (1024.0 * 1024.0)
+                    );
+                    for (kind, count) in &report.unnormalized {
+                        println!("  unnormalized {kind}: {count}");
+                    }
+                }
+            }
+            "list" => {
+                let sessions = vfs.sessions(harness.as_deref())?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&sessions)?);
+                } else {
+                    for session in sessions {
+                        println!(
+                            "{}\t{}\t{}\t{}\t{} turns",
+                            session.harness,
+                            session.native_id,
+                            session.name.as_deref().unwrap_or("-"),
+                            session.started_at_ms,
+                            session.turns
+                        );
+                    }
+                }
+            }
+            "show" => {
+                let harness =
+                    harness.ok_or_else(|| anyhow::anyhow!("session show needs --harness"))?;
+                let native_id = id.ok_or_else(|| anyhow::anyhow!("session show needs --id"))?;
+                let session = vfs
+                    .session(&harness, &native_id)?
+                    .ok_or_else(|| anyhow::anyhow!("no session {harness}/{native_id}"))?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&session)?);
+                } else {
+                    print_session(&vfs, &session)?;
+                }
+            }
+            other => anyhow::bail!("session mode must be import, list or show, not {other}"),
+        },
         Command::Fetch {
             path,
             prefix,
@@ -982,6 +1066,53 @@ fn run() -> anyhow::Result<()> {
         }
         // Handled before the store is opened, above.
         Command::Migrate => unreachable!(),
+    }
+    Ok(())
+}
+
+/// One session as a readable transcript.
+///
+/// This is the CLI's own rendering, not a projector: it exists so `session show`
+/// answers "what was said" without a second command, and it deliberately shows
+/// payload ids rather than an opinion about formatting.
+fn print_session(vfs: &fungos_vfs::Vfs, session: &fungos_vfs::Session) -> anyhow::Result<()> {
+    println!(
+        "{} {}{}{}",
+        session.harness,
+        session.native_id,
+        session
+            .name
+            .as_deref()
+            .map(|name| format!(" ({name})"))
+            .unwrap_or_default(),
+        session
+            .cwd
+            .as_deref()
+            .map(|cwd| format!(" in {cwd}"))
+            .unwrap_or_default(),
+    );
+    if !session.models.is_empty() {
+        println!("models: {}", session.models.join(", "));
+    }
+    for turn in &session.turns {
+        println!("\n#{} {:?}", turn.index, turn.role);
+        if let Some(text) = vfs.turn_text(turn)? {
+            println!("{text}");
+        }
+        if let Some(thinking) = &turn.thinking {
+            println!("  (thinking {thinking})");
+        }
+        if let Some(tool) = &turn.tool {
+            println!(
+                "  tool {} args {}{}",
+                tool.name,
+                tool.arguments,
+                if tool.failed { " (failed)" } else { "" }
+            );
+        }
+    }
+    for (kind, count) in &session.unnormalized {
+        println!("\nunnormalized {kind}: {count}");
     }
     Ok(())
 }
