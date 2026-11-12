@@ -10,7 +10,8 @@ use fungos_vfs::{
     ApplyOutcome, CheckoutOptions, ContentId, Expect, Hydration, NodeRole, PathPolicy,
     RecordOptions, ReplicaConfig, ReplicaSpec, SourceMode, SyncServer, Vfs, attach_project,
     checkout, export_dir, import_pi, ingest_dir_with_policy, list_projects, materialize,
-    migrate_storage_with_cas, pull_over_quic, pull_over_ssh, record, worktree_changes, worktrees,
+    migrate_storage_with_cas, pull_over_quic, pull_over_ssh, record, to_operator, worktree_changes,
+    worktrees,
 };
 
 #[derive(Parser)]
@@ -311,9 +312,10 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Conversations as records: import them from a harness, list them, show one.
+    /// Conversations as records: import them from a harness, list them, show
+    /// one, or project one into another harness's format.
     Session {
-        /// `import`, `list`, or `show`.
+        /// `import`, `list`, `show`, or `project`.
         mode: String,
         /// Which harness, for `import` (`pi`) and to filter `list`.
         #[arg(long)]
@@ -321,9 +323,21 @@ enum Command {
         /// The harness's own store, for `import`.
         #[arg(long)]
         path: Option<PathBuf>,
-        /// The session's native id, for `show`.
+        /// The session's native id, for `show` and `project`. Omit it to take
+        /// every session the harness has.
         #[arg(long)]
         id: Option<String>,
+        /// What to project into. `operator` is what this build writes.
+        #[arg(long)]
+        to: Option<String>,
+        /// Where the target keeps its transcripts, for `project`. For
+        /// `operator` that is `<workspace>/.operator/runs`.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// The workspace the projected session claims, for `project`. Defaults
+        /// to the cwd the conversation was recorded in.
+        #[arg(long)]
+        workspace: Option<String>,
         /// Count what an import would write, and write nothing.
         #[arg(long)]
         dry_run: bool,
@@ -951,6 +965,9 @@ fn run() -> anyhow::Result<()> {
             harness,
             path,
             id,
+            to,
+            out,
+            workspace,
             dry_run,
             json,
         } => match mode.as_str() {
@@ -996,6 +1013,58 @@ fn run() -> anyhow::Result<()> {
                     }
                 }
             }
+            "project" => {
+                let harness =
+                    harness.ok_or_else(|| anyhow::anyhow!("session project needs --harness"))?;
+                let out = out.ok_or_else(|| anyhow::anyhow!("session project needs --out"))?;
+                match to.as_deref().unwrap_or("operator") {
+                    "operator" => {}
+                    other => anyhow::bail!("no projector for {other}; this build writes operator"),
+                }
+                // One session by id, or every session the harness has: the point
+                // of a runs directory is a shelf of them, not a single file.
+                let sessions = match &id {
+                    Some(id) => vec![
+                        vfs.session(&harness, id)?
+                            .ok_or_else(|| anyhow::anyhow!("no session {harness}/{id}"))?,
+                    ],
+                    None => {
+                        let mut sessions = Vec::new();
+                        for summary in vfs.sessions(Some(&harness))? {
+                            if let Some(session) = vfs.session(&harness, &summary.native_id)? {
+                                sessions.push(session);
+                            }
+                        }
+                        sessions
+                    }
+                };
+                let mut projected = Vec::new();
+                for session in &sessions {
+                    let projection =
+                        to_operator(&vfs, session, &out, workspace.as_deref(), dry_run)?;
+                    if json {
+                        projected.push(serde_json::json!({
+                            "path": projection.path,
+                            "report": projection.report,
+                        }));
+                    } else {
+                        println!(
+                            "{}\t{} messages, {} attachments, {} bytes{}",
+                            projection.path.display(),
+                            projection.report.messages,
+                            projection.report.attachments,
+                            projection.report.bytes,
+                            if dry_run { " (dry run)" } else { "" }
+                        );
+                        for (reason, count) in &projection.report.skipped {
+                            println!("  skipped {reason}: {count}");
+                        }
+                    }
+                }
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&projected)?);
+                }
+            }
             "show" => {
                 let harness =
                     harness.ok_or_else(|| anyhow::anyhow!("session show needs --harness"))?;
@@ -1009,7 +1078,9 @@ fn run() -> anyhow::Result<()> {
                     print_session(&vfs, &session)?;
                 }
             }
-            other => anyhow::bail!("session mode must be import, list or show, not {other}"),
+            other => {
+                anyhow::bail!("session mode must be import, list, show or project, not {other}")
+            }
         },
         Command::Fetch {
             path,

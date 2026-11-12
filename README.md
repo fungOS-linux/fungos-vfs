@@ -624,6 +624,43 @@ the record; rendering is somebody else's function — which is why an `operator`
 projector can read this and a Delta importer can write it without either knowing about
 the other.
 
+### Projecting a record into `operator`
+
+A **projector** reads a record and writes a target's format. It never mutates the
+record and never reads a harness's native store, so the converters stay linear — N
+harnesses plus M targets — instead of quadratic.
+
+```sh
+# one session, into a workspace operator already reads
+cargo run -- --root ~/.local/share/fungos-vfs/sessions session project \
+  --harness pi --id 01a1bdea-6672-706b-9cbb-d66eb9eb6c69 \
+  --to operator --out ~/work/repo/.operator/runs
+```
+
+Omit `--id` to project every session the harness has. The output is `operator`'s run
+bundle — NDJSON, a `meta` line then one line per message — which is what its resume
+path reads back into a live transcript. Three things the mapping decides on purpose:
+
+- **`session_key` is the digest of the record, not operator's head hash.** Operator
+derives that key from the first messages it can see, and a projected bundle has no
+such history. It only affects sticky cache routing, and operator recomputes its own
+hint on every resumed turn; a guess at a hash we cannot compute would be worse than a
+key that says which record this is.
+- **`stop_reason` is `end_turn`, `status` is `done`.** A projection is a transcript
+import, not a terminal contract — reporting `incomplete` for a conversation that ended
+on another machine would let `--strict` exit codes describe an event this build never
+saw.
+- **Tool results name their call.** Operator needs a result line to say which call it
+answers, and the record stores the result on the call, so ids are synthesized
+(`call-<turn>`) and matched back by payload digest. A result nothing called is counted,
+not given an invented caller.
+
+Images become `operator-content` attachments — the bytes, base64, under a 10 MiB cap
+and a mime list the target accepts. Anything the target cannot take (an unsupported
+image type, an oversized one, unparseable tool arguments) is counted per reason, the
+same way `unnormalized` works on the import side. Projecting the same record twice
+writes the same file, so a re-run replaces rather than duplicates.
+
 ## Next
 
 1. File Provider / Cloud Files adapter for a signed macOS app.

@@ -14,6 +14,7 @@ mod pi;
 mod piece;
 mod policy;
 mod project;
+mod projector;
 mod provider;
 mod quic;
 mod replica;
@@ -38,6 +39,7 @@ pub use pi::{ImportReport, import as import_pi};
 pub use piece::{Have, Manifest, PIECE_SIZE, Piece, PieceError, PieceSource, empty_have, fetch};
 pub use policy::{PathClass, PathPolicy};
 pub use project::{ProjectReport, WorktreeRef, attach as attach_project, list as list_projects};
+pub use projector::{Projection, ProjectionReport, to_operator};
 pub use provider::{
     MAX_PROVIDER_FRAME, PROVIDER_VERSION, ProviderReplica, ProviderReply, ProviderRequest,
     ProviderServer,
