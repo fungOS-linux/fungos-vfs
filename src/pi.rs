@@ -283,7 +283,7 @@ fn read_session(
                     *unnormalized.entry("empty-message".to_owned()).or_default() += 1;
                     continue;
                 };
-                if let Some((call_id, slot)) = &turn.call {
+                for (call_id, slot) in &turn.calls {
                     calls.insert(call_id.clone(), (*slot, index));
                 }
                 if let (Some(call_id), Some(result)) = (&turn.result_of, &turn.turn.text) {
@@ -318,8 +318,8 @@ fn read_session(
     };
     session.models = models;
     for (call_id, result, failed) in results {
-        if let Some((_, index)) = calls.get(&call_id)
-            && let Some(tool) = session.turns[*index].tool.as_mut()
+        if let Some((slot, index)) = calls.get(&call_id)
+            && let Some(tool) = session.turns[*index].tools.get_mut(*slot)
         {
             tool.result = Some(result);
             tool.failed = failed || tool.failed;
@@ -334,7 +334,7 @@ fn read_session(
 /// answers.
 struct Parsed {
     turn: Turn,
-    call: Option<(String, usize)>,
+    calls: Vec<(String, usize)>,
     result_of: Option<String>,
     failed: bool,
 }
@@ -365,8 +365,10 @@ fn message_turn(
 
     let mut text = String::new();
     let mut thinking = String::new();
-    let mut tool: Option<ToolCall> = None;
-    let mut call: Option<(String, usize)> = None;
+    let mut tools: Vec<ToolCall> = Vec::new();
+    // The harness's own call ids, with the slot each one landed in, so a result
+    // that arrives later finds the call it answers — even when the turn fanned out.
+    let mut calls: Vec<(String, usize)> = Vec::new();
     let mut images: Vec<Value> = Vec::new();
 
     // A system turn carries a plain string here and its real text in `sections`;
@@ -395,11 +397,10 @@ fn message_turn(
                 let arguments = block.get("arguments").cloned().unwrap_or(Value::Null);
                 let bytes = serde_json::to_vec(&arguments)?;
                 let id = filing.file(vfs, &bytes, dry_run)?;
-                call = block
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(|call_id| (call_id.to_owned(), index as usize));
-                tool = Some(ToolCall {
+                if let Some(call_id) = block.get("id").and_then(Value::as_str) {
+                    calls.push((call_id.to_owned(), tools.len()));
+                }
+                tools.push(ToolCall {
                     name: name.to_owned(),
                     arguments: id,
                     result: None,
@@ -466,7 +467,7 @@ fn message_turn(
     {
         extras.insert("stopReason".to_owned(), Value::from(stop));
     }
-    if text.is_empty() && thinking.is_empty() && tool.is_none() && extras.is_empty() {
+    if text.is_empty() && thinking.is_empty() && tools.is_empty() && extras.is_empty() {
         return Ok(None);
     }
     let extras = if extras.is_empty() {
@@ -491,12 +492,12 @@ fn message_turn(
                 .map(ToOwned::to_owned),
             text: text_id,
             thinking: thinking_id,
-            tool,
+            tools,
             usage,
             model,
             extras,
         },
-        call,
+        calls,
         result_of,
         failed,
     }))
@@ -736,7 +737,7 @@ mod tests {
         assert_eq!(assistant.model.as_deref(), Some("fpl/coder"));
         assert_eq!(assistant.usage.input, 10);
         assert_eq!(assistant.usage.reasoning, 5);
-        let tool = assistant.tool.as_ref().unwrap();
+        let tool = assistant.tools.first().unwrap();
         assert_eq!(tool.name, "read");
         assert_eq!(
             vfs.content(&tool.arguments).unwrap(),
@@ -752,7 +753,7 @@ mod tests {
         assert!(tool.failed);
 
         assert_eq!(session.turns[3].role, Role::Tool);
-        assert!(session.turns[3].tool.is_none());
+        assert!(session.turns[3].tools.is_empty());
         assert_eq!(session.turns[3].parent.as_deref(), Some("e5"));
     }
 

@@ -81,19 +81,21 @@ pub fn to_operator(
     let mut lines: Vec<Value> = Vec::new();
 
     // Two ways a result finds its call. By digest when the record attached the
-    // result to the call, which is the common case. Otherwise by position, in call
-    // order: an empty result files no payload to match against, and Pi's commands
-    // that printed nothing are still results — a transcript that drops their
-    // linkage is one a provider will reject.
-    let mut by_digest: BTreeMap<ContentId, (String, String)> = BTreeMap::new();
+    // result to the call, which is the common case — a queue per digest, because
+    // the same output twice is two results that happen to read alike. Otherwise
+    // by position, in call order: an empty result files no payload to match
+    // against, and Pi's commands that printed nothing are still results.
+    let mut by_digest: BTreeMap<ContentId, VecDeque<(String, String)>> = BTreeMap::new();
     let mut unanswered: VecDeque<(String, String)> = VecDeque::new();
     for turn in &session.turns {
-        let Some(tool) = &turn.tool else { continue };
-        match &tool.result {
-            Some(result) => {
-                by_digest.insert(result.clone(), (call_id(turn), tool.name.clone()));
+        for (slot, tool) in turn.tools.iter().enumerate() {
+            match &tool.result {
+                Some(result) => by_digest
+                    .entry(result.clone())
+                    .or_default()
+                    .push_back((call_id(turn, slot), tool.name.clone())),
+                None => unanswered.push_back((call_id(turn, slot), tool.name.clone())),
             }
-            None => unanswered.push_back((call_id(turn), tool.name.clone())),
         }
     }
 
@@ -137,23 +139,32 @@ pub fn to_operator(
                 line.insert("role".into(), json!("assistant"));
                 line.insert(
                     "kind".into(),
-                    json!(if turn.tool.is_some() {
-                        "tool_call"
-                    } else {
+                    json!(if turn.tools.is_empty() {
                         "message"
+                    } else {
+                        "tool_call"
                     }),
                 );
                 insert_content(vfs, &mut line, turn.text.as_ref(), "content")?;
                 insert_content(vfs, &mut line, turn.thinking.as_ref(), "reasoning")?;
-                if let Some(tool) = &turn.tool {
-                    let args = arguments(vfs, tool, &mut report)?;
-                    let id = call_id(turn);
-                    line.insert("tool_name".into(), json!(tool.name));
-                    line.insert("tool_args".into(), args.clone());
-                    line.insert(
-                        "tool_calls".into(),
-                        json!([{ "id": id, "name": tool.name, "args": args }]),
-                    );
+                if !turn.tools.is_empty() {
+                    // A turn may fan out. Operator's own bundles already carry a
+                    // list here, and a resumed transcript needs every call in it:
+                    // one dropped call means one result with nowhere to go.
+                    let mut calls = Vec::new();
+                    for (slot, tool) in turn.tools.iter().enumerate() {
+                        let args = arguments(vfs, tool, &mut report)?;
+                        if slot == 0 {
+                            line.insert("tool_name".into(), json!(tool.name));
+                            line.insert("tool_args".into(), args.clone());
+                        }
+                        calls.push(json!({
+                            "id": call_id(turn, slot),
+                            "name": tool.name,
+                            "args": args,
+                        }));
+                    }
+                    line.insert("tool_calls".into(), Value::Array(calls));
                 }
             }
             Role::Tool => {
@@ -163,7 +174,8 @@ pub fn to_operator(
                 let found = turn
                     .text
                     .as_ref()
-                    .and_then(|id| by_digest.remove(id))
+                    .and_then(|id| by_digest.get_mut(id))
+                    .and_then(|calls| calls.pop_front())
                     .or_else(|| unanswered.pop_front());
                 match found {
                     Some((id, name)) => {
@@ -259,8 +271,8 @@ fn session_key(session: &Session) -> Result<String> {
 
 /// The call id a projected assistant turn's tool invocation gets. Synthesized
 /// because the record keys tools by turn, not by the harness's own call id.
-fn call_id(turn: &crate::Turn) -> String {
-    format!("call-{}", turn.index)
+fn call_id(turn: &crate::Turn, slot: usize) -> String {
+    format!("call-{}-{slot}", turn.index)
 }
 
 fn insert_content(
@@ -424,7 +436,7 @@ mod tests {
             parent: None,
             text: None,
             thinking: None,
-            tool: None,
+            tools: Vec::new(),
             usage: Usage::default(),
             model: None,
             extras: None,
@@ -451,12 +463,12 @@ mod tests {
                     reasoning: 5,
                 },
                 model: Some("fpl/coder".to_owned()),
-                tool: Some(ToolCall {
+                tools: vec![ToolCall {
                     name: "read".to_owned(),
                     arguments,
                     result: Some(result.clone()),
                     failed: true,
-                }),
+                }],
                 ..turn(2, 3_000, Role::Assistant)
             },
             Turn {
@@ -464,7 +476,7 @@ mod tests {
                 ..turn(3, 4_000, Role::Tool)
             },
         ];
-        turns[2].tool.as_mut().unwrap().result = Some(turns[3].text.clone().unwrap());
+        turns[2].tools[0].result = Some(turns[3].text.clone().unwrap());
 
         Session {
             harness: "pi".to_owned(),
@@ -549,7 +561,7 @@ mod tests {
         assert_eq!(assistant["kind"], "tool_call");
         assert_eq!(assistant["content"], "reading it");
         assert_eq!(assistant["reasoning"], "they want a look");
-        assert_eq!(assistant["tool_calls"][0]["id"], "call-2");
+        assert_eq!(assistant["tool_calls"][0]["id"], "call-2-0");
         assert_eq!(assistant["tool_calls"][0]["name"], "read");
         assert_eq!(assistant["tool_calls"][0]["args"]["path"], "README.md");
 
@@ -558,7 +570,7 @@ mod tests {
         let tool = &lines[4];
         assert_eq!(tool["role"], "tool");
         assert_eq!(tool["kind"], "tool_result");
-        assert_eq!(tool["tool_call_id"], "call-2");
+        assert_eq!(tool["tool_call_id"], "call-2-0");
         assert_eq!(tool["tool_name"], "read");
         assert_eq!(tool["content"], "boom");
         assert_eq!(tool["ts_ms"], 4_000, "the result keeps its own time");
@@ -592,8 +604,9 @@ mod tests {
         let mut session = session(&mut vfs);
         // A TIFF is not an image operator-content accepts, and a projector that
         // wrote it anyway would produce a bundle that fails on replay, not here.
+        let text = session.turns[0].text.clone().unwrap();
         session.turns[1].extras = Some(json!({ "images": [
-            { "mimeType": "image/tiff", "content": session.turns[0].text.clone().unwrap().to_string() }
+            { "mimeType": "image/tiff", "content": text.to_string() }
         ]}));
 
         let projection =
@@ -633,7 +646,7 @@ mod tests {
         let (temp, mut vfs) = store();
         let mut session = session(&mut vfs);
         // No call at all, and the transcript still has an answer to it.
-        session.turns[2].tool = None;
+        session.turns[2].tools.clear();
 
         let projection =
             to_operator(&vfs, &session, &temp.path().join("runs"), None, false).unwrap();
@@ -654,14 +667,14 @@ mod tests {
         // fact that remains.
         let (temp, mut vfs) = store();
         let mut session = session(&mut vfs);
-        session.turns[2].tool.as_mut().unwrap().result = None;
+        session.turns[2].tools[0].result = None;
         session.turns[3].text = None;
 
         let projection =
             to_operator(&vfs, &session, &temp.path().join("runs"), None, false).unwrap();
         assert!(projection.report.skipped.is_empty());
         let lines = lines(&projection.path);
-        assert_eq!(lines[4]["tool_call_id"], "call-2");
+        assert_eq!(lines[4]["tool_call_id"], "call-2-0");
         assert_eq!(lines[4]["tool_name"], "read");
         assert!(lines[4].get("content").is_none(), "there was no text");
     }

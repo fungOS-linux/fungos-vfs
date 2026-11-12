@@ -1229,7 +1229,7 @@ fn print_session(vfs: &fungos_vfs::Vfs, session: &fungos_vfs::Session) -> anyhow
         if let Some(thinking) = &turn.thinking {
             println!("  (thinking {thinking})");
         }
-        if let Some(tool) = &turn.tool {
+        for tool in &turn.tools {
             println!(
                 "  tool {} args {}{}",
                 tool.name,

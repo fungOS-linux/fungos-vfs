@@ -98,8 +98,12 @@ pub struct Turn {
     /// Text that was the model thinking, kept apart from what was said.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ContentId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool: Option<ToolCall>,
+    /// Every call this turn made. A list, not a slot: harnesses fan out —
+    /// Pi answers one assistant message with several `toolCall` blocks — and a
+    /// record that kept one of them would lose the others and orphan their
+    /// results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Usage::is_empty")]
     pub usage: Usage,
     #[serde(skip_serializing_if = "Option::is_none")]
