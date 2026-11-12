@@ -314,6 +314,16 @@ fn attachments(vfs: &Vfs, turn: &crate::Turn, report: &mut ProjectionReport) -> 
                 .or_default() += 1;
             continue;
         }
+        // A declared mime is a claim, not a fact. The target sniffs the bytes, so
+        // a mismatched one would pass through this projector and only fail on
+        // replay — which is exactly the failure this count exists to prevent.
+        if sniff(&bytes) != Some(mime) {
+            *report
+                .skipped
+                .entry(format!("attachment-mime-mismatch:{mime}"))
+                .or_default() += 1;
+            continue;
+        }
         out.push(json!({
             "name": format!("image-{}-{}.{extension}", turn.index, out.len()),
             "mime_type": mime,
@@ -321,6 +331,27 @@ fn attachments(vfs: &Vfs, turn: &crate::Turn, report: &mut ProjectionReport) -> 
         }));
     }
     Ok(out)
+}
+
+/// What the bytes say they are, by signature — the same set of types
+/// `operator-content` accepts.
+fn sniff(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() > 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return Some("application/pdf");
+    }
+    None
 }
 
 /// The image types `operator-content` accepts, and the extension each one earns.
@@ -346,6 +377,9 @@ mod tests {
 
     /// A store this test owns. A projector reads payloads out of the store, so a
     /// test pointed at the machine's real one would be reading somebody's data.
+    /// A PNG by its signature, which is what the target checks.
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n not really pixels";
+
     fn store() -> (tempfile::TempDir, Vfs) {
         let temp = tempfile::tempdir().unwrap();
         let cas = temp.path().join("cas");
@@ -361,7 +395,7 @@ mod tests {
         let thinking = vfs.put_blob(b"they want a look").unwrap();
         let arguments = vfs.put_blob(br#"{"path":"README.md"}"#).unwrap();
         let result = vfs.put_blob(b"boom").unwrap();
-        let image = vfs.put_blob(b"hello").unwrap();
+        let image = vfs.put_blob(PNG).unwrap();
 
         let turn = |index: u32, at_ms: i64, role: Role| Turn {
             index,
@@ -480,10 +514,10 @@ mod tests {
         assert_eq!(user["role"], "user");
         assert_eq!(user["content"], "read the readme");
         assert_eq!(user["attachments"][0]["mime_type"], "image/png");
-        assert_eq!(
-            user["attachments"][0]["data"], "aGVsbG8=",
-            "the bytes, base64"
-        );
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(user["attachments"][0]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(decoded, PNG, "the bytes, not the harness's base64");
         assert!(
             user["attachments"][0]["name"]
                 .as_str()
@@ -550,6 +584,27 @@ mod tests {
         );
         let lines = lines(&projection.path);
         assert!(lines[2].get("attachments").is_none());
+    }
+
+    #[test]
+    fn an_attachment_whose_bytes_are_not_what_they_claim_is_counted() {
+        let (temp, mut vfs) = store();
+        let mut session = session(&mut vfs);
+        let plain = vfs.put_blob(b"not a png at all").unwrap();
+        session.turns[1].extras = Some(json!({ "images": [
+            { "mimeType": "image/png", "content": plain.to_string() }
+        ]}));
+
+        let projection =
+            to_operator(&vfs, &session, &temp.path().join("runs"), None, false).unwrap();
+        assert_eq!(projection.report.attachments, 0);
+        assert_eq!(
+            projection
+                .report
+                .skipped
+                .get("attachment-mime-mismatch:image/png"),
+            Some(&1)
+        );
     }
 
     #[test]
