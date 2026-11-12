@@ -26,7 +26,7 @@
 //!   whichever `Role::Tool` turn carries the same payload.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs,
     path::{Path, PathBuf},
 };
@@ -80,14 +80,20 @@ pub fn to_operator(
     let mut report = ProjectionReport::default();
     let mut lines: Vec<Value> = Vec::new();
 
-    // Which call each result answers, keyed by the digest of the result's text:
-    // the assistant turn is the only place the call and its result meet.
-    let mut calls: BTreeMap<ContentId, (String, String)> = BTreeMap::new();
+    // Two ways a result finds its call. By digest when the record attached the
+    // result to the call, which is the common case. Otherwise by position, in call
+    // order: an empty result files no payload to match against, and Pi's commands
+    // that printed nothing are still results — a transcript that drops their
+    // linkage is one a provider will reject.
+    let mut by_digest: BTreeMap<ContentId, (String, String)> = BTreeMap::new();
+    let mut unanswered: VecDeque<(String, String)> = VecDeque::new();
     for turn in &session.turns {
-        if let Some(tool) = &turn.tool
-            && let Some(result) = &tool.result
-        {
-            calls.insert(result.clone(), (call_id(turn), tool.name.clone()));
+        let Some(tool) = &turn.tool else { continue };
+        match &tool.result {
+            Some(result) => {
+                by_digest.insert(result.clone(), (call_id(turn), tool.name.clone()));
+            }
+            None => unanswered.push_back((call_id(turn), tool.name.clone())),
         }
     }
 
@@ -154,7 +160,12 @@ pub fn to_operator(
                 line.insert("role".into(), json!("tool"));
                 line.insert("kind".into(), json!("tool_result"));
                 insert_content(vfs, &mut line, turn.text.as_ref(), "content")?;
-                match turn.text.as_ref().and_then(|id| calls.get(id)) {
+                let found = turn
+                    .text
+                    .as_ref()
+                    .and_then(|id| by_digest.remove(id))
+                    .or_else(|| unanswered.pop_front());
+                match found {
                     Some((id, name)) => {
                         line.insert("tool_call_id".into(), json!(id));
                         line.insert("tool_name".into(), json!(name));
@@ -621,8 +632,8 @@ mod tests {
     fn a_tool_result_nobody_called_is_counted() {
         let (temp, mut vfs) = store();
         let mut session = session(&mut vfs);
-        // The call forgets its result; the transcript still has the answer.
-        session.turns[2].tool.as_mut().unwrap().result = None;
+        // No call at all, and the transcript still has an answer to it.
+        session.turns[2].tool = None;
 
         let projection =
             to_operator(&vfs, &session, &temp.path().join("runs"), None, false).unwrap();
@@ -633,6 +644,26 @@ mod tests {
         let lines = lines(&projection.path);
         assert!(lines[4].get("tool_call_id").is_none());
         assert_eq!(lines[4]["content"], "boom", "the text is still there");
+    }
+
+    #[test]
+    fn a_result_with_nothing_to_say_still_names_its_call() {
+        // Pi files no payload for a command that printed nothing, so the result
+        // cannot be matched by digest. Dropping its linkage would leave a
+        // transcript a provider rejects; guessing would be worse. Position is the
+        // fact that remains.
+        let (temp, mut vfs) = store();
+        let mut session = session(&mut vfs);
+        session.turns[2].tool.as_mut().unwrap().result = None;
+        session.turns[3].text = None;
+
+        let projection =
+            to_operator(&vfs, &session, &temp.path().join("runs"), None, false).unwrap();
+        assert!(projection.report.skipped.is_empty());
+        let lines = lines(&projection.path);
+        assert_eq!(lines[4]["tool_call_id"], "call-2");
+        assert_eq!(lines[4]["tool_name"], "read");
+        assert!(lines[4].get("content").is_none(), "there was no text");
     }
 
     #[test]
