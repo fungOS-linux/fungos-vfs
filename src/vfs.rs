@@ -2822,7 +2822,9 @@ mod tests {
         db.execute("ALTER TABLE files DROP COLUMN mode", [])
             .unwrap();
         drop(db);
-        let mut vfs = Vfs::open_with(&root, NodeRole::Full, Some(&cas)).unwrap();
+        // `file` and `set_mode` both take `&self`: reopening is a read of what the
+        // database says, not a borrow that must be unique.
+        let vfs = Vfs::open_with(&root, NodeRole::Full, Some(&cas)).unwrap();
         assert_eq!(vfs.file("a.txt").unwrap().unwrap().mode, DEFAULT_MODE);
         assert_eq!(vfs.set_mode("a.txt", 0o755).unwrap().mode, 0o755);
     }
