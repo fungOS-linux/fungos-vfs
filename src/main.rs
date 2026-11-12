@@ -9,9 +9,9 @@ use clap::{Parser, Subcommand};
 use fungos_vfs::{
     ApplyOutcome, CheckoutOptions, ContentId, Expect, Hydration, NodeRole, PathPolicy,
     RecordOptions, ReplicaConfig, ReplicaSpec, SourceMode, SyncServer, Vfs, attach_project,
-    checkout, export_dir, import_pi, ingest_dir_with_policy, list_projects, materialize,
-    migrate_storage_with_cas, pull_over_quic, pull_over_ssh, record, to_operator, worktree_changes,
-    worktrees,
+    checkout, export_dir, import_pi, import_pi_incremental, ingest_dir_with_policy, list_projects,
+    materialize, migrate_storage_with_cas, pull_over_quic, pull_over_ssh, record, to_operator,
+    worktree_changes, worktrees,
 };
 
 #[derive(Parser)]
@@ -315,7 +315,7 @@ enum Command {
     /// Conversations as records: import them from a harness, list them, show
     /// one, or project one into another harness's format.
     Session {
-        /// `import`, `list`, `show`, or `project`.
+        /// `import`, `list`, `show`, `project`, or `sync`.
         mode: String,
         /// Which harness, for `import` (`pi`) and to filter `list`.
         #[arg(long)]
@@ -1013,6 +1013,60 @@ fn run() -> anyhow::Result<()> {
                     }
                 }
             }
+            // Import what changed, then project everything: one command, because a
+            // timer that has to run two is a timer somebody will wire up wrong.
+            "sync" => {
+                let harness =
+                    harness.ok_or_else(|| anyhow::anyhow!("session sync needs --harness"))?;
+                let store = path.ok_or_else(|| anyhow::anyhow!("session sync needs --path"))?;
+                let out = out.ok_or_else(|| anyhow::anyhow!("session sync needs --out"))?;
+                let report = match harness.as_str() {
+                    "pi" => import_pi_incremental(&mut vfs, &store, dry_run)?,
+                    other => anyhow::bail!("no importer for {other}; this build has pi"),
+                };
+                let mut projected = 0usize;
+                let mut rewritten = 0usize;
+                let mut skipped = report.unnormalized.clone();
+                for summary in vfs.sessions(Some(&harness))? {
+                    let Some(session) = vfs.session(&harness, &summary.native_id)? else {
+                        continue;
+                    };
+                    let projection =
+                        to_operator(&vfs, &session, &out, workspace.as_deref(), dry_run)?;
+                    projected += 1;
+                    if projection.report.written {
+                        rewritten += 1;
+                    }
+                    for (reason, count) in projection.report.skipped {
+                        *skipped.entry(reason).or_default() += count;
+                    }
+                }
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "import": report,
+                            "projected": projected,
+                            "bundles_rewritten": rewritten,
+                            "skipped": skipped,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "{harness}: {} new or changed files ({} unchanged), {} turns, \
+                         {} new payloads; {} bundles ({rewritten} rewritten){}",
+                        report.sessions,
+                        report.files_skipped,
+                        report.turns,
+                        report.blobs,
+                        projected,
+                        if dry_run { " (dry run)" } else { "" }
+                    );
+                    for (reason, count) in &skipped {
+                        println!("  counted {reason}: {count}");
+                    }
+                }
+            }
             "project" => {
                 let harness =
                     harness.ok_or_else(|| anyhow::anyhow!("session project needs --harness"))?;
@@ -1079,7 +1133,9 @@ fn run() -> anyhow::Result<()> {
                 }
             }
             other => {
-                anyhow::bail!("session mode must be import, list, show or project, not {other}")
+                anyhow::bail!(
+                    "session mode must be import, list, show, project or sync, not {other}"
+                )
             }
         },
         Command::Fetch {

@@ -35,7 +35,7 @@ pub use cid::{CODEC_DAG_CBOR, CODEC_RAW, cid_bytes, cid_string, content_id_to_ci
 pub use content::ContentId;
 pub use hydrate::Hydrator;
 pub use path::normalize_path;
-pub use pi::{ImportReport, import as import_pi};
+pub use pi::{ImportReport, import as import_pi, import_incremental as import_pi_incremental};
 pub use piece::{Have, Manifest, PIECE_SIZE, Piece, PieceError, PieceSource, empty_have, fetch};
 pub use policy::{PathClass, PathPolicy};
 pub use project::{ProjectReport, WorktreeRef, attach as attach_project, list as list_projects};

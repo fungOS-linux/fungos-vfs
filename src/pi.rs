@@ -31,7 +31,7 @@ use base64::Engine as _;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::{ContentId, Role, Session, ToolCall, Turn, Usage, Vfs, session::blob_key};
+use crate::{ContentId, Expect, Role, Session, ToolCall, Turn, Usage, Vfs, session::blob_key};
 
 /// What an import did.
 #[derive(Debug, Default, Serialize)]
@@ -45,15 +45,76 @@ pub struct ImportReport {
     /// reports none, because the store already holds them.
     pub blobs: usize,
     pub bytes: u64,
+    /// Files an incremental run did not open, because they had not changed since
+    /// the last one. The point of the number is that a timer is not a full re-read.
+    pub files_skipped: usize,
     /// Record kinds this schema has no home for, counted by kind.
     pub unnormalized: BTreeMap<String, u64>,
 }
+
+/// How far an incremental import got, and which store it got there in. Keyed by
+/// store because two machines can both import their own `~/.pi` into the same root
+/// — a watermark shared between them would skip the other machine's history.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ImportState {
+    store: String,
+    up_to_ms: i64,
+}
+
+/// Where an importer keeps its watermark. Deliberately not a record: the session
+/// listing looks for `session.json` and skips this.
+const IMPORT_STATE_KEY: &str = "sessions/pi/import-state.json";
 
 /// Import every session under a Pi sessions directory.
 ///
 /// Idempotent: a session is keyed by the id Pi gave it, and its payloads are keyed
 /// by their own digest, so a second run writes nothing and says so.
 pub fn import(vfs: &mut Vfs, root: &Path, dry_run: bool) -> Result<ImportReport> {
+    import_since(vfs, root, dry_run, None)
+}
+
+/// Import what changed since the last incremental run, and remember this one.
+///
+/// A Pi session file is append-only, so "changed" is its modification time against
+/// the watermark taken when the previous run started. Files that have not moved are
+/// not opened at all: importing a 686-session store in full costs minutes of I/O
+/// that a timer should not spend every quarter hour.
+pub fn import_incremental(vfs: &mut Vfs, root: &Path, dry_run: bool) -> Result<ImportReport> {
+    let started = now_ms();
+    let store = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf())
+        .display()
+        .to_string();
+    let since = vfs
+        .file(IMPORT_STATE_KEY)?
+        .and_then(|entry| vfs.content(&entry.content_id).ok())
+        .and_then(|bytes| serde_json::from_slice::<ImportState>(&bytes).ok())
+        .filter(|state| state.store == store)
+        .map(|state| state.up_to_ms);
+
+    let report = import_since(vfs, root, dry_run, since)?;
+    if !dry_run {
+        let state = ImportState {
+            store,
+            up_to_ms: started,
+        };
+        vfs.put(
+            IMPORT_STATE_KEY,
+            &serde_json::to_vec(&state)?,
+            "application/json",
+            Expect::Any,
+        )?;
+    }
+    Ok(report)
+}
+
+fn import_since(
+    vfs: &mut Vfs,
+    root: &Path,
+    dry_run: bool,
+    since: Option<i64>,
+) -> Result<ImportReport> {
     let mut report = ImportReport::default();
     let mut files = Vec::new();
     collect_session_files(root, &mut files)?;
@@ -63,6 +124,12 @@ pub fn import(vfs: &mut Vfs, root: &Path, dry_run: bool) -> Result<ImportReport>
     let mut filing = Filing::default();
 
     for path in files {
+        if let Some(since) = since
+            && modified_ms(&path)? <= since
+        {
+            report.files_skipped += 1;
+            continue;
+        }
         match read_session(vfs, &path, dry_run, &mut filing)? {
             Some(session) => {
                 report.sessions += 1;
@@ -90,6 +157,24 @@ pub fn import(vfs: &mut Vfs, root: &Path, dry_run: bool) -> Result<ImportReport>
     report.blobs = filing.blobs;
     report.bytes = filing.bytes;
     Ok(report)
+}
+
+/// Wall clock, milliseconds.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
+}
+
+fn modified_ms(path: &Path) -> Result<i64> {
+    let modified = fs::metadata(path)
+        .with_context(|| format!("reading the time of {}", path.display()))?
+        .modified()?;
+    Ok(modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default())
 }
 
 fn collect_session_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -700,6 +785,75 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn an_incremental_import_skips_a_file_that_did_not_change() {
+        let (temp, mut vfs) = store();
+        pi_file(temp.path(), "s-1", &session_lines());
+
+        let first = import_incremental(&mut vfs, temp.path(), false).unwrap();
+        assert_eq!(first.sessions, 1);
+        assert_eq!(first.files_skipped, 0);
+
+        let second = import_incremental(&mut vfs, temp.path(), false).unwrap();
+        assert_eq!(second.sessions, 0, "nothing was opened");
+        assert_eq!(second.files_skipped, 1);
+        assert_eq!(vfs.sessions(Some("pi")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_incremental_import_picks_up_a_session_that_grew() {
+        let (temp, mut vfs) = store();
+        let file = pi_file(temp.path(), "s-1", &session_lines());
+        import_incremental(&mut vfs, temp.path(), false).unwrap();
+        assert_eq!(vfs.session("pi", "s-1").unwrap().unwrap().turns.len(), 4);
+
+        // Pi appends to a session file as the conversation continues.
+        let mut text = fs::read_to_string(&file).unwrap();
+        text.push_str(
+            r#"{"type":"message","id":"e8","parentId":"e7","timestamp":"2026-10-21T12:12:20.000Z","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"model":"fpl/coder"}}"#,
+        );
+        text.push('\n');
+        fs::write(&file, text).unwrap();
+
+        let next = import_incremental(&mut vfs, temp.path(), false).unwrap();
+        assert_eq!(next.sessions, 1, "the file moved, so it was read again");
+        assert_eq!(next.written, 1);
+        assert_eq!(vfs.session("pi", "s-1").unwrap().unwrap().turns.len(), 5);
+    }
+
+    #[test]
+    fn the_watermark_belongs_to_one_store() {
+        // Two machines importing their own `~/.pi` into one root must not skip each
+        // other's history because one of them got there first.
+        let (temp, mut vfs) = store();
+        let neo = temp.path().join("neo");
+        let studio = temp.path().join("studio");
+        fs::create_dir_all(&neo).unwrap();
+        fs::create_dir_all(&studio).unwrap();
+        pi_file(&neo, "a", &session_lines());
+        pi_file(&studio, "b", &session_lines());
+
+        assert_eq!(
+            import_incremental(&mut vfs, &neo, false).unwrap().sessions,
+            1
+        );
+        let other = import_incremental(&mut vfs, &studio, false).unwrap();
+        assert_eq!(other.sessions, 1, "a different store reads in full");
+        assert_eq!(other.files_skipped, 0);
+    }
+
+    #[test]
+    fn a_dry_run_leaves_the_watermark_alone() {
+        // A dry run must not claim to have imported anything, or the next real run
+        // would skip the files the dry run only looked at.
+        let (temp, mut vfs) = store();
+        pi_file(temp.path(), "s-1", &session_lines());
+        import_incremental(&mut vfs, temp.path(), true).unwrap();
+        let real = import_incremental(&mut vfs, temp.path(), false).unwrap();
+        assert_eq!(real.sessions, 1);
+        assert_eq!(real.files_skipped, 0);
     }
 
     #[test]

@@ -55,6 +55,9 @@ pub struct Projection {
 
 #[derive(Debug, Default, Serialize)]
 pub struct ProjectionReport {
+    /// Whether the file on disk had to change. A projection that produces the same
+    /// bytes does not rewrite them, so a timer is not a stream of identical writes.
+    pub written: bool,
     /// Message lines written.
     pub messages: usize,
     pub attachments: usize,
@@ -219,8 +222,13 @@ pub fn to_operator(
 
     let path = out_dir.join(format!("{}.ndjson", run_id(session)));
     if !dry_run {
-        fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
-        fs::write(&path, &body).with_context(|| format!("writing {}", path.display()))?;
+        let same = fs::read(&path).is_ok_and(|existing| existing == body.as_bytes());
+        if !same {
+            fs::create_dir_all(out_dir)
+                .with_context(|| format!("creating {}", out_dir.display()))?;
+            fs::write(&path, &body).with_context(|| format!("writing {}", path.display()))?;
+            report.written = true;
+        }
     }
     Ok(Projection { path, report })
 }
@@ -553,6 +561,8 @@ mod tests {
 
         let first = to_operator(&vfs, &session, &out, None, false).unwrap();
         let second = to_operator(&vfs, &session, &out, None, false).unwrap();
+        assert!(first.report.written);
+        assert!(!second.report.written, "the bytes are already there");
         assert_eq!(first.path, second.path);
         assert_eq!(
             fs::read(&first.path).unwrap(),
