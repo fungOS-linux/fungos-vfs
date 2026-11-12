@@ -273,7 +273,7 @@ enum Command {
     /// Where content is replicated besides this machine: disks, and adapters
     /// over the same trait for buckets and nodes.
     Replica {
-        /// `add`, `list`, `remove`, or `push`.
+        /// `add`, `list`, `remove`, `push`, or `serve`.
         mode: String,
         /// The replica's name, for `add` and `remove`.
         #[arg(long)]
