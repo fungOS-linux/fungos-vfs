@@ -933,6 +933,13 @@ impl Vfs {
         self.ensure_column("sync_queue", "base_content_id", "TEXT")?;
         self.ensure_column("sync_queue", "worktree", "TEXT NOT NULL DEFAULT ''")?;
         self.ensure_column("sync_queue", "store", "TEXT NOT NULL DEFAULT ''")?;
+        // The attribution backfill below asks `WHERE store=''` on every open. On a
+        // root with a six-figure op log that is a full scan with a cold page
+        // cache: minutes to open, where the index makes it a seek. Created here
+        // rather than with the schema, because an older root gains the column
+        // three lines up.
+        self.db
+            .execute_batch("CREATE INDEX IF NOT EXISTS sync_queue_store ON sync_queue(store);")?;
         // Executability arrived after the first roots were written. A root that
         // predates it reads every file as a plain, non-executable file rather
         // than guessing from the bytes.
@@ -2362,6 +2369,25 @@ mod tests {
         let cas = temp.path().join("cas");
         let vfs = Vfs::open_with(temp.path().join("root"), NodeRole::Full, Some(&cas)).unwrap();
         (temp, vfs)
+    }
+
+    #[test]
+    fn the_store_backfill_is_an_index_lookup() {
+        // `migrate` asks `sync_queue WHERE store=''` on every open. Without the
+        // index that is a full scan of the op log, which is what made a launchd
+        // sync spend a minute opening a root it had opened before.
+        let (temp, vfs) = workspace();
+        let indexed: bool = vfs
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_index_list('sync_queue') WHERE name='sync_queue_store')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(indexed);
+        drop(vfs);
+        drop(temp);
     }
 
     /// Open a root against a content store the test owns, under the root itself.
