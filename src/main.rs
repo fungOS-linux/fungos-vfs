@@ -237,6 +237,10 @@ enum Command {
         owner: Option<String>,
         #[arg(long, default_value_t = fungos_vfs::DEFAULT_LEASE_MS)]
         lease_ms: u64,
+        /// Do not carry the commit with the recording, even when no remote has
+        /// it. The far side will then need the commit from somewhere else.
+        #[arg(long)]
+        no_carry: bool,
         /// Cursor from a previous `changes` page. `0` starts from the beginning.
         #[arg(long, default_value_t = 0)]
         since: i64,
@@ -246,6 +250,10 @@ enum Command {
         /// commit's version.
         #[arg(long)]
         force: bool,
+        /// Leave the checkout on whatever commit it is on, instead of moving it to
+        /// the recording's base.
+        #[arg(long)]
+        stay: bool,
         /// Forget, rather than only report, what `worktree prune` finds safe.
         #[arg(long)]
         apply: bool,
@@ -319,7 +327,10 @@ enum Command {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("fungos-vfs: {error}");
+        // `{:#}` rather than `{}`: the outermost message says what failed, the
+        // causes say why, and a tool that hides the causes makes every incident a
+        // guessing game.
+        eprintln!("fungos-vfs: {error:#}");
         std::process::exit(1);
     }
 }
@@ -640,6 +651,8 @@ fn run() -> anyhow::Result<()> {
             limit,
             force,
             apply,
+            no_carry,
+            stay,
         } => match mode.as_str() {
             "materialize" => {
                 let project = project
@@ -657,7 +670,15 @@ fn run() -> anyhow::Result<()> {
                 let name = name.ok_or_else(|| anyhow::anyhow!("worktree record needs --name"))?;
                 let owner = owner
                     .unwrap_or_else(|| format!("{}:{}", vfs.writer().actor, std::process::id()));
-                let report = record(&mut vfs, &name, &RecordOptions { owner, lease_ms })?;
+                let report = record(
+                    &mut vfs,
+                    &name,
+                    &RecordOptions {
+                        owner,
+                        lease_ms,
+                        carry: !no_carry,
+                    },
+                )?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
             "changes" => {
@@ -688,6 +709,7 @@ fn run() -> anyhow::Result<()> {
                         prefix,
                         commit,
                         force,
+                        to_base: !stay,
                         owner,
                         lease_ms,
                     },
