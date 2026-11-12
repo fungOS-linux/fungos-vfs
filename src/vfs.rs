@@ -2760,9 +2760,17 @@ mod tests {
     fn mode_survives_a_rewrite_and_chmod_is_not_a_version() {
         let (_temp, mut vfs) = workspace();
         let entry = vfs
-            .put("bin/tool", b"#!/bin/sh\n", "text/x-shellscript", Expect::Any)
+            .put(
+                "bin/tool",
+                b"#!/bin/sh\n",
+                "text/x-shellscript",
+                Expect::Any,
+            )
             .unwrap();
-        assert_eq!(entry.mode, DEFAULT_MODE, "a new file is data, not a program");
+        assert_eq!(
+            entry.mode, DEFAULT_MODE,
+            "a new file is data, not a program"
+        );
         assert_eq!(vfs.set_mode("bin/tool", 0o755).unwrap().mode, 0o755);
         // Rewriting the bytes keeps the bit: a rebuilt script is still a script.
         let entry = vfs
@@ -2807,8 +2815,7 @@ mod tests {
         let cas = temp.path().join("cas");
         {
             let mut vfs = Vfs::open_with(&root, NodeRole::Full, Some(&cas)).unwrap();
-            vfs.put("a.txt", b"a", "text/plain", Expect::Any)
-                .unwrap();
+            vfs.put("a.txt", b"a", "text/plain", Expect::Any).unwrap();
         }
         // Rewind the schema to the shape a build without `mode` wrote.
         let db = Connection::open(StateLayout::new(&root).db_path()).unwrap();
