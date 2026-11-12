@@ -36,6 +36,14 @@ pub const PROJECTS_DIR: &str = ".fungos/projects";
 /// a repository that commits its build output (some do) must not have that
 /// output treated as source.
 ///
+/// Build output is **excluded here, not cached**. `cache: target/` would also be
+/// legal — the class exists for exactly this shape of data — but attaching walks
+/// `git ls-files`, which never lists an ignored `target/`, so the only case the
+/// change would reach is a repository that tracks its own build output, and there
+/// the bytes are already in the git tree. Storing them again is a cost with no
+/// benefit. The cache is for the thing that produces build output, which is the
+/// builder: it knows the ceiling and writes [crate::PathClass::Cache] entries.
+///
 /// Note what a dirty worktree costs: a tree id describes a commit, not the disk,
 /// so a checkout with any change at all cannot use the pointer and its whole
 /// tree is stored as blobs. The content store deduplicates them across
@@ -73,9 +81,11 @@ pub struct WorktreeRef {
 pub struct IngestSummary {
     pub added: usize,
     pub changed: usize,
+    pub removed: usize,
     pub unchanged: usize,
     pub skipped: usize,
     pub excluded: usize,
+    pub cached: usize,
     pub git_skipped: usize,
     pub bytes_written: u64,
     pub dirty: bool,
@@ -86,9 +96,11 @@ impl From<&IngestReport> for IngestSummary {
         Self {
             added: report.added,
             changed: report.changed,
+            removed: report.removed,
             unchanged: report.unchanged,
             skipped: report.skipped,
             excluded: report.excluded,
+            cached: report.cached,
             git_skipped: report.git_skipped,
             bytes_written: report.bytes_written,
             dirty: report.git.as_ref().is_some_and(|pointer| pointer.dirty),
@@ -107,6 +119,9 @@ pub struct AttachedWorktree {
     /// Namespace prefix its files landed under; absent when it was skipped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
+    /// Attached from its recording rather than by walking the checkout: one
+    /// pointer for the base commit and only the in-between as files.
+    pub recorded: bool,
     /// Why it was skipped, when it was: `bare`, `missing`, or `outside`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped: Option<String>,
@@ -135,7 +150,7 @@ pub struct ProjectReport {
     pub dry_run: bool,
 }
 
-fn git(root: &Path, args: &[&str]) -> Result<String> {
+pub(crate) fn git(root: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -150,6 +165,34 @@ fn git(root: &Path, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Attach one worktree: from its recording when it has one, from the checkout
+/// otherwise.
+///
+/// The recording is preferred because it is both cheaper and truer: the base
+/// commit already describes every file that has not changed, and only the
+/// in-between costs anything. Walking the checkout instead is what makes a dirty
+/// worktree cost its whole tree — see [`attach_policy`] — so a worktree that has
+/// been recorded never pays that again.
+///
+/// Returns the namespace it landed in, the report, and whether the recording
+/// answered. A recording owns its address: it was computed from
+/// [`crate::namespace_for`] when the recording was made, and recomputing it here
+/// would be a second opinion about where the same worktree lives.
+fn attach_one(
+    vfs: &mut Vfs,
+    path: &Path,
+    namespace: &str,
+    policy: &PathPolicy,
+    dry_run: bool,
+) -> Result<(String, IngestReport, bool)> {
+    if let Some(known) = crate::worktree::state_for_path(vfs, path)? {
+        let report = crate::worktree::project(vfs, &known, &known.prefix, dry_run)?;
+        return Ok((known.prefix, report, true));
+    }
+    let report = ingest_dir_with_policy(vfs, path, namespace, SourceMode::Git, dry_run, policy)?;
+    Ok((namespace.to_string(), report, false))
 }
 
 /// Every worktree of the repository at `root`, in Git's own order.
@@ -279,7 +322,7 @@ pub fn attach(
     let worktrees = worktrees(&root).unwrap_or_default();
 
     let policy = PathPolicy::parse(attach_policy());
-    let ingest = ingest_dir_with_policy(vfs, &root, &prefix, SourceMode::Git, dry_run, &policy)?;
+    let (root_namespace, ingest, recorded) = attach_one(vfs, &root, &prefix, &policy, dry_run)?;
 
     // The main worktree was just ingested; the siblings follow it, one namespace
     // each, so "where is my half-finished branch" has an answer.
@@ -295,11 +338,13 @@ pub fn attach(
             head: worktree.head.clone(),
             bare: worktree.bare,
             namespace: None,
+            recorded: false,
             skipped: None,
             ingest: None,
         };
         if canonical == canonical_root {
-            entry.namespace = Some(prefix.clone());
+            entry.namespace = Some(root_namespace.clone());
+            entry.recorded = recorded;
             entry.ingest = Some(IngestSummary::from(&ingest));
             attached.push(entry);
             continue;
@@ -309,7 +354,11 @@ pub fn attach(
             attached.push(entry);
             continue;
         }
-        if !path.is_dir() {
+        // A recorded worktree is attached whether or not its directory is still
+        // there: what it recorded is the work, and a handoff should not lose it
+        // because somebody deleted the checkout.
+        let has_recording = crate::worktree::state_for_path(vfs, &path)?.is_some();
+        if !path.is_dir() && !has_recording {
             // Git still lists a worktree whose directory was removed by hand
             // until `git worktree prune` runs. Naming it beats ingesting into a
             // namespace that no longer has a source.
@@ -325,10 +374,54 @@ pub fn attach(
             suffix += 1;
         }
         let namespace = format!("{prefix}/worktrees/{candidate}");
-        let report =
-            ingest_dir_with_policy(vfs, &path, &namespace, SourceMode::Git, dry_run, &policy)?;
+        let (namespace, report, recorded) = attach_one(vfs, &path, &namespace, &policy, dry_run)?;
         entry.namespace = Some(namespace);
+        entry.recorded = recorded;
         entry.ingest = Some(IngestSummary::from(&report));
+        attached.push(entry);
+    }
+
+    // Git knows the worktrees of *this* clone. A recording can be of a checkout of
+    // another clone — a Delta thread's worktree is exactly that — and it is a
+    // worktree of the project all the same. Leaving it out of the marker strands
+    // the recording on the far side, where `worktree checkout` can only restore
+    // what the marker names.
+    let known_paths: BTreeSet<PathBuf> = attached
+        .iter()
+        .map(|entry| {
+            let path = PathBuf::from(&entry.path);
+            std::fs::canonicalize(&path).unwrap_or(path)
+        })
+        .collect();
+    for known in crate::worktree::worktrees(vfs)? {
+        if !known.prefix.starts_with(&format!("{prefix}/")) {
+            continue;
+        }
+        let canonical = std::fs::canonicalize(&known.path).unwrap_or_else(|_| known.path.clone());
+        if known_paths.contains(&canonical) {
+            continue;
+        }
+        let present = known.path.is_dir();
+        let mut entry = AttachedWorktree {
+            path: known.path.display().to_string(),
+            branch: None,
+            head: known.base_commit.clone(),
+            bare: false,
+            namespace: Some(known.prefix.clone()),
+            recorded: true,
+            skipped: if present {
+                None
+            } else {
+                Some("missing".to_owned())
+            },
+            ingest: None,
+        };
+        if present {
+            let (namespace, report, _) =
+                attach_one(vfs, &known.path, &known.prefix, &policy, dry_run)?;
+            entry.namespace = Some(namespace);
+            entry.ingest = Some(IngestSummary::from(&report));
+        }
         attached.push(entry);
     }
 
@@ -385,6 +478,164 @@ pub fn list(vfs: &mut Vfs) -> Result<Vec<serde_json::Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{NodeRole, RecordOptions, Vfs, record};
+
+    fn scratch(tag: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("fungos-vfs-project-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn open_vfs(base: &Path) -> Vfs {
+        Vfs::open_with(base.join("vfs"), NodeRole::Full, Some(&base.join("cas"))).unwrap()
+    }
+
+    fn write(path: &Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn commit_all(dir: &Path) {
+        git(dir, &["add", "-A"]).unwrap();
+        git(
+            dir,
+            &[
+                "-c",
+                "user.email=vfs@example.test",
+                "-c",
+                "user.name=vfs",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        )
+        .unwrap();
+    }
+
+    /// A repository with `files` committed files and `dirty` of them edited.
+    fn dirty_repository(base: &Path, files: usize, dirty: &[usize]) -> PathBuf {
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]).unwrap();
+        for index in 0..files {
+            write(&repo.join(format!("src/f{index:02}.txt")), &body(index, ""));
+        }
+        commit_all(&repo);
+        for index in dirty {
+            write(
+                &repo.join(format!("src/f{index:02}.txt")),
+                &body(*index, " (edited)"),
+            );
+        }
+        repo
+    }
+
+    fn body(index: usize, suffix: &str) -> String {
+        format!("file {index}{suffix}\n")
+    }
+
+    #[test]
+    fn a_recorded_worktree_is_attached_from_its_in_between() {
+        let base = scratch("recorded");
+        let repo = dirty_repository(&base, 12, &[1, 5, 9]);
+        let mut vfs = open_vfs(&base);
+
+        crate::worktree::materialize(&mut vfs, &repo, "main", &repo, None, "projects").unwrap();
+        let recorded = record(&mut vfs, "main", &RecordOptions::new("agent")).unwrap();
+        assert_eq!(recorded.planned, 3);
+
+        let report = attach(&mut vfs, &repo, None, "projects", false).unwrap();
+        let main = &report.worktrees[0];
+        assert!(main.recorded, "the recording is the cheaper answer");
+        let summary = main.ingest.expect("the main worktree is attached");
+        // `record` already put the in-between in the namespace at the address the
+        // attach arrives at — one function names a worktree, so the two cannot
+        // disagree about where it lives.
+        assert_eq!(summary.unchanged, 3);
+        assert_eq!(summary.added, 0);
+        assert_eq!(summary.git_skipped, 0, "nothing was walked");
+
+        // Three files in the namespace, not twelve: the other nine are still the
+        // commit's tree.
+        assert_eq!(vfs.list(&report.prefix).unwrap().len(), 3);
+        assert_eq!(
+            vfs.get(&format!("{}/src/f01.txt", report.prefix)).unwrap(),
+            body(1, " (edited)").into_bytes()
+        );
+        // The pointer says which commit covers the rest, and that it is dirty —
+        // dirty because the in-between exists, not because it was estimated.
+        let pointer = report.git.expect("a recorded worktree still has a pointer");
+        assert!(pointer.dirty);
+        assert_eq!(pointer.commit.len(), 40);
+    }
+
+    #[test]
+    fn a_recording_repairs_a_namespace_a_dirty_checkout_filled() {
+        let base = scratch("repair");
+        let repo = dirty_repository(&base, 12, &[1, 5, 9]);
+        let mut vfs = open_vfs(&base);
+
+        // Nothing recorded yet: attaching a dirty checkout costs its whole tree.
+        let before = attach(&mut vfs, &repo, None, "projects", false).unwrap();
+        assert!(!before.worktrees[0].recorded);
+        assert_eq!(vfs.list(&before.prefix).unwrap().len(), 12);
+
+        // Record it, then attach again: the namespace becomes the in-between and
+        // the nine files the commit already covers are let go.
+        crate::worktree::materialize(&mut vfs, &repo, "main", &repo, None, "projects").unwrap();
+        record(&mut vfs, "main", &RecordOptions::new("agent")).unwrap();
+        let after = attach(&mut vfs, &repo, None, "projects", false).unwrap();
+        assert!(after.worktrees[0].recorded);
+        assert_eq!(
+            after.worktrees[0].ingest.expect("attached").removed,
+            9,
+            "{after:#?}"
+        );
+        assert_eq!(vfs.list(&after.prefix).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_recording_of_another_clone_is_in_the_marker() {
+        let base = scratch("marker-clone");
+        let repo = dirty_repository(&base, 6, &[2]);
+        let mut vfs = open_vfs(&base);
+
+        // A checkout of a clone the project has never seen: `git worktree list`
+        // there knows nothing about it, so the marker has to learn it from the
+        // recording or the far side cannot name it.
+        let clone = base.join("thread-clone");
+        crate::project::git(
+            &base,
+            &[
+                "clone",
+                "-q",
+                &repo.to_string_lossy(),
+                &clone.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+        crate::worktree::materialize(&mut vfs, &repo, "thread", &clone, None, "projects").unwrap();
+        write(&clone.join("src/f04.txt"), &body(4, " (thread)"));
+        record(&mut vfs, "thread", &RecordOptions::new("agent")).unwrap();
+
+        let report = attach(&mut vfs, &repo, None, "projects", false).unwrap();
+        let thread = report
+            .worktrees
+            .iter()
+            .find(|entry| entry.namespace.as_deref() == Some("projects/repo/worktrees/thread"))
+            .unwrap_or_else(|| panic!("the recording is in the marker: {report:#?}"));
+        assert!(thread.recorded);
+        assert_eq!(thread.path, clone.display().to_string());
+        assert_eq!(
+            vfs.get("projects/repo/worktrees/thread/src/f04.txt")
+                .unwrap(),
+            body(4, " (thread)").into_bytes()
+        );
+    }
 
     #[test]
     fn a_worktree_listing_splits_into_one_entry_per_worktree() {
@@ -408,7 +659,12 @@ mod tests {
             policy.classify("crates/soil-spore/src/lib.rs"),
             crate::PathClass::Git
         );
-        // Build output: nobody's.
+        // Build output: nobody's. Deliberately `Exclude` rather than `Cache`:
+        // attaching walks `git ls-files`, which never lists an ignored `target/`,
+        // so caching it here would only ever store a repository's *tracked* build
+        // output — bytes the git tree already names. The builder fills the cache
+        // instead. Changing this to `Cache` should mean deciding that attaching a
+        // checkout of build output is worth the bytes.
         assert_eq!(
             policy.classify("target/debug/fungos-vfs"),
             crate::PathClass::Exclude

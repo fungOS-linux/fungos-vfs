@@ -640,21 +640,28 @@ impl Vfs {
                     self.mark_diverged(&op.store, op.hlc, &op.path, bytes, &op.actor, &op.origin)?;
                     return Ok(ApplyOutcome::Diverged);
                 }
-                self.apply_put(&op.path, bytes, current.as_ref(), &op.actor, &op.origin)?;
+                self.apply_put(
+                    &op.path,
+                    bytes,
+                    current.as_ref(),
+                    &op.actor,
+                    &op.origin,
+                    &op.worktree,
+                )?;
             }
             SyncOpKind::Remove => {
                 if self.file(&op.path)?.is_some() {
-                    self.apply_remove(&op.path)?;
+                    self.apply_remove(&op.path, &op.actor, &op.origin, &op.worktree)?;
                 }
             }
             SyncOpKind::Mkdir => {
                 if matches!(self.is_directory(&op.path), Ok(false)) {
-                    self.apply_mkdir(&op.path)?;
+                    self.apply_mkdir(&op.path, &op.actor, &op.origin, &op.worktree)?;
                 }
             }
             SyncOpKind::Rmdir => {
                 if matches!(self.is_directory(&op.path), Ok(true)) {
-                    self.apply_rmdir(&op.path)?;
+                    self.apply_rmdir(&op.path, &op.actor, &op.origin, &op.worktree)?;
                 }
             }
         }
@@ -1243,9 +1250,7 @@ pub fn pull_over_ssh(
         remote_bin,
         shell_quote(remote_root)
     );
-    let mut child = std::process::Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
+    let mut child = ssh_command()
         .arg(remote)
         .arg(&command)
         .stdin(std::process::Stdio::piped())
@@ -1291,6 +1296,30 @@ pub fn pull_over_ssh(
     };
     let outcomes = vfs.apply_sync(&response)?;
     Ok((outcomes, report))
+}
+
+/// The carrier that reaches a peer, when it is not plain `ssh`.
+///
+/// `FUNGOS_VFS_SSH` names it -- the same idea as bob's `BOB_SSH` -- because a
+/// sandbox reached with `boat-ssh <id> <command>` takes the same two arguments
+/// `ssh <host> <command>` does and none of its options. Hard-coding `ssh` meant
+/// the only peers this could pull from were peers holding a keychain, and a VM
+/// that holds no keys for anything is exactly the machine worth pulling from.
+fn ssh_command() -> std::process::Command {
+    match std::env::var("FUNGOS_VFS_SSH") {
+        Ok(transport) if !transport.trim().is_empty() => {
+            let mut parts = transport.split_whitespace();
+            let program = parts.next().unwrap_or("ssh").to_string();
+            let mut command = std::process::Command::new(program);
+            command.args(parts);
+            command
+        }
+        _ => {
+            let mut command = std::process::Command::new("ssh");
+            command.args(["-o", "BatchMode=yes"]);
+            command
+        }
+    }
 }
 
 /// Quote one argument for the remote shell.
@@ -1808,7 +1837,8 @@ mod tests {
         // the op — but the horizon must not reach a divergence whose bytes are
         // gone. This is the case expiry cannot rescue: nothing is on disk to
         // keep, so forgetting the record would swallow the write below.
-        b.apply_remove(&divergences[0].copy_path()).unwrap();
+        b.apply_remove(&divergences[0].copy_path(), "test", "test", "")
+            .unwrap();
         wait_past(op.hlc);
         let report = b.compact(std::time::Duration::ZERO).unwrap();
         assert!(
@@ -2183,7 +2213,7 @@ mod tests {
 
         // Without the bytes there is nothing to keep, so the record must go on
         // pinning rather than being expired into the void.
-        b.apply_remove(&copy).unwrap();
+        b.apply_remove(&copy, "test", "test", "").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
         let pinned = b.compact(std::time::Duration::from_millis(1)).unwrap();
         assert!(pinned.expired_divergences.is_empty());

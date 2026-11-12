@@ -4,6 +4,7 @@ members = [
     "crates/fungos-vfs-unibus",
     "crates/fungos-vfs-fuse",
     "crates/fungos-vfs-kubo",
+    "crates/fungos-vfs-r2",
 ]
 resolver = "2"
 

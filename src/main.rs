@@ -1,10 +1,16 @@
-use std::{fs, io::Write, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    io::Write,
+    path::PathBuf,
+};
 
 use clap::{Parser, Subcommand};
 use fungos_vfs::{
-    ApplyOutcome, ContentId, Expect, NodeRole, PathPolicy, SourceMode, SyncServer, Vfs,
-    attach_project, export_dir, ingest_dir_with_policy, list_projects, migrate_storage_with_cas,
-    pull_over_quic, pull_over_ssh,
+    ApplyOutcome, CheckoutOptions, ContentId, Expect, Hydration, NodeRole, PathPolicy,
+    RecordOptions, ReplicaConfig, ReplicaSpec, SourceMode, SyncServer, Vfs, attach_project,
+    checkout, export_dir, ingest_dir_with_policy, list_projects, materialize,
+    migrate_storage_with_cas, pull_over_quic, pull_over_ssh, record, worktree_changes, worktrees,
 };
 
 #[derive(Parser)]
@@ -207,6 +213,107 @@ enum Command {
     Export {
         prefix: String,
         dest: PathBuf,
+    },
+    /// Worktrees on a real disk, recorded by the difference.
+    Worktree {
+        /// `materialize`, `checkout`, `list`, `record`, `changes`, or `prune`.
+        mode: String,
+        #[arg(long)]
+        name: Option<String>,
+        /// The repository for `materialize`.
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// The directory to check out into, for `materialize`.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// The commit to check out; defaults to the repository's HEAD.
+        #[arg(long)]
+        commit: Option<String>,
+        /// Namespace prefix; defaults to `projects`, the same as `project attach`.
+        #[arg(long, default_value = "projects")]
+        prefix: String,
+        /// Who holds the lease while `record` runs. Defaults to this actor and pid.
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long, default_value_t = fungos_vfs::DEFAULT_LEASE_MS)]
+        lease_ms: u64,
+        /// Cursor from a previous `changes` page. `0` starts from the beginning.
+        #[arg(long, default_value_t = 0)]
+        since: i64,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Lay a recording over files that are neither its content nor the base
+        /// commit's version.
+        #[arg(long)]
+        force: bool,
+        /// Forget, rather than only report, what `worktree prune` finds safe.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// The build cache: content this root may forget.
+    Cache {
+        /// `put`, `ls`, `pin`, `unpin`, or `evict`.
+        mode: String,
+        /// The file to file, for `put`.
+        file: Option<PathBuf>,
+        /// What produced it, for `put`. A label, never an address.
+        #[arg(long)]
+        path: Option<String>,
+        /// The content id, for `pin` and `unpin`.
+        #[arg(long)]
+        content_id: Option<String>,
+        #[arg(long, default_value = "application/octet-stream")]
+        media_type: String,
+        /// The ceiling to evict down to, for `evict`.
+        #[arg(long)]
+        max_bytes: Option<u64>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Where content is replicated besides this machine: disks, and adapters
+    /// over the same trait for buckets and nodes.
+    Replica {
+        /// `add`, `list`, `remove`, `push`, or `serve`.
+        mode: String,
+        /// The replica's name, for `add` and `remove`.
+        #[arg(long)]
+        name: Option<String>,
+        /// What kind it is. `disk` is built in.
+        #[arg(long, default_value = "disk")]
+        kind: String,
+        /// Where a `disk` replica keeps its objects.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Where a `provider` replica listens, `host:port`. For `serve`, where to
+        /// listen.
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// `replica serve`: the address to serve on.
+        #[arg(long)]
+        listen: Option<String>,
+        /// Read from this replica, never write to it.
+        #[arg(long)]
+        read_only: bool,
+        /// Only the prefix to push.
+        #[arg(long, default_value = "")]
+        prefix: String,
+        /// Report what `push` would upload, and upload nothing.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fill placeholders from the configured replicas.
+    Fetch {
+        /// One namespace path.
+        #[arg(long)]
+        path: Option<String>,
+        /// Every placeholder under this prefix.
+        #[arg(long, default_value = "")]
+        prefix: String,
+        /// Name what is missing without fetching it.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -519,6 +626,337 @@ fn run() -> anyhow::Result<()> {
         Command::Export { prefix, dest } => {
             let report = export_dir(&mut vfs, &prefix, &dest)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::Worktree {
+            mode,
+            name,
+            project,
+            path,
+            commit,
+            prefix,
+            owner,
+            lease_ms,
+            since,
+            limit,
+            force,
+            apply,
+        } => match mode.as_str() {
+            "materialize" => {
+                let project = project
+                    .ok_or_else(|| anyhow::anyhow!("worktree materialize needs --project"))?;
+                let name =
+                    name.ok_or_else(|| anyhow::anyhow!("worktree materialize needs --name"))?;
+                let path =
+                    path.ok_or_else(|| anyhow::anyhow!("worktree materialize needs --path"))?;
+                let report =
+                    materialize(&mut vfs, &project, &name, &path, commit.as_deref(), &prefix)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            "list" => println!("{}", serde_json::to_string_pretty(&worktrees(&vfs)?)?),
+            "record" => {
+                let name = name.ok_or_else(|| anyhow::anyhow!("worktree record needs --name"))?;
+                let owner = owner
+                    .unwrap_or_else(|| format!("{}:{}", vfs.writer().actor, std::process::id()));
+                let report = record(&mut vfs, &name, &RecordOptions { owner, lease_ms })?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            "changes" => {
+                let name = name.ok_or_else(|| anyhow::anyhow!("worktree changes needs --name"))?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&worktree_changes(&vfs, &name, since, limit)?)?
+                );
+            }
+            "checkout" => {
+                let name = name.ok_or_else(|| anyhow::anyhow!("worktree checkout needs --name"))?;
+                let path = path.ok_or_else(|| anyhow::anyhow!("worktree checkout needs --path"))?;
+                let owner = owner
+                    .unwrap_or_else(|| format!("{}:{}", vfs.writer().actor, std::process::id()));
+                // `--project` names a directory everywhere else in this CLI, and a
+                // project is named after its directory; asking for the name a
+                // second way would be two vocabularies for one thing.
+                let project = project
+                    .as_ref()
+                    .and_then(|dir| dir.file_name())
+                    .map(|name| name.to_string_lossy().into_owned());
+                let report = checkout(
+                    &mut vfs,
+                    &CheckoutOptions {
+                        name,
+                        path,
+                        project,
+                        prefix,
+                        commit,
+                        force,
+                        owner,
+                        lease_ms,
+                    },
+                )?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            "prune" => {
+                let report = fungos_vfs::prune(&mut vfs, name.as_deref(), apply)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            other => anyhow::bail!(
+                "worktree mode must be materialize, checkout, list, record, changes or prune, not {other}"
+            ),
+        },
+        Command::Cache {
+            mode,
+            file,
+            path,
+            content_id,
+            media_type,
+            max_bytes,
+            json,
+        } => match mode.as_str() {
+            "put" => {
+                let file = file.ok_or_else(|| anyhow::anyhow!("cache put needs a file"))?;
+                let label = path.unwrap_or_else(|| file.to_string_lossy().into_owned());
+                let bytes = fs::read(&file)?;
+                let content_id = vfs.put_cache(&label, &bytes, &media_type)?;
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "path": label,
+                        "content_id": content_id.to_string(),
+                        "size": bytes.len(),
+                        "cached_bytes": vfs.cached_bytes()?,
+                    })
+                );
+            }
+            "ls" => {
+                let entries = vfs.cache_entries()?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&entries)?);
+                } else {
+                    for entry in entries {
+                        println!(
+                            "{}\t{}\t{}{}",
+                            entry.content_id,
+                            entry.size,
+                            entry.path,
+                            if entry.pinned { "\t(pinned)" } else { "" }
+                        );
+                    }
+                }
+            }
+            "pin" | "unpin" => {
+                let id =
+                    content_id.ok_or_else(|| anyhow::anyhow!("cache {mode} needs --content-id"))?;
+                let id = ContentId::parse(&id).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                vfs.pin_cache(&id, mode == "pin")?;
+            }
+            "evict" => {
+                let max =
+                    max_bytes.ok_or_else(|| anyhow::anyhow!("cache evict needs --max-bytes"))?;
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "evicted": vfs.evict_cache_to(max)?,
+                        "cached_bytes": vfs.cached_bytes()?,
+                    })
+                );
+            }
+            other => anyhow::bail!("cache mode must be put, ls, pin, unpin or evict, not {other}"),
+        },
+        Command::Replica {
+            mode,
+            name,
+            kind,
+            path,
+            endpoint,
+            listen,
+            read_only,
+            prefix,
+            dry_run,
+            json,
+        } => match mode.as_str() {
+            "add" => {
+                let name = name.ok_or_else(|| anyhow::anyhow!("replica add needs --name"))?;
+                let mut config = ReplicaConfig::load(&cli.root)?;
+                config.upsert(ReplicaSpec {
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    path,
+                    endpoint,
+                    read_only,
+                });
+                // Built before it is saved: a replica this build cannot reach is
+                // a typo to fix now, not a backup that has been failing for a week.
+                let replicas = config.build()?;
+                config.save(&cli.root)?;
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "added": name,
+                        "kind": kind,
+                        "replicas": replicas.names(),
+                        "config": fungos_vfs::replica_config_path(&cli.root).display().to_string(),
+                    })
+                );
+            }
+            "list" => {
+                let config = ReplicaConfig::load(&cli.root)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&config.replicas)?);
+                } else if config.replicas.is_empty() {
+                    println!("no replicas; `replica add --name <name> --path <dir>` starts one");
+                } else {
+                    for spec in &config.replicas {
+                        println!(
+                            "{}\t{}\t{}{}",
+                            spec.name,
+                            spec.kind,
+                            spec.path
+                                .as_ref()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_default(),
+                            if spec.read_only { "\t(read-only)" } else { "" }
+                        );
+                    }
+                }
+            }
+            "remove" => {
+                let name = name.ok_or_else(|| anyhow::anyhow!("replica remove needs --name"))?;
+                let mut config = ReplicaConfig::load(&cli.root)?;
+                if !config.remove(&name) {
+                    anyhow::bail!("no replica named {name}");
+                }
+                config.save(&cli.root)?;
+                println!("{}", serde_json::json!({ "removed": name }));
+            }
+            "push" => {
+                let config = ReplicaConfig::load(&cli.root)?;
+                let replicas = config.build()?;
+                if replicas.is_empty() {
+                    anyhow::bail!("no replicas configured; nothing to push to");
+                }
+                // Pushed by content id, not by path: the same bytes live under
+                // many paths, and a namespace entry is a name for content, not
+                // the content itself.
+                let mut seen: BTreeSet<String> = BTreeSet::new();
+                let mut ids: Vec<ContentId> = Vec::new();
+                for entry in vfs.list(&prefix)? {
+                    if entry.hydration != Hydration::Present {
+                        continue;
+                    }
+                    if seen.insert(entry.content_id.to_string()) {
+                        ids.push(entry.content_id);
+                    }
+                }
+                let mut outcomes: Vec<serde_json::Value> = Vec::new();
+                let mut added = 0;
+                let mut already = 0;
+                let mut failed = 0;
+                for id in &ids {
+                    if dry_run {
+                        outcomes.push(serde_json::json!({
+                            "content_id": id.to_string(),
+                            "outcome": "would-push",
+                        }));
+                        continue;
+                    }
+                    let bytes = vfs.content(id)?;
+                    for outcome in replicas.put_all(id, &bytes) {
+                        match outcome.outcome {
+                            "added" => added += 1,
+                            "already" => already += 1,
+                            "failed" => failed += 1,
+                            _ => {}
+                        }
+                        outcomes.push(serde_json::to_value(&outcome)?);
+                    }
+                }
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "replicas": replicas.names(),
+                        "content_ids": ids.len(),
+                        "added": added,
+                        "already": already,
+                        "failed": failed,
+                        "dry_run": dry_run,
+                        "outcomes": outcomes,
+                    })
+                );
+            }
+            "serve" => {
+                // One replica, served to whoever can reach the address. This is how a
+                // RAID shelf or a peer's store becomes a replica on another machine
+                // without either side learning a new protocol.
+                let name = name.ok_or_else(|| anyhow::anyhow!("replica serve needs --name"))?;
+                let listen = listen.unwrap_or_else(|| "127.0.0.1:7200".to_owned());
+                let config = ReplicaConfig::load(&cli.root)?;
+                let replicas = config.build()?;
+                let source = replicas
+                    .source(&name)
+                    .ok_or_else(|| anyhow::anyhow!("no replica named {name}"))?;
+                let server = fungos_vfs::ProviderServer::bind(listen.as_str())?;
+                eprintln!(
+                    "fungos-vfs: serving {name} on {} ({} bytes per range)",
+                    server.local_addr()?,
+                    fungos_vfs::MAX_RANGE_BYTES
+                );
+                server.serve(&*source)?;
+            }
+            other => {
+                anyhow::bail!("replica mode must be add, list, remove, push or serve, not {other}")
+            }
+        },
+        Command::Fetch {
+            path,
+            prefix,
+            dry_run,
+        } => {
+            let config = ReplicaConfig::load(&cli.root)?;
+            let replicas = config.build()?;
+            match path {
+                Some(path) => {
+                    if dry_run {
+                        let entry = vfs
+                            .file(&path)?
+                            .ok_or_else(|| anyhow::anyhow!("no such path: {path}"))?;
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "path": entry.path,
+                                "content_id": entry.content_id.to_string(),
+                                "hydration": format!("{:?}", entry.hydration),
+                                "replicas": replicas.names(),
+                            })
+                        );
+                    } else {
+                        let hydrated = vfs.hydrate_from_replicas(&path, &replicas)?;
+                        println!("{}", serde_json::to_string_pretty(&hydrated)?);
+                    }
+                }
+                None => {
+                    let missing = vfs.placeholders(&prefix)?;
+                    let mut hydrated = 0;
+                    let mut bytes = 0usize;
+                    let mut sources: BTreeMap<String, usize> = BTreeMap::new();
+                    if !dry_run {
+                        for (path, _, _) in &missing {
+                            let done = vfs.hydrate_from_replicas(path, &replicas)?;
+                            hydrated += 1;
+                            bytes += done.size;
+                            *sources.entry(done.source).or_default() += 1;
+                        }
+                    }
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "placeholders": missing.len(),
+                            "hydrated": hydrated,
+                            "bytes": bytes,
+                            "sources": sources,
+                            "dry_run": dry_run,
+                        })
+                    );
+                }
+            }
         }
         // Handled before the store is opened, above.
         Command::Migrate => unreachable!(),

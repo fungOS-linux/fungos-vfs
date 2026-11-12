@@ -12,12 +12,15 @@ mod path;
 mod piece;
 mod policy;
 mod project;
+mod provider;
 mod quic;
+mod replica;
 mod store;
 mod stream;
 mod sync;
 mod transfer;
 mod vfs;
+mod worktree;
 
 pub use bus::{
     CONTENT_AVAILABLE_KIND, CONTENT_DATA_KIND, CONTENT_ERROR_KIND, CONTENT_FETCH_KIND,
@@ -30,7 +33,15 @@ pub use path::normalize_path;
 pub use piece::{Have, Manifest, PIECE_SIZE, Piece, PieceError, PieceSource, empty_have, fetch};
 pub use policy::{PathClass, PathPolicy};
 pub use project::{ProjectReport, WorktreeRef, attach as attach_project, list as list_projects};
+pub use provider::{
+    MAX_PROVIDER_FRAME, PROVIDER_VERSION, ProviderReplica, ProviderReply, ProviderRequest,
+    ProviderServer,
+};
 pub use quic::{SyncServer, pull_over_quic};
+pub use replica::{
+    DiskReplica, Fetched, FetchedRange, Hydrated, Replica, ReplicaConfig, ReplicaSpec, Replicas,
+    Replicated, Stored, config_path as replica_config_path,
+};
 pub use stream::{MAX_FRAME, PullClient, Resume, STREAM_VERSION, SnapshotHeader, StreamRequest};
 pub use sync::{
     ApplyOutcome, CompactionReport, ContentBlob, Divergence, MESSAGE_VERSION, SessionId, Snapshot,
@@ -42,7 +53,12 @@ pub use transfer::{
     ingest_dir_with_policy,
 };
 pub use vfs::{
-    Expect, FileEntry, Hlc, Hydration, LEGACY_STATE_DIR, Lease, LodPolicy, NodeRole, STATE_DIR,
-    StorageMigration, SyncOp, SyncOpKind, Version, Vfs, VfsError, Writer, migrate_storage,
-    migrate_storage_with_cas,
+    CacheEntry, Change, Expect, FileEntry, Hlc, Hydration, LEGACY_STATE_DIR, Lease, LodPolicy,
+    NodeRole, STATE_DIR, StorageMigration, SyncOp, SyncOpKind, Version, Vfs, VfsError, Writer,
+    migrate_storage, migrate_storage_with_cas,
+};
+pub use worktree::{
+    ChangePage, CheckoutOptions, CheckoutReport, DEFAULT_LEASE_MS, MaterializeReport, PruneEntry,
+    PruneReport, RecordOptions, RecordReport, WorktreeChange, WorktreeState,
+    changes as worktree_changes, checkout, materialize, namespace_for, prune, record, worktrees,
 };

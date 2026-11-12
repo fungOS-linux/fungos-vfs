@@ -8,6 +8,7 @@ description = "Kubo/IPFS content provider for fungOS VFS"
 
 [dependencies]
 fungos-vfs = { path = "../.." }
+clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.13", default-features = false, features = [
     "blocking",
@@ -15,3 +16,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "query",
     "rustls",
 ] }
+
+[[bin]]
+name = "fungos-vfs-kubo-provider"
+path = "src/bin/fungos-vfs-kubo-provider.rs"

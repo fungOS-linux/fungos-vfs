@@ -14,6 +14,7 @@
 //! exclude: *.iso         explicit form of the same thing
 //! cid: **/*.pdf          stored as content-addressed blob
 //! git: **/*.svg          belongs to the Git tree; do not duplicate as blobs
+//! cache: target/         stored in the CAS, never versioned, evictable
 //! ```
 //!
 //! Last matching rule wins. A path matching nothing is stored as a blob, which
@@ -31,6 +32,16 @@ pub enum PathClass {
     Blob,
     /// Belongs to a Git tree. Record the tree, do not copy the files.
     Git,
+    /// Stored in the CAS and never versioned: a build's output.
+    ///
+    /// The difference from [`PathClass::Blob`] is not storage, it is what the
+    /// collector may do. A blob is a fact with a history and a divergence record,
+    /// and losing one loses information; a cache entry is a hint whose loss is
+    /// always safe, so it can be evicted by size while every other class is
+    /// collected only by reachability. Merging the two would leave the collector
+    /// unable to tell "safe to forget" from "never forget", and that distinction
+    /// is what lets it run aggressively at all.
+    Cache,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -111,6 +122,7 @@ impl PathPolicy {
 fn split_directive(line: &str) -> (PathClass, &str) {
     for (prefix, class) in [
         ("exclude:", PathClass::Exclude),
+        ("cache:", PathClass::Cache),
         ("cid:", PathClass::Blob),
         ("store:", PathClass::Blob),
         ("git:", PathClass::Git),
@@ -221,6 +233,22 @@ mod tests {
             PathClass::Exclude
         );
         assert_eq!(policy.classify("src/index.js"), PathClass::Blob);
+    }
+
+    #[test]
+    fn a_cache_rule_is_its_own_class() {
+        // Build output is stored, so it is not `exclude:`, and it is never
+        // versioned, so it is not `cid:` either. The class is what tells the
+        // collector it may evict this content by size.
+        let policy = PathPolicy::parse("cache: target/\n");
+        assert_eq!(
+            policy.classify("target/debug/deps/libfoo.rmeta"),
+            PathClass::Cache
+        );
+        assert_eq!(policy.classify("src/main.rs"), PathClass::Blob);
+        // Last rule wins, so a later `exclude:` can still carve something out.
+        let narrow = PathPolicy::parse("cache: target/\nexclude: target/final/\n");
+        assert_eq!(narrow.classify("target/final/app"), PathClass::Exclude);
     }
 
     #[test]

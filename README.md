@@ -109,6 +109,22 @@ fungos-vfs --root ~/fungos-local sync pull --quic agora-one:7701 \
   --fingerprint <hex>
 ```
 
+`--remote` is whatever `ssh` accepts, because `ssh` is what runs — unless
+`FUNGOS_VFS_SSH` names another carrier. A Boat sandbox is reached with
+`boat-ssh <id> <command>`, which takes the same two arguments and none of ssh's
+options:
+
+```sh
+FUNGOS_VFS_SSH=boat-ssh fungos-vfs --root ~/fungos sync pull \
+  --remote bx_j9txh4ms --remote-root /home/user/vfs --remote-bin /home/user/fungos-vfs
+```
+
+That is what lets a VM holding no keys for anything be a peer rather than a place
+to copy files into. Verified end to end on a Boat sandbox: two edits recorded on
+the VM, pulled here over `boat-ssh`, and laid over a checkout of the same base
+with `checkout` — `replaced: 2`, eight files untouched.
+
+
 `pull` reports what happened to each op:
 
 ```json
@@ -199,10 +215,10 @@ What attach records:
 - the **worktrees** Git knows about, so the desktop can see what is checked out
   and where, without a second copy of any object;
 the **in-between** Git cannot hold: a dirty worktree cannot be described by a
-  tree id, so its whole checkout is stored as blobs — deduplicated by the
-  content store, and not narrowed to the changed files — and the report says
-  `git.dirty` so the difference is
-  never implied.
+  tree id, so one that has not been recorded is stored as blobs — its whole
+  checkout, not only the changed files — and the report says `git.dirty` so the
+  difference is never implied. Record the worktree and it costs its diff instead;
+  see [Worktrees](#worktrees).
 
 The policy it attaches, in full:
 
@@ -219,9 +235,316 @@ exclude: build/
 Last matching rule wins, which is why the exclusions come second: a repository
 that commits its build output must not have that output treated as source.
 
+A *dirty* worktree cannot use the tree pointer, so attaching one stores its whole
+checkout as blobs — unless it has been recorded, in which case only the
+in-between is written (see [Worktrees](#worktrees)). The report says
+`git.dirty` either way, so the difference is never implied.
+
 A clean repository of one file attaches as **one tree pointer and zero bytes
 written**. Change a file and the next attach writes that file — the rest is
 still the tree's.
+
+## Worktrees
+
+A worktree is where work happens; the namespace is where it is recorded. A
+worktree is a real directory on the local filesystem — `cargo`, an editor, and
+`rg` behave exactly as they always have, and `target/` survives between builds
+because nothing is remounting it. The VFS sits beside that directory, not under
+it: it holds the base, the diff, and the history.
+
+```sh
+fungos-vfs --root ~/fungos-local worktree materialize \
+  --project ~/src/soil --name fix-parser --path ~/src/soil-fix-parser
+fungos-vfs --root ~/fungos-local worktree record  --name fix-parser
+fungos-vfs --root ~/fungos-local worktree changes --name fix-parser
+fungos-vfs --root ~/fungos-local worktree list
+```
+
+**Handing a worktree to another machine.** `record` writes the work, `checkout`
+puts it back into a working tree somewhere else. The address and the base travel
+in the project marker that `project attach` synced; the bytes travel as content.
+Nothing is shared between the two machines but the wire:
+
+```sh
+# where the work is
+fungos-vfs --root ~/fungos worktree materialize \
+  --project ~/src/bob --name bob-thread --path ~/src/bob/.delta/worktrees/<t>/bob
+fungos-vfs --root ~/fungos worktree record --name bob-thread
+fungos-vfs --root ~/fungos project attach  ~/src/bob
+
+# where the work is wanted
+fungos-vfs --root ~/fungos sync pull --remote <peer> --remote-root /Users/<you>/fungos \
+  --remote-bin /Users/<you>/.local/bin/fungos-vfs
+git -C ~/src/bob fetch <peer>:src/bob/.delta/clones/<t>/bob.git <base>
+git -C ~/src/bob worktree add --detach ~/work/bob-thread <base>
+fungos-vfs --root ~/fungos worktree checkout --name bob-thread \
+  --path ~/work/bob-thread --project ~/src/bob
+```
+
+Three things about that sequence are load-bearing:
+
+- **The base commit has to reach the far side by Git.** The recording carries the
+  diff, never the tree, so the peer needs a checkout of the base — fetch it from
+  whoever has it. `materialize` adopts a checkout of *any* clone of the work, which
+  is what lets a worktree that belongs to another tool be recorded here at all;
+- **`sync pull` runs where the work is wanted**, because that is where the content
+  is missing. There is no push: the puller decides when bytes move.
+- **`checkout --project <dir>` names the attached project**, not the worktree: the
+  namespace is read out of the marker, and the marker is what `project attach`
+  wrote — including recorded worktrees whose checkouts belong to another clone.
+
+Verified over Tailscale between a Mac Studio and a MacBook (`averys-macbook-neo`),
+in both directions. A Delta thread worktree was adopted writing nothing, two edits
+recorded as two ops and 17,770 bytes, pulled (`3 entries, 38,386 bytes`), and laid
+into a fresh checkout on the far side: `replaced: 2`, forty files otherwise
+untouched, both files byte-identical by SHA-256. An edit made on the far side came
+back the same way (`1 op, 389 bytes`, `replaced: 2`) and its first `record` wrote
+no op for the file it had just received (`unchanged: 1`).
+
+`checkout` has three outcomes per path and one refusal: nothing there (write it),
+already the recorded content (nothing to do), the base commit's version (replace
+it, because that is what "changed this file" means), and anything else — **refuse**,
+name the paths, and write nothing at all. A file that is neither what was recorded
+nor what the commit says is somebody else's edit; a refusal that still wrote half
+the plan would be worse than no checkout.
+
+It writes files, never namespace entries, and it records a row so the far side
+becomes a peer rather than a reader: its first `record` adopts the synced state in
+one pass writing no ops, and the next edit reaches the other machine with that
+machine's actor on it.
+
+**Recording costs the diff, not the tree.** `record` asks Git which paths differ
+from the base commit, hashes only those, and writes one op for each that differs
+from what the namespace already holds. Three edits in a 678-file checkout cost
+three ops and zero bytes for the other 675 — the rest is still the commit's
+tree, which Git already content-addresses. A second `record` with nothing changed
+is **zero ops and zero bytes written**.
+
+**Materializing is nearly free.** Files the commit covers come from Git's own
+checkout. Only the recorded in-between is streamed out of the content store, and
+on APFS it is placed by `clonefile` — a reflink, not a copy. The report says which
+happened (`placed` against `cloned`).
+
+**Adopting is the usual case.** A worktree exists because an agent or an editor
+made it; the recording arrives second. `materialize` pointed at an existing
+checkout of the same repository at the same commit adopts it — it writes nothing,
+records the address, and the next `record` describes whatever is already
+different. Pointed at a directory that is not a worktree of that repository, it
+refuses and says so.
+
+**`project attach` prefers the recording.** A recorded worktree attaches as one
+pointer plus its in-between, not as a walk of the checkout. That is what repairs
+the old cost: attach a dirty checkout and it still stores the whole tree; record
+that worktree, attach again, and the namespace becomes the three files that
+actually changed, with the rest let go (`removed: 17` in a twenty-file checkout).
+The report says `recorded: true` when this happened, so "attached cheaply" and
+"attached the old way" are never confused.
+
+A recording owns its namespace address, computed by one function for both
+`materialize` and `attach`: the project's main worktree *is* `projects/<name>`,
+and every other worktree hangs under `projects/<name>/worktrees/<label>`.
+
+Two rules make an interrupted record safe:
+
+1. **The plan is written before it is applied.** Every op lands in the journal in
+   one transaction, with its content already filed. A run that dies leaves a plan
+   the next run finishes — no duplicate ops, no lost file.
+2. **Ops are committed before the base advances.** Each op is its own transaction;
+   the recorded base moves only after they have all landed, in the same transaction
+   that clears the journal. An op that already landed is recognised by looking at
+   the namespace, not by trusting a flag that could itself be what was lost.
+
+A record holds a **lease** on the worktree for as long as it runs. A second record
+is refused and names the holder, which is the same rule as an open-file lease one
+level up: two writers to one working tree is a conflict pretending to be a diff.
+
+**The change feed** is what a harness polls. `changes --since <cursor>` returns
+`{path, op, author, origin}` for everything that happened after a cursor, including
+ops that arrived from a peer and removals — which are recorded as tombstones,
+because Git's tree pointer covers files the namespace never held.
+
+**Nothing cleans up after a worktree on its own.** Landing a PR, closing a thread,
+or ending a session leaves the checkout and its row exactly where they were, which
+is why `prune` exists and why it reports before it acts:
+
+```sh
+fungos-vfs --root ~/fungos worktree prune              # what would go, and why
+fungos-vfs --root ~/fungos worktree prune --apply      # forget those
+fungos-vfs --root ~/fungos worktree prune --name fix-parser --apply
+```
+
+There is no `--older-than`. Each row is decided by what it holds, not by its age:
+
+| state | removable | why |
+|---|---|---|
+| `clean` | yes | the recording holds no in-between and Git reports nothing uncommitted, so every file is described by a commit |
+| `missing` | yes | the directory is gone; the row was a promise about nothing |
+| `recorded` | no | the in-between exists only as ops — dropping the row drops the only pointer to it |
+| `dirty` | no | the disk holds work the recording has not seen |
+| `leased` | no | something is recording or checking out right now; the refusal names the holder |
+| `kept-by-git` | no | `git worktree remove` refused — the main worktree, the one you are standing in, or the one holding a file Git does not know |
+
+The directory goes through `git worktree remove`, so git's own refusals are the
+guard rather than a copy of them kept here. `clean` is deliberately **not** the same
+question as *merged*: a prune loses a directory and a row, never a commit — the
+commits stay in the repository behind their branch, and `worktree checkout` rebuilds
+the directory from the row's base. Ignored files are the one thing `clean` cannot
+see, and git removes them without complaint, which is right for `target/` and is why
+`--name` exists for the one worktree holding something a commit does not describe.
+
+What it deliberately does not do, yet:
+
+- **Plain directories.** A worktree is a Git worktree; there is no cheap base for
+  anything else, and inventing a per-file one would cost a hash of everything on
+  every record. Refused rather than approximated.
+- **Ignored files.** Git does not report them, and the attached policy excludes
+  build output anyway. Same rule as `project attach`, same policy.
+- **Renames** are recorded as a removal and an upsert — one blob, which is what a
+  rename costs to store.
+- **Non-Git directories.** There is no cheap base for one, and hashing everything
+  on every record is the cost this design exists to avoid. Refused rather than
+  approximated — a content-addressed store for plain files is the other half of
+  the story, and it is a different one.
+
+## The cache class
+
+Build output is the largest thing on a developer machine and the only large thing
+a namespace has no business versioning. A fourth class stores it without making it
+a fact:
+
+```text
+cache: target/      stored in the CAS, never versioned, evictable
+```
+
+| | `Git` | `Blob` | `Cache` | `Exclude` |
+|---|---|---|---|---|
+| in the CAS | no (tree id) | yes | yes | no |
+| version history | tree | yes | **no** | no |
+| in the op log | yes | yes | **no** | no |
+| a reader fetches it by | tree | path | **content id** | — |
+| dropped by | nothing | reachability (`gc`) | **size (`evict`)** | — |
+
+```sh
+fungos-vfs --root ~/fungos cache put target/debug/app --path target/debug/app
+fungos-vfs --root ~/fungos cache ls
+fungos-vfs --root ~/fungos cache pin   --content-id blake3:<hex>
+fungos-vfs --root ~/fungos cache evict --max-bytes 20000000000
+```
+
+Four rules, and each is the reason the class exists:
+
+- **A cache write is not an op.** No namespace entry, no version, no author, no
+  row for a peer to replay: a compiler's scratch files are not edits. What you get
+  back is a `ContentId`, and that is the only handle — cache content is fetched by
+  id, never by path.
+- **`gc` keeps cache content; `evict` is what forgets it.** Collecting it in both
+  places would be two collectors racing to delete the same bytes on different
+  rules. Reachability is the rule for everything else; the ceiling is the rule for
+  this.
+- **Eviction is by size, oldest-use first.** Age alone is the wrong axis: a
+  twelve-hour-old build tree may be the only copy of an hour of work. Pinned
+  entries are skipped, so a changeset can name an artifact and have it survive the
+  ceiling.
+- **Eviction forgets the entry, not the bytes.** The store is shared, so dropping
+  one root's claim leaves the content to the next `gc` — which is what makes
+  eviction cheap and safe to run while other roots are working.
+
+Two things are deliberately not done yet, and both are about a build that is
+*running*: a tree-scoped lease (today `Lease` holds one path, so `evict` can drop
+the tree under a build), and who renews it — the build by heartbeat, or the caller
+for its lifetime. Neither changes the storage rule above; both matter before this
+turns into a mount.
+
+**`project attach` still says `exclude: target/`, and should.** Attaching walks
+`git ls-files`, which never lists an ignored `target/`, so switching that rule to
+`cache:` would only ever reach a repository that tracks its own build output — and
+there the bytes are already in the git tree. *Source* is what attaching is for.
+The cache is for the thing that produces build output, which is the builder: it
+knows the ceiling and files ``PathClass::Cache`` entries itself.
+
+## Replicas
+
+A backup is a copy of content, not a copy of history, and that distinction is why
+this is safe where a peer push is not. Content is immutable and named by its own
+digest: a copy is a copy, `put` is idempotent, there is no order to agree on, and a
+source that is down is a source to skip rather than a conflict to resolve. Ops have
+an order; content does not.
+
+```sh
+fungos-vfs --root ~/fungos replica add --name shelf --path /Volumes/RAID/fungos
+fungos-vfs --root ~/fungos replica add --name peer  --path ~/mnt/neo/fungos --read-only
+fungos-vfs --root ~/fungos replica list
+fungos-vfs --root ~/fungos replica push            # everything present, by content id
+fungos-vfs --root ~/fungos replica push --dry-run
+```
+
+The list lives in `<root>/.fungos/replicas.json`, device-local on purpose: a RAID
+path is not a fact that travels with a namespace, and a bucket is reached with this
+machine's credentials.
+
+Three properties are load-bearing:
+
+- **Every byte is checked.** A replica that hands back the wrong block is worse
+  than one that is down, because the byte is about to become a file. The digest is
+  verified on read; a mismatch fails and names the file it was found in.
+- **Reads race, writes mirror.** Every source is asked at once and the first
+  verified answer wins, so four slow replicas add up to one fast one rather than
+  the sum of their latencies. `push` writes everywhere it can and reports each
+  outcome separately.
+- **A source that fails says which one it was.** A failure report that only counts
+  is a backup you cannot audit.
+
+```sh
+fungos-vfs --root ~/fungos fetch                     # every placeholder
+fungos-vfs --root ~/fungos fetch --path docs/plan.md # one file, from any replica
+fungos-vfs --root ~/fungos fetch --dry-run           # what is missing
+```
+
+**Kinds.** `disk` is built in, and a disk replica is also a network export, a RAID
+shelf, or another machine's store directory — the layout is the local store's own
+(`<root>/<first two hex>/<hex>`), because a mirror that sorts its objects
+differently is a second format to debug at the worst moment.
+
+Everything that is not a path is a **provider**: a small process that owns the
+credentials and the network, serving content ranges over a framed protocol
+(`ContentFetch`/`ContentData`, 64 KiB per range, 64 MiB per object). The VFS holds
+no HTTP client and no bucket signer, which is the same split as `unibus-ipfs`:
+adapter crate with a hardened third-party client, provider binary that hosts it,
+consumer that only speaks the protocol.
+
+```sh
+# a disk replica, served to the rest of the fleet
+fungos-vfs --root ~/fungos replica serve --name shelf --listen 0.0.0.0:7200
+fungos-vfs --root ~/fungos replica add --name studio --kind provider --endpoint studio:7200
+
+# a Kubo node (raw blake3 blocks; the CID is only how the name is spelled to it)
+fungos-vfs-kubo-provider --kubo-api http://127.0.0.1:5001 --listen 127.0.0.1:7201
+fungos-vfs --root ~/fungos replica add --name kubo --kind provider --endpoint 127.0.0.1:7201
+
+# an S3/R2 bucket
+R2_ENDPOINT=… R2_ACCESS_KEY_ID=… R2_SECRET_ACCESS_KEY=… \
+  fungos-vfs-r2-provider --bucket fungos-backup --listen 127.0.0.1:7202
+fungos-vfs --root ~/fungos replica add --name cold --kind provider --endpoint 127.0.0.1:7202
+```
+
+A provider introduces itself before it is trusted — `replica add` refuses an
+endpoint that does not answer — and says whether it is writable, so `put` to a
+read-only shelf is refused by the thing that knows rather than discovered halfway
+through an upload. Every range is checked against the digest like every other
+source, and a provider that returns the wrong bytes fails rather than filling a
+file.
+
+**Signing is tested against an oracle, not a memory.** SigV4 lives in
+`crates/fungos-vfs-r2` and is pure: `Credentials::sign` takes the request parts and
+a timestamp and returns the headers. Two vectors pin it — AWS's published `GET
+Object` example, which botocore 1.34.69 also reproduces, and a `PUT` with a body
+whose expected signature was generated by botocore for those exact parts. The
+second one exists because the first version of this test asserted a remembered
+constant that no implementation produced.
+
+What it deliberately does not do: **no push of ops.** Replication here moves
+immutable content and nothing else, which is why it needs no merge policy. Moving
+the log is `sync pull`, and it stays pull.
 
 ## Pieces
 
