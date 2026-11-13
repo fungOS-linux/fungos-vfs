@@ -7,7 +7,7 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use fungos_vfs::{
-    ApplyOutcome, CheckoutOptions, ContentId, Expect, Hydration, NodeRole, PathPolicy,
+    ApplyOutcome, CheckoutOptions, ContentId, DocFile, Expect, Hydration, NodeRole, PathPolicy,
     RecordOptions, ReplicaConfig, ReplicaSpec, SourceMode, SyncServer, Vfs, attach_project,
     checkout, export_dir, import_pi, import_pi_incremental, ingest_dir_with_policy, list_projects,
     materialize, migrate_storage_with_cas, pull_over_quic, pull_over_ssh, record, to_operator,
@@ -341,6 +341,24 @@ enum Command {
         /// Count what an import would write, and write nothing.
         #[arg(long)]
         dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// A markdown file and the document it is a view of: read the file's edits,
+    /// merge them, and write the result back.
+    Doc {
+        /// `sync` is the only mode.
+        mode: String,
+        /// The document's identity. Two files with one id are one document.
+        #[arg(long)]
+        id: Option<String>,
+        /// The file to reconcile.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Who the edits are attributed to. Defaults to this store's actor, which
+        /// has to be stable or every run starts a new op stream.
+        #[arg(long)]
+        actor: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -1157,6 +1175,57 @@ fn run() -> anyhow::Result<()> {
                     "session mode must be import, list, show, project or sync, not {other}"
                 )
             }
+        },
+        Command::Doc {
+            mode,
+            id,
+            path,
+            actor,
+            json,
+        } => match mode.as_str() {
+            "sync" => {
+                let id = id.ok_or_else(|| anyhow::anyhow!("doc sync needs --id"))?;
+                let path = path.ok_or_else(|| anyhow::anyhow!("doc sync needs --path"))?;
+                let actor = actor.unwrap_or_else(|| vfs.writer().actor.clone());
+                let mut doc = DocFile::open(&vfs, &id, &actor, &path)?;
+                let report = doc.reconcile(&mut vfs)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "path": path,
+                            "actor": actor,
+                            "ops": report.ops,
+                            "wrote_file": report.wrote_file,
+                            "deferred": report.deferred,
+                            "replaced_unseen_text": report.replaced_unseen_text,
+                            "snapshot": doc.snapshot(&vfs)?,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "{}\t{} ops, {}{}{}",
+                        path.display(),
+                        report.ops,
+                        if report.wrote_file {
+                            "file rewritten"
+                        } else {
+                            "file unchanged"
+                        },
+                        if report.deferred > 0 {
+                            format!(", {} deferred", report.deferred)
+                        } else {
+                            String::new()
+                        },
+                        if report.replaced_unseen_text {
+                            ", replaced text this worktree had not seen"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+            other => anyhow::bail!("doc mode must be sync, not {other}"),
         },
         Command::Fetch {
             path,
