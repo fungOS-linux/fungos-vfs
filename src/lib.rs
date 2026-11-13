@@ -4,6 +4,7 @@
 //! store that every root on the machine shares. A node can be a full replica or a
 //! pull-through cache. Distributed transport is deliberately outside this crate.
 
+mod anchor;
 mod bus;
 mod carry;
 mod cid;
@@ -28,6 +29,7 @@ mod transfer;
 mod vfs;
 mod worktree;
 
+pub use anchor::{Anchor, Comment, CommentBook, CommentOp, Resolution, Thread};
 pub use bus::{
     CONTENT_AVAILABLE_KIND, CONTENT_DATA_KIND, CONTENT_ERROR_KIND, CONTENT_FETCH_KIND,
     ContentAvailable, ContentData, ContentError, ContentFetch, MAX_CONTENT_BYTES, MAX_RANGE_BYTES,
