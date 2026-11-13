@@ -36,7 +36,7 @@ use base64::Engine as _;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use crate::{ContentId, Role, Session, Vfs};
+use crate::{BlockId, ContentId, DocFile, Op, Role, Session, Vfs, split_blocks};
 
 /// Named in the bundle's `version` field so a reader can tell a projected bundle
 /// from one this machine's own run wrote.
@@ -264,6 +264,191 @@ pub fn to_operator(
 /// makes appending a turn a single insert and re-projecting an unchanged session
 /// produce nothing at all.
 pub fn to_markdown(vfs: &Vfs, session: &Session) -> Result<String> {
+    let mut parts = vec![header_chunk(session)];
+    for turn in &session.turns {
+        parts.push(turn_chunk(vfs, turn)?);
+    }
+    let mut canonical = crate::split_blocks(&parts.join("")).join("\n\n");
+    canonical.push('\n');
+    Ok(canonical)
+}
+
+/// A transcript is a document, and this is where it is grown.
+///
+/// [`to_markdown`] renders a whole record, which is the right thing for an export
+/// and the wrong thing for a session that is still running: it re-reads every
+/// payload in the record to answer "what changed?" when the answer is "one turn
+/// arrived". This walks the same layout and appends:
+///
+/// - **Identity is positional and owned by the record.** Turn *i*'s blocks are
+///   numbered after the blocks already emitted, and their actor is the record
+///   (`pi:1a2b3c4d`), not the machine. Two replicas that absorb each other's ops
+///   before projecting therefore extend one transcript instead of each building
+///   its own.
+/// - **Only the tail can change.** A harness appends its record; it does not
+///   rewrite a turn it already wrote. So a sync re-projects the last turn it
+///   knows (which may still be growing) and then everything after it. A record
+///   rewritten in the middle is a full [`to_markdown`] plus `doc sync`, and this
+///   type does not pretend to notice it.
+/// - **Turn boundaries are recovered from the layout, not stored.** Every turn
+///   starts with a `## role` block, so which blocks belong to which turn is a
+///   fact about the document, not a cursor somebody has to keep in step.
+pub struct Transcript;
+
+/// What one append did.
+#[derive(Debug, Default, Serialize)]
+pub struct Synced {
+    /// Turns in the record, whether or not this pass wrote them.
+    pub turns: usize,
+    /// Turns this pass looked at again: the last one it knew, and the new ones.
+    pub replayed: usize,
+    pub inserted: usize,
+    pub updated: usize,
+    pub deleted: usize,
+    /// Whether the text on disk changed.
+    pub wrote_file: bool,
+}
+
+impl Transcript {
+    /// The actor a record's blocks are owned by.
+    ///
+    /// Derived from the harness and the record's own id, so the same record
+    /// projects to the same identities wherever it is projected. A harness id can
+    /// hold anything a path can, so the digest is what keeps it short and legal.
+    #[must_use]
+    pub fn author(session: &Session) -> String {
+        let digest = ContentId::from_bytes(session.native_id.as_bytes());
+        format!("{}:{}", session.harness, &digest.hex()[..8])
+    }
+
+    /// Append what `session` has beyond what `doc` already holds, and write the
+    /// merged text back to the document's file.
+    pub fn sync(doc: &mut DocFile, vfs: &mut Vfs, session: &Session) -> Result<Synced> {
+        let author = Self::author(session);
+        let emitted: Vec<(BlockId, String)> = doc
+            .doc()
+            .order()
+            .into_iter()
+            .filter(|block| block.id.actor == author && !block.deleted)
+            .map(|block| (block.id.clone(), block.text.clone()))
+            .collect();
+
+        // Turn *t* owns the blocks from the *t*-th `## role` heading to the next
+        // one; everything before the first heading is the header.
+        let mut runs: Vec<Vec<(BlockId, String)>> = Vec::new();
+        let mut header: Vec<(BlockId, String)> = Vec::new();
+        for (id, text) in emitted {
+            if text.starts_with("## ") {
+                runs.push(Vec::new());
+            }
+            match runs.last_mut() {
+                Some(run) => run.push((id, text)),
+                None => header.push((id, text)),
+            }
+        }
+
+        let mut next = doc
+            .doc()
+            .order()
+            .iter()
+            .filter(|block| block.id.actor == author)
+            .map(|block| block.id.counter)
+            .max()
+            .map_or(1, |counter| counter + 1);
+        let mut fresh = || {
+            let id = BlockId::new(next, &author);
+            next += 1;
+            id
+        };
+
+        let mut ops: Vec<Op> = Vec::new();
+        let mut synced = Synced {
+            turns: session.turns.len(),
+            ..Synced::default()
+        };
+        // The header carries the name, the cwd and the models, and it is cheap to
+        // render: it is checked on every pass so a renamed session is corrected.
+        let want = split_blocks(&header_chunk(session));
+        let mut previous: Option<BlockId> = None;
+        for (index, text) in want.iter().enumerate() {
+            match header.get(index) {
+                Some((id, have)) if have == text => previous = Some(id.clone()),
+                Some((id, _)) => {
+                    ops.push(Op::Update {
+                        id: id.clone(),
+                        text: text.clone(),
+                        at: doc.stamp(),
+                    });
+                    synced.updated += 1;
+                    previous = Some(id.clone());
+                }
+                None => {
+                    let id = fresh();
+                    ops.push(Op::Insert {
+                        id: id.clone(),
+                        after: previous.clone(),
+                        text: text.clone(),
+                    });
+                    synced.inserted += 1;
+                    previous = Some(id);
+                }
+            }
+        }
+        for (id, _) in header.iter().skip(want.len()) {
+            ops.push(Op::Delete {
+                id: id.clone(),
+                at: doc.stamp(),
+            });
+            synced.deleted += 1;
+        }
+
+        // Re-project the last turn this document knows: it may have grown since.
+        let replay = runs.len().saturating_sub(1);
+        synced.replayed = session.turns.len().saturating_sub(replay);
+        for (turn, source) in session.turns.iter().enumerate().skip(replay) {
+            let want = split_blocks(&turn_chunk(vfs, source)?);
+            let have = runs.get(turn).map_or(&[][..], Vec::as_slice);
+            for (index, text) in want.iter().enumerate() {
+                match have.get(index) {
+                    Some((id, existing)) if existing == text => previous = Some(id.clone()),
+                    Some((id, _)) => {
+                        ops.push(Op::Update {
+                            id: id.clone(),
+                            text: text.clone(),
+                            at: doc.stamp(),
+                        });
+                        synced.updated += 1;
+                        previous = Some(id.clone());
+                    }
+                    None => {
+                        let id = fresh();
+                        ops.push(Op::Insert {
+                            id: id.clone(),
+                            after: previous.clone(),
+                            text: text.clone(),
+                        });
+                        synced.inserted += 1;
+                        previous = Some(id);
+                    }
+                }
+            }
+            for (id, _) in have.iter().skip(want.len()) {
+                ops.push(Op::Delete {
+                    id: id.clone(),
+                    at: doc.stamp(),
+                });
+                synced.deleted += 1;
+            }
+        }
+
+        let report = doc.extend(vfs, ops)?;
+        synced.wrote_file = report.wrote_file;
+        Ok(synced)
+    }
+}
+
+/// The header: what the record is, and where it ran.
+fn header_chunk(session: &Session) -> String {
     let title = session
         .name
         .as_deref()
@@ -281,52 +466,49 @@ pub fn to_markdown(vfs: &Vfs, session: &Session) -> Result<String> {
         out.push_str(&session.models.join(", "));
     }
     out.push('\n');
+    out
+}
 
-    for turn in &session.turns {
-        let role = match turn.role {
-            Role::System => "system",
-            Role::User => "user",
-            Role::Assistant => "assistant",
-            Role::Tool => "tool",
-        };
-        out.push_str(&format!("\n## {role}\n\n"));
-        if let Some(text) = vfs.turn_text(turn)? {
-            out.push_str(text.trim_end());
-            out.push('\n');
-        }
-        for tool in &turn.tools {
-            let bytes = vfs.content(&tool.arguments)?;
-            let args = String::from_utf8_lossy(&bytes);
-            let args = args.trim();
-            let args = if args.len() > 120 {
-                format!("{}…", &args[..120])
-            } else {
-                args.to_owned()
-            };
-            out.push_str(&format!(
-                "\n- `{}` {}{}\n",
-                tool.name,
-                args,
-                if tool.failed { " (failed)" } else { "" }
-            ));
-        }
-        if let Some(thinking) = &turn.thinking {
-            let bytes = vfs.content(thinking)?;
-            let text = String::from_utf8_lossy(&bytes);
-            // Folded into one line so a turn stays one block: the point of the
-            // markdown is that a re-projection of an unchanged session is free.
-            out.push_str(&format!(
-                "\n<sub>thought: {}</sub>\n",
-                text.replace('\n', " ").trim()
-            ));
-        }
+/// One turn: a heading, what was said, what was called, what was thought.
+fn turn_chunk(vfs: &Vfs, turn: &crate::Turn) -> Result<String> {
+    let role = match turn.role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+    };
+    let mut out = format!("\n## {role}\n\n");
+    if let Some(text) = vfs.turn_text(turn)? {
+        out.push_str(text.trim_end());
+        out.push('\n');
     }
-    // Emit the layout the document layer would write back, so projecting a
-    // transcript and then syncing it does not count as a change: one blank line
-    // between blocks, none inside them.
-    let mut canonical = crate::split_blocks(&out).join("\n\n");
-    canonical.push('\n');
-    Ok(canonical)
+    for tool in &turn.tools {
+        let bytes = vfs.content(&tool.arguments)?;
+        let args = String::from_utf8_lossy(&bytes);
+        let args = args.trim();
+        let args = if args.len() > 120 {
+            format!("{}…", &args[..120])
+        } else {
+            args.to_owned()
+        };
+        out.push_str(&format!(
+            "\n- `{}` {}{}\n",
+            tool.name,
+            args,
+            if tool.failed { " (failed)" } else { "" }
+        ));
+    }
+    if let Some(thinking) = &turn.thinking {
+        let bytes = vfs.content(thinking)?;
+        let text = String::from_utf8_lossy(&bytes);
+        // Folded into one line so a turn stays one block: the point of the
+        // markdown is that a re-projection of an unchanged session is free.
+        out.push_str(&format!(
+            "\n<sub>thought: {}</sub>\n",
+            text.replace('\n', " ").trim()
+        ));
+    }
+    Ok(out)
 }
 
 /// A bundle is one file named after the session; the same record projects to the
@@ -873,5 +1055,120 @@ mod tests {
         )
         .unwrap();
         assert_eq!(lines(&projection.path)[0]["workspace"], "/elsewhere");
+    }
+
+    /// A transcript document bound to a file, ready to be grown.
+    fn transcript(vfs: &Vfs, temp: &tempfile::TempDir) -> (DocFile, std::path::PathBuf) {
+        let path = temp.path().join("transcript.md");
+        (
+            DocFile::open(vfs, "transcript", "neo", &path).unwrap(),
+            path,
+        )
+    }
+
+    fn turn(index: u32, role: Role, text: Option<ContentId>) -> Turn {
+        Turn {
+            index,
+            at_ms: 5_000 + i64::from(index),
+            role,
+            native_id: format!("e{index}"),
+            parent: None,
+            text,
+            thinking: None,
+            tools: Vec::new(),
+            usage: Usage::default(),
+            model: None,
+            extras: None,
+        }
+    }
+
+    #[test]
+    fn the_appended_document_is_the_projected_file() {
+        // The incremental path and the whole-record renderer must agree block for
+        // block, or `session project` and `doc sync` would disagree about what the
+        // transcript says.
+        let (temp, mut vfs) = store();
+        let session = session(&mut vfs);
+        let (mut doc, path) = transcript(&vfs, &temp);
+
+        let synced = Transcript::sync(&mut doc, &mut vfs, &session).unwrap();
+        assert!(synced.inserted > 0, "a fresh document gets every block");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            to_markdown(&vfs, &session).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_second_sync_of_an_unchanged_session_writes_nothing() {
+        let (temp, mut vfs) = store();
+        let session = session(&mut vfs);
+        let (mut doc, path) = transcript(&vfs, &temp);
+        Transcript::sync(&mut doc, &mut vfs, &session).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+
+        let synced = Transcript::sync(&mut doc, &mut vfs, &session).unwrap();
+        assert_eq!(synced.inserted, 0);
+        assert_eq!(synced.updated, 0);
+        assert_eq!(synced.deleted, 0);
+        assert!(!synced.wrote_file);
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_growing_session_appends_only_the_new_turn() {
+        // The reason this exists: a live session must not cost a rewrite of every
+        // turn it ever had. The blocks already there keep their identities, which
+        // is also what keeps an annotation on an old turn attached to it.
+        let (temp, mut vfs) = store();
+        let mut session = session(&mut vfs);
+        let (mut doc, path) = transcript(&vfs, &temp);
+        Transcript::sync(&mut doc, &mut vfs, &session).unwrap();
+        let before: Vec<BlockId> = doc.doc().order().iter().map(|b| b.id.clone()).collect();
+
+        let said = vfs.put_blob(b"and now a summary").unwrap();
+        session.turns.push(turn(4, Role::Assistant, Some(said)));
+        session.ended_at_ms = 6_000;
+        let synced = Transcript::sync(&mut doc, &mut vfs, &session).unwrap();
+
+        assert_eq!(synced.updated, 0, "nothing earlier was rewritten");
+        assert_eq!(
+            synced.inserted, 2,
+            "a turn is a heading block and a text block: two places, both new"
+        );
+        assert!(synced.wrote_file);
+
+        let after: Vec<BlockId> = doc.doc().order().iter().map(|b| b.id.clone()).collect();
+        assert_eq!(
+            after[..before.len()],
+            before[..],
+            "every earlier block kept its identity"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            to_markdown(&vfs, &session).unwrap(),
+            "the appended document is the rendered one"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_is_still_being_written_is_updated_in_place() {
+        let (temp, mut vfs) = store();
+        let mut session = session(&mut vfs);
+        let (mut doc, _path) = transcript(&vfs, &temp);
+        Transcript::sync(&mut doc, &mut vfs, &session).unwrap();
+
+        let later = vfs.put_blob(b"boom, and then it worked").unwrap();
+        let last = session.turns.len() - 1;
+        session.turns[last].text = Some(later);
+        let synced = Transcript::sync(&mut doc, &mut vfs, &session).unwrap();
+
+        assert_eq!(synced.inserted, 0, "the turn was already there");
+        assert_eq!(synced.updated, 1, "its text was replaced");
+        assert!(
+            doc.render().contains("boom, and then it worked"),
+            "{}",
+            doc.render()
+        );
     }
 }

@@ -7,11 +7,12 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use fungos_vfs::{
-    ApplyOutcome, CheckoutOptions, ContentId, DocFile, Expect, Hydration, NodeRole, PathPolicy,
-    RecordOptions, ReplicaConfig, ReplicaSpec, SourceMode, SyncServer, Vfs, attach_project,
-    checkout, export_dir, import_pi, import_pi_incremental, ingest_dir_with_policy, list_projects,
-    materialize, migrate_storage_with_cas, pull_over_quic, pull_over_ssh, record, to_markdown,
-    to_operator, worktree_changes, worktrees,
+    Anchor, ApplyOutcome, BlockId, CheckoutOptions, CommentFile, ContentId, Doc, DocFile, Expect,
+    Hydration, NodeRole, PathPolicy, RecordOptions, ReplicaConfig, ReplicaSpec, SourceMode,
+    SyncServer, Transcript, Vfs, attach_project, checkout, export_dir, import_pi,
+    import_pi_incremental, ingest_dir_with_policy, list_projects, load_doc, materialize,
+    migrate_storage_with_cas, pull_over_quic, pull_over_ssh, record, to_markdown, to_operator,
+    worktree_changes, worktrees,
 };
 
 #[derive(Parser)]
@@ -330,6 +331,11 @@ enum Command {
         /// What to project into. `operator` is what this build writes.
         #[arg(long)]
         to: Option<String>,
+        /// A document to grow instead of overwriting `--out`. With `markdown`
+        /// this appends only the turns the document does not already hold, so a
+        /// running session can be projected on a timer.
+        #[arg(long = "doc")]
+        doc: Option<String>,
         /// Where the target keeps its transcripts, for `project`. For
         /// `operator` that is `<workspace>/.operator/runs`.
         #[arg(long)]
@@ -347,7 +353,7 @@ enum Command {
     /// A markdown file and the document it is a view of: read the file's edits,
     /// merge them, and write the result back.
     Doc {
-        /// `sync` is the only mode.
+        /// `sync`, `comment`, or `comments`.
         mode: String,
         /// The document's identity. Two files with one id are one document.
         #[arg(long)]
@@ -355,10 +361,27 @@ enum Command {
         /// The file to reconcile.
         #[arg(long)]
         path: Option<PathBuf>,
-        /// Who the edits are attributed to. Defaults to this store's actor, which
-        /// has to be stable or every run starts a new op stream.
+        /// Who the edits, and the comments, are attributed to. Defaults to this
+        /// store's actor, which has to be stable or every run starts a new stream.
         #[arg(long)]
         actor: Option<String>,
+        /// The block a new thread hangs on: `counter@actor`, or `#N` for the Nth
+        /// live block of the document.
+        #[arg(long)]
+        block: Option<String>,
+        /// What to say. With `--block` it opens a thread; with `--thread` it
+        /// replies.
+        #[arg(long)]
+        body: Option<String>,
+        /// An existing thread, for a reply or a settle.
+        #[arg(long)]
+        thread: Option<String>,
+        /// Mark the thread in `--thread` resolved.
+        #[arg(long)]
+        settle: bool,
+        /// Reopen the thread in `--thread`.
+        #[arg(long)]
+        reopen: bool,
         #[arg(long)]
         json: bool,
     },
@@ -374,6 +397,45 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+/// Milliseconds since the epoch, as this process reads the clock.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
+}
+
+/// `#N` names the Nth live block of a document; `counter@actor` names one exactly.
+///
+/// The number is a convenience for a person at a terminal. Anything recorded
+/// should use the identity: positions move when somebody inserts above them.
+fn anchor_spec(doc: &Doc, spec: &str) -> anyhow::Result<Anchor> {
+    let spec = spec.trim();
+    if let Some(number) = spec.strip_prefix('#') {
+        let number: usize = number
+            .parse()
+            .map_err(|_| anyhow::anyhow!("#{number} is not a block number"))?;
+        let live = doc.live();
+        let block = number.checked_sub(1).and_then(|index| live.get(index));
+        let block = block.ok_or_else(|| {
+            anyhow::anyhow!("the document has {} live blocks, not {number}", live.len())
+        })?;
+        return Ok(Anchor::Block {
+            block: block.id.clone(),
+        });
+    }
+    Ok(Anchor::Block {
+        block: spec.parse().map_err(anyhow::Error::msg)?,
+    })
+}
+
+fn anchor_label(anchor: &Anchor) -> String {
+    match anchor {
+        Anchor::Block { block } => block.to_string(),
+        Anchor::Range { block, start, end } => format!("{block}[{start}..{end}]"),
+    }
 }
 
 fn main() {
@@ -984,6 +1046,7 @@ fn run() -> anyhow::Result<()> {
             path,
             id,
             to,
+            doc,
             out,
             workspace,
             dry_run,
@@ -1136,11 +1199,51 @@ fn run() -> anyhow::Result<()> {
                     }
                 };
                 if target == "markdown" {
-                    // A transcript is a document: one file, which `doc sync` then
-                    // merges and snapshots like any other markdown.
+                    // A transcript is a document. With `--doc` it is grown in
+                    // place: only the turns the document does not already hold
+                    // are projected, so a running session can be projected on a
+                    // timer instead of rewriting the file each time.
                     let session = sessions
                         .first()
                         .ok_or_else(|| anyhow::anyhow!("markdown projection needs one session"))?;
+                    if let Some(doc_id) = &doc {
+                        let actor = cli
+                            .actor
+                            .clone()
+                            .unwrap_or_else(|| vfs.writer().actor.clone());
+                        let mut file = DocFile::open(&vfs, doc_id, &actor, &out)?;
+                        let synced = Transcript::sync(&mut file, &mut vfs, session)?;
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "document": doc_id,
+                                    "path": out,
+                                    "actor": actor,
+                                    "synced": synced,
+                                })
+                            );
+                        } else {
+                            println!(
+                                "{}\t{} turns, {} new blocks, {} rewritten{}, {}",
+                                out.display(),
+                                synced.turns,
+                                synced.inserted,
+                                synced.updated,
+                                if synced.deleted > 0 {
+                                    format!(", {} dropped", synced.deleted)
+                                } else {
+                                    String::new()
+                                },
+                                if synced.wrote_file {
+                                    "file rewritten"
+                                } else {
+                                    "file unchanged"
+                                }
+                            );
+                        }
+                        return Ok(());
+                    }
                     let text = to_markdown(&vfs, session)?;
                     fs::write(&out, &text)?;
                     println!("{}\t{} bytes", out.display(), text.len());
@@ -1197,6 +1300,11 @@ fn run() -> anyhow::Result<()> {
             id,
             path,
             actor,
+            block,
+            body,
+            thread,
+            settle,
+            reopen,
             json,
         } => match mode.as_str() {
             "sync" => {
@@ -1241,7 +1349,140 @@ fn run() -> anyhow::Result<()> {
                     );
                 }
             }
-            other => anyhow::bail!("doc mode must be sync, not {other}"),
+            "comment" => {
+                let id = id.ok_or_else(|| anyhow::anyhow!("doc comment needs --id"))?;
+                let actor = actor.unwrap_or_else(|| vfs.writer().actor.clone());
+                let mut comments = CommentFile::open(&vfs, &id, &actor)?;
+                match (block, thread) {
+                    (Some(spec), _) => {
+                        let body =
+                            body.ok_or_else(|| anyhow::anyhow!("doc comment needs --body"))?;
+                        // The document decides which block `#N` means, and the
+                        // root has every actor's ops: the file is only a view of
+                        // it and may not have been synced yet.
+                        let doc = load_doc(&vfs, &id, &actor)?;
+                        let anchor = anchor_spec(&doc, &spec)?;
+                        let thread =
+                            comments.open_thread(&mut vfs, anchor.clone(), &body, now_ms())?;
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "document": id,
+                                    "thread": thread,
+                                    "anchor": anchor_label(&anchor),
+                                    "author": actor,
+                                })
+                            );
+                        } else {
+                            println!("{thread}\t{}\t{id}", anchor_label(&anchor));
+                        }
+                    }
+                    (None, Some(spec)) => {
+                        let thread: BlockId = spec.parse().map_err(anyhow::Error::msg)?;
+                        if settle && reopen {
+                            anyhow::bail!("a comment is settled or reopened, not both");
+                        }
+                        if settle || reopen {
+                            let at = comments.settle(&mut vfs, &thread, settle, now_ms())?;
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::json!({
+                                        "thread": thread,
+                                        "settled": at,
+                                        "resolved": settle,
+                                    })
+                                );
+                            } else {
+                                println!(
+                                    "{thread}\t{}",
+                                    if settle { "resolved" } else { "reopened" }
+                                );
+                            }
+                        } else {
+                            let body =
+                                body.ok_or_else(|| anyhow::anyhow!("doc comment needs --body"))?;
+                            let comment = comments.say(&mut vfs, &thread, &body, now_ms())?;
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::json!({
+                                        "thread": thread,
+                                        "comment": comment,
+                                        "author": actor,
+                                    })
+                                );
+                            } else {
+                                println!("{thread}\t{comment}\t@{actor}");
+                            }
+                        }
+                    }
+                    (None, None) => anyhow::bail!(
+                        "doc comment needs --block (open a thread on a block) or --thread \
+                         (reply to one)"
+                    ),
+                }
+            }
+            "comments" => {
+                let id = id.ok_or_else(|| anyhow::anyhow!("doc comments needs --id"))?;
+                let actor = actor.unwrap_or_else(|| vfs.writer().actor.clone());
+                let comments = CommentFile::open(&vfs, &id, &actor)?;
+                // Resolution is against the document. The file is preferred when
+                // it is here because it may hold edits the root has not seen yet.
+                let doc = match &path {
+                    Some(path) => DocFile::open(&vfs, &id, &actor, path)?.doc().clone(),
+                    None => load_doc(&vfs, &id, &actor)?,
+                };
+                let rows: Vec<serde_json::Value> = comments
+                    .threads(&doc)
+                    .into_iter()
+                    .map(|(thread, resolution)| {
+                        serde_json::json!({
+                            "document": id,
+                            "thread": thread.id,
+                            "state": resolution.state(),
+                            "at": resolution.block(),
+                            "resolved": thread.resolved(),
+                            "anchor": anchor_label(&thread.anchor),
+                            "comments": thread.comments.iter().map(|comment| {
+                                serde_json::json!({
+                                    "id": comment.id,
+                                    "author": comment.author,
+                                    "body": comment.body,
+                                })
+                            }).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                } else if rows.is_empty() {
+                    println!("{id}\tno threads");
+                } else {
+                    for row in &rows {
+                        println!(
+                            "{}\t{}\t{}\t{}",
+                            row["thread"].as_str().unwrap_or_default(),
+                            if row["resolved"].as_bool().unwrap_or(false) {
+                                "resolved"
+                            } else {
+                                "open"
+                            },
+                            row["state"].as_str().unwrap_or_default(),
+                            row["anchor"].as_str().unwrap_or_default(),
+                        );
+                        for comment in row["comments"].as_array().into_iter().flatten() {
+                            println!(
+                                "  @{}: {}",
+                                comment["author"].as_str().unwrap_or_default(),
+                                comment["body"].as_str().unwrap_or_default()
+                            );
+                        }
+                    }
+                }
+            }
+            other => anyhow::bail!("doc mode must be sync, comment or comments, not {other}"),
         },
         Command::Fetch {
             path,

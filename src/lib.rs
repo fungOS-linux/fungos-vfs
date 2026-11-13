@@ -8,6 +8,7 @@ mod anchor;
 mod bus;
 mod carry;
 mod cid;
+mod comments;
 mod content;
 mod crdt;
 mod doc;
@@ -29,23 +30,26 @@ mod transfer;
 mod vfs;
 mod worktree;
 
-pub use anchor::{Anchor, Comment, CommentBook, CommentOp, Resolution, Thread};
+pub use anchor::{Anchor, Comment, CommentBook, CommentOp, Resolution, Stamp, Thread};
 pub use bus::{
     CONTENT_AVAILABLE_KIND, CONTENT_DATA_KIND, CONTENT_ERROR_KIND, CONTENT_FETCH_KIND,
     ContentAvailable, ContentData, ContentError, ContentFetch, MAX_CONTENT_BYTES, MAX_RANGE_BYTES,
 };
 pub use carry::{CARRY_REF, Carried, ensure_commit as ensure_carried_commit};
 pub use cid::{CODEC_DAG_CBOR, CODEC_RAW, cid_bytes, cid_string, content_id_to_cid};
+pub use comments::{CommentFile, comments_key as doc_comments_key};
 pub use content::ContentId;
 pub use crdt::{Applied, Block, BlockId, Doc, Op, match_blocks, split_blocks};
-pub use doc::{DocFile, Reconciled, ops_key as doc_ops_key, snapshot_key as doc_snapshot_key};
+pub use doc::{
+    DocFile, Reconciled, load as load_doc, ops_key as doc_ops_key, snapshot_key as doc_snapshot_key,
+};
 pub use hydrate::Hydrator;
 pub use path::normalize_path;
 pub use pi::{ImportReport, import as import_pi, import_incremental as import_pi_incremental};
 pub use piece::{Have, Manifest, PIECE_SIZE, Piece, PieceError, PieceSource, empty_have, fetch};
 pub use policy::{PathClass, PathPolicy};
 pub use project::{ProjectReport, WorktreeRef, attach as attach_project, list as list_projects};
-pub use projector::{Projection, ProjectionReport, to_markdown, to_operator};
+pub use projector::{Projection, ProjectionReport, Synced, Transcript, to_markdown, to_operator};
 pub use provider::{
     MAX_PROVIDER_FRAME, PROVIDER_VERSION, ProviderReplica, ProviderReply, ProviderRequest,
     ProviderServer,

@@ -575,6 +575,65 @@ The wire already carried ranges (`unibus.content.fetch.v1`, bounded by
 independently checkable, which is what lets the ranges come from different peers
 instead of being concatenated from one.
 
+## Documents
+
+A file is a **view** of a document. The document is blocks with identities; the file is
+one rendering of them, and a save is a batch of ops from whoever touched it. Three
+layers, three jobs:
+
+- `crdt.rs` decides what two replicas agree on. Position is identity (`counter@actor`),
+  order comes from `(after, id)` and never from arrival order, a rewrite is an update
+  rather than a delete and an insert, and a deletion leaves a tombstone so anything
+  anchored to the block still resolves.
+- `doc.rs` binds that to a file: per-actor op streams at `docs/<id>/ops/<actor>.json`,
+  a `seen` record so a worktree can tell its own unsaved edits from a view that
+  predates a pull, and a snapshot at `docs/<id>/snapshot.md`. Each replica writes only
+  its own stream — one shared state blob would be last-writer-wins at the storage
+  layer, which is the thing the merge exists to avoid.
+- `anchor.rs` and `comments.rs` put annotations on blocks instead of positions, so a
+  thread survives the paragraph it is on being rewritten, and moves to the neighbour
+  when the paragraph is deleted.
+
+```sh
+cargo run -- --root ~/.local/share/fungos-vfs/notes doc sync --id notes --path NOTES.md
+cargo run -- --root ~/.local/share/fungos-vfs/notes doc comment --id notes \
+  --block '#2' --body "this section contradicts the intro"
+cargo run -- --root ~/.local/share/fungos-vfs/notes doc comment --id notes \
+  --thread 1@studio --body "agreed"
+cargo run -- --root ~/.local/share/fungos-vfs/notes doc comments --id notes --path NOTES.md
+```
+
+`--block` takes `#N` (the Nth live block) or `counter@actor`; anything recorded should
+use the identity, because a number moves when somebody inserts above it. `doc comments`
+prints each thread with its state — `exact`, `clamped`, `neighbour` or `orphan` — because
+a range that no longer fits is reported rather than silently presented as exact.
+
+Comments are stored the way edits are: one file per commenter at
+`docs/<id>/comments/<actor>.json`, merged on read. A reply is ordered by when it was
+said (`at_ms`), not by its identity: every commenter numbers their own stream from one,
+so a counter alone would sort an answer before the question. Settling a thread carries
+the same kind of stamp, which is what lets a later reopen win over an earlier settle
+without either replica guessing.
+
+### A transcript is a document
+
+`session project --to markdown` writes a whole record. Adding `--doc` grows an existing
+document instead: it appends only the turns the document does not already hold, so a
+running session can be projected on a timer without rewriting the file each time.
+
+```sh
+cargo run -- --root ~/.local/share/fungos-vfs/sessions session project --harness pi \
+  --id 01a1bdea-6672-706b-9cbb-d66eb9eb6c69 --to markdown \
+  --doc transcript --out transcript.md
+```
+
+The block identities belong to the record (`pi:1a2b3c4d`), not to the machine, so two
+replicas that absorb each other's ops before projecting extend one transcript rather
+than each building its own. One honest limit: a harness appends its record and does not
+rewrite turns it already wrote, so only the last turn is re-projected on each pass. A
+record rewritten in the middle is a full `session project --to markdown` plus
+`doc sync`, and this path does not pretend to notice it.
+
 ## Sessions
 
 A conversation is evidence: what was asked, what ran, what came back, and which

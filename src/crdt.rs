@@ -29,6 +29,8 @@ use serde::{Deserialize, Serialize};
 
 /// Who an edit is attributed to. The actor is part of every identity, so two
 /// machines generate the same counter without colliding.
+///
+/// Written `counter@actor` when a person has to name one.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BlockId {
     pub counter: u64,
@@ -42,6 +44,33 @@ impl BlockId {
             counter,
             actor: actor.to_owned(),
         }
+    }
+}
+
+/// `counter@actor`, the form a person types.
+///
+/// The actor half is free text (a harness record, a machine, a person), so the
+/// split is on the first `@` and everything after it is the actor.
+impl std::fmt::Display for BlockId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}@{}", self.counter, self.actor)
+    }
+}
+
+impl std::str::FromStr for BlockId {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let (counter, actor) = text
+            .split_once('@')
+            .ok_or_else(|| format!("a block id looks like 3@studio, not {text}"))?;
+        let counter = counter
+            .parse()
+            .map_err(|_| format!("{counter} is not a block counter"))?;
+        if actor.is_empty() {
+            return Err("a block id needs an actor after the @".to_owned());
+        }
+        Ok(Self::new(counter, actor))
     }
 }
 
@@ -120,6 +149,19 @@ impl Doc {
         let id = BlockId::new(self.clock, &self.actor);
         self.clock += 1;
         id
+    }
+
+    /// An identity for a write this replica is making, keeping the clock ahead of
+    /// everything it has seen.
+    ///
+    /// The same counter space [`import`](Self::import) draws from, exposed for the
+    /// writers that build ops themselves — a projector appending a turn, an
+    /// annotation settling a thread. A caller must not mint its own numbers: an
+    /// `at` that does not sort after the block's revision is a write that loses
+    /// silently.
+    #[must_use]
+    pub fn stamp(&mut self) -> BlockId {
+        self.tick()
     }
 
     /// Apply one op. Idempotent: applying the same op twice is a duplicate, not a

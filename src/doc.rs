@@ -29,7 +29,7 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use crate::{ContentId, Expect, Op, Vfs, crdt};
+use crate::{BlockId, ContentId, Expect, Op, Vfs, crdt};
 
 /// Where one replica's ops live.
 #[must_use]
@@ -101,14 +101,8 @@ impl DocFile {
     pub fn open(vfs: &Vfs, id: &str, actor: &str, path: &Path) -> Result<Self> {
         let mut doc = crdt::Doc::new(actor);
         let mut mine = Vec::new();
-        for entry in vfs.list(&ops_prefix(id))? {
-            if !under_ops(id, &entry.path) {
-                continue;
-            }
-            let bytes = vfs.content(&entry.content_id)?;
-            let ops: Vec<Op> = serde_json::from_slice(&bytes)
-                .with_context(|| format!("reading {}", entry.path))?;
-            if entry.path == ops_key(id, actor) {
+        for (stream, ops) in read_ops(vfs, id)? {
+            if stream == ops_key(id, actor) {
                 mine.clone_from(&ops);
             }
             doc.apply_all(&ops);
@@ -133,18 +127,17 @@ impl DocFile {
         Ok(open)
     }
 
+    /// An identity for a write this replica is making on this document's behalf.
+    pub fn stamp(&mut self) -> BlockId {
+        self.doc.stamp()
+    }
+
     /// Take in what the other replicas have written since the last pass.
     fn absorb(&mut self, vfs: &Vfs) -> Result<()> {
-        for entry in vfs.list(&ops_prefix(&self.id))? {
-            if !under_ops(&self.id, &entry.path) {
+        for (stream, ops) in read_ops(vfs, &self.id)? {
+            if stream == ops_key(&self.id, &self.actor) {
                 continue;
             }
-            if entry.path == ops_key(&self.id, &self.actor) {
-                continue;
-            }
-            let bytes = vfs.content(&entry.content_id)?;
-            let ops: Vec<Op> = serde_json::from_slice(&bytes)
-                .with_context(|| format!("reading {}", entry.path))?;
             self.doc.apply_all(&ops);
         }
         Ok(())
@@ -183,6 +176,29 @@ impl DocFile {
                 _ => self.doc.import(&current),
             }
         };
+        let mut reconciled = self.commit(vfs, ops, &current)?;
+        reconciled.replaced_unseen_text = replaced_unseen_text;
+        Ok(reconciled)
+    }
+
+    /// Add ops this replica authored, without reading the file as an edit.
+    ///
+    /// This is the seam a projector uses: a transcript that grew by one turn is
+    /// one insert, not a 20 KB file that has to be re-read, re-split and
+    /// re-diffed. The file is still written and snapshotted, so git sees the same
+    /// text either way.
+    ///
+    /// A file this worktree has never seen is replaced rather than merged, exactly
+    /// as [`reconcile`](Self::reconcile) does — an op is not a base to merge a
+    /// stale view against either.
+    pub fn extend(&mut self, vfs: &mut Vfs, ops: Vec<Op>) -> Result<Reconciled> {
+        let current = read_or_none(&self.path)?.unwrap_or_default();
+        self.unshown = false;
+        self.commit(vfs, ops, &current)
+    }
+
+    /// Apply `ops`, publish this replica's stream, and write the merged text.
+    fn commit(&mut self, vfs: &mut Vfs, ops: Vec<Op>, current: &str) -> Result<Reconciled> {
         let report_ops = ops.len();
         let deferred = self.doc.apply_all(&ops).len();
         self.absorb(vfs)?;
@@ -198,7 +214,7 @@ impl DocFile {
         }
 
         let merged = self.doc.render();
-        let wrote_file = normalize(&merged) != normalize(&current);
+        let wrote_file = normalize(&merged) != normalize(current);
         if wrote_file {
             if let Some(parent) = self.path.parent() {
                 fs::create_dir_all(parent)
@@ -225,8 +241,17 @@ impl DocFile {
             ops: report_ops,
             wrote_file,
             deferred,
-            replaced_unseen_text,
+            replaced_unseen_text: false,
         })
+    }
+
+    /// The document as it stands in memory.
+    ///
+    /// Read-only on purpose: the merge is this module's business, and a caller
+    /// that could mutate the document could mutate it without publishing ops.
+    #[must_use]
+    pub fn doc(&self) -> &crdt::Doc {
+        &self.doc
     }
 
     /// The document as it stands in memory.
@@ -246,6 +271,35 @@ impl DocFile {
             .file(&snapshot_key(&self.id))?
             .map(|entry| entry.content_id))
     }
+}
+
+/// Every actor's op file under `docs/<id>/ops`, with the path it came from.
+fn read_ops(vfs: &Vfs, id: &str) -> Result<Vec<(String, Vec<Op>)>> {
+    let mut streams = Vec::new();
+    for entry in vfs.list(&ops_prefix(id))? {
+        if !under_ops(id, &entry.path) {
+            continue;
+        }
+        let bytes = vfs.content(&entry.content_id)?;
+        let ops: Vec<Op> =
+            serde_json::from_slice(&bytes).with_context(|| format!("reading {}", entry.path))?;
+        streams.push((entry.path, ops));
+    }
+    Ok(streams)
+}
+
+/// A document as the root holds it, without binding it to a file.
+///
+/// Reading what a document *is* must not require the machine to hold the file
+/// that displays it: listing the annotations on somebody else's transcript has
+/// no file to open, and inventing a path for one would only be a lie about where
+/// the document lives.
+pub fn load(vfs: &Vfs, id: &str, actor: &str) -> Result<crdt::Doc> {
+    let mut doc = crdt::Doc::new(actor);
+    for (_, ops) in read_ops(vfs, id)? {
+        doc.apply_all(&ops);
+    }
+    Ok(doc)
 }
 
 fn read_or_none(path: &Path) -> Result<Option<String>> {

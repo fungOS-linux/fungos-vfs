@@ -70,6 +70,21 @@ impl Resolution {
             Self::Orphan => None,
         }
     }
+
+    /// The word a listing prints.
+    ///
+    /// Spelled out because `clamped` and `neighbour` are the two states a reader
+    /// has to notice: one says the words moved inside the block, the other says
+    /// the block is gone and this is what took its place.
+    #[must_use]
+    pub fn state(&self) -> &'static str {
+        match self {
+            Self::Exact(_) => "exact",
+            Self::Clamped(_) => "clamped",
+            Self::Neighbour(_) => "neighbour",
+            Self::Orphan => "orphan",
+        }
+    }
 }
 
 impl Anchor {
@@ -133,6 +148,29 @@ pub struct Comment {
     pub id: BlockId,
     pub author: String,
     pub body: String,
+    /// When it was said, in milliseconds since the epoch, as the writer's clock
+    /// read it.
+    ///
+    /// A counter is not an order across writers: every commenter numbers their
+    /// own stream from one, so a reply would sort before the question it answers.
+    /// Time is the only thing that reliably puts them in the order a person said
+    /// them, and the id breaks a tie so two replicas still agree.
+    #[serde(default)]
+    pub at_ms: i64,
+}
+
+/// When something happened, in terms that compare across writers.
+///
+/// A counter is not an order across writers: every commenter numbers their own
+/// stream from one, so the second person to reply holds the smaller number and
+/// a settle from them would lose to a settle they never saw. Time is the part
+/// that orders, and the identity breaks a tie within one millisecond.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Stamp {
+    /// Milliseconds since the epoch, as the writer's clock read them.
+    pub at_ms: i64,
+    /// Who did it, and the counter that orders two writes in one millisecond.
+    pub by: BlockId,
 }
 
 /// A comment thread, anchored to one place.
@@ -144,9 +182,9 @@ pub struct Thread {
     /// Set while the thread is resolved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_at: Option<BlockId>,
-    /// The stamp of the last settle or reopen, so a stale one cannot win later.
+    /// The last settle or reopen, so a stale one cannot win later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub settled: Option<BlockId>,
+    pub settled: Option<Stamp>,
 }
 
 impl Thread {
@@ -169,11 +207,13 @@ pub enum CommentOp {
         id: BlockId,
         author: String,
         body: String,
+        #[serde(default)]
+        at_ms: i64,
     },
     /// Mark resolved, or reopen with `resolved: false`.
     Settle {
         thread: BlockId,
-        at: BlockId,
+        stamp: Stamp,
         resolved: bool,
     },
 }
@@ -211,6 +251,7 @@ impl CommentBook {
                 id,
                 author,
                 body,
+                at_ms,
             } => {
                 let Some(open) = self.threads.get_mut(thread) else {
                     return Applied::Deferred;
@@ -222,27 +263,33 @@ impl CommentBook {
                     id: id.clone(),
                     author: author.clone(),
                     body: body.clone(),
+                    at_ms: *at_ms,
                 });
                 // Two replies that arrive out of order are the same set; sort by
-                // stamp so every replica shows the same sequence.
-                open.comments.sort_by(|a, b| a.id.cmp(&b.id));
+                // when they were said so every replica shows the same sequence.
+                open.comments
+                    .sort_by(|a, b| (a.at_ms, &a.id).cmp(&(b.at_ms, &b.id)));
                 Applied::Applied
             }
             CommentOp::Settle {
                 thread,
-                at,
+                stamp,
                 resolved,
             } => {
                 let Some(open) = self.threads.get_mut(thread) else {
                     return Applied::Deferred;
                 };
-                if open.settled.as_ref().is_some_and(|current| current >= at) {
+                if open
+                    .settled
+                    .as_ref()
+                    .is_some_and(|current| current >= stamp)
+                {
                     return Applied::Duplicate;
                 }
-                open.settled = Some(at.clone());
+                open.settled = Some(stamp.clone());
                 // A reopen has to remember that it won, not merely forget the
                 // settle: otherwise a stale settle arriving afterwards wins.
-                open.resolved_at = resolved.then(|| at.clone());
+                open.resolved_at = resolved.then(|| stamp.by.clone());
                 Applied::Applied
             }
         }
@@ -389,21 +436,29 @@ mod tests {
             id: BlockId::new(2, "neo"),
             author: "neo".to_owned(),
             body: "agreed".to_owned(),
+            at_ms: 2_000,
         };
         let reply_b = CommentOp::Say {
             thread: BlockId::new(1, "studio"),
             id: BlockId::new(2, "studio"),
             author: "studio".to_owned(),
             body: "and one more thing".to_owned(),
+            at_ms: 3_000,
         };
         let settle = CommentOp::Settle {
             thread: BlockId::new(1, "studio"),
-            at: BlockId::new(3, "neo"),
+            stamp: Stamp {
+                at_ms: 4_000,
+                by: BlockId::new(1, "neo"),
+            },
             resolved: true,
         };
         let reopen = CommentOp::Settle {
             thread: BlockId::new(1, "studio"),
-            at: BlockId::new(4, "studio"),
+            stamp: Stamp {
+                at_ms: 5_000,
+                by: BlockId::new(3, "studio"),
+            },
             resolved: false,
         };
 
@@ -426,7 +481,15 @@ mod tests {
         let one = one.thread(&thread).unwrap();
         let two = two.thread(&thread).unwrap();
         assert_eq!(one, two, "the same ops in either order give one thread");
-        assert_eq!(one.comments.len(), 2, "both replies, in stamp order");
+        assert_eq!(
+            one.comments.len(),
+            2,
+            "both replies, in the order they were said"
+        );
+        assert_eq!(
+            one.comments[0].author, "neo",
+            "the earlier reply reads first"
+        );
         assert!(!one.resolved(), "the later reopen wins");
         let _ = doc;
     }
@@ -444,13 +507,19 @@ mod tests {
         });
         book.apply(&CommentOp::Settle {
             thread: thread.clone(),
-            at: BlockId::new(9, "studio"),
+            stamp: Stamp {
+                at_ms: 9_000,
+                by: BlockId::new(1, "studio"),
+            },
             resolved: false,
         });
         // A settle stamped earlier, arriving later, must not win.
         book.apply(&CommentOp::Settle {
             thread: thread.clone(),
-            at: BlockId::new(3, "neo"),
+            stamp: Stamp {
+                at_ms: 3_000,
+                by: BlockId::new(9, "neo"),
+            },
             resolved: true,
         });
         assert!(!book.thread(&thread).unwrap().resolved());
