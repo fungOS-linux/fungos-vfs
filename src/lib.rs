@@ -8,6 +8,7 @@ mod bus;
 mod carry;
 mod cid;
 mod content;
+mod crdt;
 mod hydrate;
 mod path;
 mod pi;
@@ -33,6 +34,7 @@ pub use bus::{
 pub use carry::{CARRY_REF, Carried, ensure_commit as ensure_carried_commit};
 pub use cid::{CODEC_DAG_CBOR, CODEC_RAW, cid_bytes, cid_string, content_id_to_cid};
 pub use content::ContentId;
+pub use crdt::{Applied, Block, BlockId, Doc, Op, match_blocks, split_blocks};
 pub use hydrate::Hydrator;
 pub use path::normalize_path;
 pub use pi::{ImportReport, import as import_pi, import_incremental as import_pi_incremental};
