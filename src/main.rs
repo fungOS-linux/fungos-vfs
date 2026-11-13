@@ -7,10 +7,12 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use fungos_vfs::{
-    ApplyOutcome, CheckoutOptions, ContentId, Expect, Hydration, NodeRole, PathPolicy,
-    RecordOptions, ReplicaConfig, ReplicaSpec, SourceMode, SyncServer, Vfs, attach_project,
-    checkout, export_dir, ingest_dir_with_policy, list_projects, materialize,
-    migrate_storage_with_cas, pull_over_quic, pull_over_ssh, record, worktree_changes, worktrees,
+    Anchor, ApplyOutcome, BlockId, CheckoutOptions, CommentFile, ContentId, Doc, DocFile, Docx,
+    Expect, Hydration, NodeRole, PathPolicy, RecordOptions, ReplicaConfig, ReplicaSpec, SourceMode,
+    SyncServer, Transcript, Vfs, attach_project, checkout, export_dir, import_pi,
+    import_pi_incremental, ingest_dir_with_policy, list_projects, load_doc, materialize,
+    migrate_storage_with_cas, pull_over_quic, pull_over_ssh, record, to_markdown, to_operator,
+    worktree_changes, worktrees,
 };
 
 #[derive(Parser)]
@@ -311,6 +313,81 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Conversations as records: import them from a harness, list them, show
+    /// one, or project one into another harness's format.
+    Session {
+        /// `import`, `list`, `show`, `project`, or `sync`.
+        mode: String,
+        /// Which harness, for `import` (`pi`) and to filter `list`.
+        #[arg(long)]
+        harness: Option<String>,
+        /// The harness's own store, for `import`.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// The session's native id, for `show` and `project`. Omit it to take
+        /// every session the harness has.
+        #[arg(long)]
+        id: Option<String>,
+        /// What to project into. `operator` is what this build writes.
+        #[arg(long)]
+        to: Option<String>,
+        /// A document to grow instead of overwriting `--out`. With `markdown`
+        /// this appends only the turns the document does not already hold, so a
+        /// running session can be projected on a timer.
+        #[arg(long = "doc")]
+        doc: Option<String>,
+        /// Where the target keeps its transcripts, for `project`. For
+        /// `operator` that is `<workspace>/.operator/runs`.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// The workspace the projected session claims, for `project`. Defaults
+        /// to the cwd the conversation was recorded in.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Count what an import would write, and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// A markdown file and the document it is a view of: read the file's edits,
+    /// merge them, and write the result back.
+    Doc {
+        /// `sync`, `comment`, or `comments`.
+        mode: String,
+        /// The document's identity. Two files with one id are one document.
+        #[arg(long)]
+        id: Option<String>,
+        /// The file to reconcile.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// The markdown view to write for `import`, and to read for `view`.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Who the edits, and the comments, are attributed to. Defaults to this
+        /// store's actor, which has to be stable or every run starts a new stream.
+        #[arg(long)]
+        actor: Option<String>,
+        /// The block a new thread hangs on: `counter@actor`, or `#N` for the Nth
+        /// live block of the document.
+        #[arg(long)]
+        block: Option<String>,
+        /// What to say. With `--block` it opens a thread; with `--thread` it
+        /// replies.
+        #[arg(long)]
+        body: Option<String>,
+        /// An existing thread, for a reply or a settle.
+        #[arg(long)]
+        thread: Option<String>,
+        /// Mark the thread in `--thread` resolved.
+        #[arg(long)]
+        settle: bool,
+        /// Reopen the thread in `--thread`.
+        #[arg(long)]
+        reopen: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Fill placeholders from the configured replicas.
     Fetch {
         /// One namespace path.
@@ -323,6 +400,55 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+/// Milliseconds since the epoch, as this process reads the clock.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
+}
+
+/// `#N` names the Nth live block of a document; `counter@actor` names one exactly.
+///
+/// The number is a convenience for a person at a terminal. Anything recorded
+/// should use the identity: positions move when somebody inserts above them.
+fn anchor_spec(doc: &Doc, spec: &str) -> anyhow::Result<Anchor> {
+    let spec = spec.trim();
+    if let Some(number) = spec.strip_prefix('#') {
+        let number: usize = number
+            .parse()
+            .map_err(|_| anyhow::anyhow!("#{number} is not a block number"))?;
+        let live = doc.live();
+        let block = number.checked_sub(1).and_then(|index| live.get(index));
+        let block = block.ok_or_else(|| {
+            anyhow::anyhow!("the document has {} live blocks, not {number}", live.len())
+        })?;
+        return Ok(Anchor::Block {
+            block: block.id.clone(),
+        });
+    }
+    Ok(Anchor::Block {
+        block: spec.parse().map_err(anyhow::Error::msg)?,
+    })
+}
+
+/// The first line of a block, short enough to scan in a listing.
+fn one_line(text: &str) -> String {
+    let first = text.lines().next().unwrap_or_default().trim();
+    if first.chars().count() > 96 {
+        format!("{}…", first.chars().take(96).collect::<String>())
+    } else {
+        first.to_owned()
+    }
+}
+
+fn anchor_label(anchor: &Anchor) -> String {
+    match anchor {
+        Anchor::Block { block } => block.to_string(),
+        Anchor::Range { block, start, end } => format!("{block}[{start}..{end}]"),
+    }
 }
 
 fn main() {
@@ -927,6 +1053,598 @@ fn run() -> anyhow::Result<()> {
                 anyhow::bail!("replica mode must be add, list, remove, push or serve, not {other}")
             }
         },
+        Command::Session {
+            mode,
+            harness,
+            path,
+            id,
+            to,
+            doc,
+            out,
+            workspace,
+            dry_run,
+            json,
+        } => match mode.as_str() {
+            "import" => {
+                let root = path.ok_or_else(|| anyhow::anyhow!("session import needs --path"))?;
+                let harness = harness.unwrap_or_else(|| "pi".to_owned());
+                let report = match harness.as_str() {
+                    "pi" => import_pi(&mut vfs, &root, dry_run)?,
+                    other => anyhow::bail!("no importer for {other}; this build has pi"),
+                };
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!(
+                        "{harness}: {} sessions ({} written, {} unchanged), {} turns, \
+                         {} new payloads, {:.1} MiB",
+                        report.sessions,
+                        report.written,
+                        report.unchanged,
+                        report.turns,
+                        report.blobs,
+                        report.bytes as f64 / (1024.0 * 1024.0)
+                    );
+                    for (kind, count) in &report.unnormalized {
+                        println!("  unnormalized {kind}: {count}");
+                    }
+                }
+            }
+            "list" => {
+                let sessions = vfs.sessions(harness.as_deref())?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&sessions)?);
+                } else {
+                    for session in sessions {
+                        println!(
+                            "{}\t{}\t{}\t{}\t{} turns",
+                            session.harness,
+                            session.native_id,
+                            session.name.as_deref().unwrap_or("-"),
+                            session.started_at_ms,
+                            session.turns
+                        );
+                    }
+                }
+            }
+            // Import what changed, then project everything: one command, because a
+            // timer that has to run two is a timer somebody will wire up wrong.
+            "sync" => {
+                let harness =
+                    harness.ok_or_else(|| anyhow::anyhow!("session sync needs --harness"))?;
+                let store = path.ok_or_else(|| anyhow::anyhow!("session sync needs --path"))?;
+                let out = out.ok_or_else(|| anyhow::anyhow!("session sync needs --out"))?;
+                let report = match harness.as_str() {
+                    "pi" => import_pi_incremental(&mut vfs, &store, dry_run)?,
+                    other => anyhow::bail!("no importer for {other}; this build has pi"),
+                };
+                let mut projected = 0usize;
+                let mut rewritten = 0usize;
+                let mut skipped = report.unnormalized.clone();
+                let summaries = vfs.sessions(Some(&harness))?;
+                // Rebuild only what moved. A timer fires whether or not anybody
+                // wrote anything, and projecting 140 unchanged sessions costs a
+                // minute of hashing to produce 140 identical files. A runs
+                // directory that is missing bundles — first run, or somebody
+                // cleaned it — gets everything again.
+                let bundles = fs::read_dir(&out)
+                    .map(|entries| {
+                        entries
+                            .filter_map(|entry| entry.ok())
+                            .filter(|entry| {
+                                entry.path().extension().is_some_and(|ext| ext == "ndjson")
+                            })
+                            .count()
+                    })
+                    .unwrap_or_default();
+                let project_all = bundles < summaries.len();
+                for summary in &summaries {
+                    if !project_all && !report.changed.contains(&summary.native_id) {
+                        continue;
+                    }
+                    let Some(session) = vfs.session(&harness, &summary.native_id)? else {
+                        continue;
+                    };
+                    let projection =
+                        to_operator(&vfs, &session, &out, workspace.as_deref(), dry_run)?;
+                    projected += 1;
+                    if projection.report.written {
+                        rewritten += 1;
+                    }
+                    for (reason, count) in projection.report.skipped {
+                        *skipped.entry(reason).or_default() += count;
+                    }
+                }
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "import": report,
+                            "projected": projected,
+                            "bundles_rewritten": rewritten,
+                            "skipped": skipped,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "{harness}: {} new or changed files ({} unchanged), {} turns, \
+                         {} new payloads; {} bundles ({rewritten} rewritten){}",
+                        report.sessions,
+                        report.files_skipped,
+                        report.turns,
+                        report.blobs,
+                        projected,
+                        if dry_run { " (dry run)" } else { "" }
+                    );
+                    for (reason, count) in &skipped {
+                        println!("  counted {reason}: {count}");
+                    }
+                }
+            }
+            "project" => {
+                let harness =
+                    harness.ok_or_else(|| anyhow::anyhow!("session project needs --harness"))?;
+                let out = out.ok_or_else(|| anyhow::anyhow!("session project needs --out"))?;
+                let target = to.as_deref().unwrap_or("operator").to_owned();
+                match target.as_str() {
+                    "operator" | "markdown" => {}
+                    other => {
+                        anyhow::bail!(
+                            "no projector for {other}; this build writes operator and markdown"
+                        )
+                    }
+                }
+                // One session by id, or every session the harness has: the point
+                // of a runs directory is a shelf of them, not a single file.
+                let sessions = match &id {
+                    Some(id) => vec![
+                        vfs.session(&harness, id)?
+                            .ok_or_else(|| anyhow::anyhow!("no session {harness}/{id}"))?,
+                    ],
+                    None => {
+                        let mut sessions = Vec::new();
+                        for summary in vfs.sessions(Some(&harness))? {
+                            if let Some(session) = vfs.session(&harness, &summary.native_id)? {
+                                sessions.push(session);
+                            }
+                        }
+                        sessions
+                    }
+                };
+                if target == "markdown" {
+                    // A transcript is a document. With `--doc` it is grown in
+                    // place: only the turns the document does not already hold
+                    // are projected, so a running session can be projected on a
+                    // timer instead of rewriting the file each time.
+                    let session = sessions
+                        .first()
+                        .ok_or_else(|| anyhow::anyhow!("markdown projection needs one session"))?;
+                    if let Some(doc_id) = &doc {
+                        let actor = cli
+                            .actor
+                            .clone()
+                            .unwrap_or_else(|| vfs.writer().actor.clone());
+                        let mut file = DocFile::open(&vfs, doc_id, &actor, &out)?;
+                        let synced = Transcript::sync(&mut file, &mut vfs, session)?;
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "document": doc_id,
+                                    "path": out,
+                                    "actor": actor,
+                                    "synced": synced,
+                                })
+                            );
+                        } else {
+                            println!(
+                                "{}\t{} turns, {} new blocks, {} rewritten{}, {}",
+                                out.display(),
+                                synced.turns,
+                                synced.inserted,
+                                synced.updated,
+                                if synced.deleted > 0 {
+                                    format!(", {} dropped", synced.deleted)
+                                } else {
+                                    String::new()
+                                },
+                                if synced.wrote_file {
+                                    "file rewritten"
+                                } else {
+                                    "file unchanged"
+                                }
+                            );
+                        }
+                        return Ok(());
+                    }
+                    let text = to_markdown(&vfs, session)?;
+                    fs::write(&out, &text)?;
+                    println!("{}\t{} bytes", out.display(), text.len());
+                    return Ok(());
+                }
+                let mut projected = Vec::new();
+                for session in &sessions {
+                    let projection =
+                        to_operator(&vfs, session, &out, workspace.as_deref(), dry_run)?;
+                    if json {
+                        projected.push(serde_json::json!({
+                            "path": projection.path,
+                            "report": projection.report,
+                        }));
+                    } else {
+                        println!(
+                            "{}\t{} messages, {} attachments, {} bytes{}",
+                            projection.path.display(),
+                            projection.report.messages,
+                            projection.report.attachments,
+                            projection.report.bytes,
+                            if dry_run { " (dry run)" } else { "" }
+                        );
+                        for (reason, count) in &projection.report.skipped {
+                            println!("  skipped {reason}: {count}");
+                        }
+                    }
+                }
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&projected)?);
+                }
+            }
+            "show" => {
+                let harness =
+                    harness.ok_or_else(|| anyhow::anyhow!("session show needs --harness"))?;
+                let native_id = id.ok_or_else(|| anyhow::anyhow!("session show needs --id"))?;
+                let session = vfs
+                    .session(&harness, &native_id)?
+                    .ok_or_else(|| anyhow::anyhow!("no session {harness}/{native_id}"))?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&session)?);
+                } else {
+                    print_session(&vfs, &session)?;
+                }
+            }
+            other => {
+                anyhow::bail!(
+                    "session mode must be import, list, show, project or sync, not {other}"
+                )
+            }
+        },
+        Command::Doc {
+            mode,
+            id,
+            path,
+            out,
+            actor,
+            block,
+            body,
+            thread,
+            settle,
+            reopen,
+            json,
+        } => match mode.as_str() {
+            "sync" => {
+                let id = id.ok_or_else(|| anyhow::anyhow!("doc sync needs --id"))?;
+                let path = path.ok_or_else(|| anyhow::anyhow!("doc sync needs --path"))?;
+                let actor = actor.unwrap_or_else(|| vfs.writer().actor.clone());
+                let mut doc = DocFile::open(&vfs, &id, &actor, &path)?;
+                let report = doc.reconcile(&mut vfs)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "path": path,
+                            "actor": actor,
+                            "ops": report.ops,
+                            "wrote_file": report.wrote_file,
+                            "deferred": report.deferred,
+                            "replaced_unseen_text": report.replaced_unseen_text,
+                            "snapshot": doc.snapshot(&vfs)?,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "{}\t{} ops, {}{}{}",
+                        path.display(),
+                        report.ops,
+                        if report.wrote_file {
+                            "file rewritten"
+                        } else {
+                            "file unchanged"
+                        },
+                        if report.deferred > 0 {
+                            format!(", {} deferred", report.deferred)
+                        } else {
+                            String::new()
+                        },
+                        if report.replaced_unseen_text {
+                            ", replaced text this worktree had not seen"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+            "comment" => {
+                let id = id.ok_or_else(|| anyhow::anyhow!("doc comment needs --id"))?;
+                let actor = actor.unwrap_or_else(|| vfs.writer().actor.clone());
+                let mut comments = CommentFile::open(&vfs, &id, &actor)?;
+                match (block, thread) {
+                    (Some(spec), _) => {
+                        let body =
+                            body.ok_or_else(|| anyhow::anyhow!("doc comment needs --body"))?;
+                        // The document decides which block `#N` means, and the
+                        // root has every actor's ops: the file is only a view of
+                        // it and may not have been synced yet.
+                        let doc = load_doc(&vfs, &id, &actor)?;
+                        let anchor = anchor_spec(&doc, &spec)?;
+                        let thread =
+                            comments.open_thread(&mut vfs, anchor.clone(), &body, now_ms())?;
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "document": id,
+                                    "thread": thread,
+                                    "anchor": anchor_label(&anchor),
+                                    "author": actor,
+                                })
+                            );
+                        } else {
+                            println!("{thread}\t{}\t{id}", anchor_label(&anchor));
+                        }
+                    }
+                    (None, Some(spec)) => {
+                        let thread: BlockId = spec.parse().map_err(anyhow::Error::msg)?;
+                        if settle && reopen {
+                            anyhow::bail!("a comment is settled or reopened, not both");
+                        }
+                        if settle || reopen {
+                            let at = comments.settle(&mut vfs, &thread, settle, now_ms())?;
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::json!({
+                                        "thread": thread,
+                                        "settled": at,
+                                        "resolved": settle,
+                                    })
+                                );
+                            } else {
+                                println!(
+                                    "{thread}\t{}",
+                                    if settle { "resolved" } else { "reopened" }
+                                );
+                            }
+                        } else {
+                            let body =
+                                body.ok_or_else(|| anyhow::anyhow!("doc comment needs --body"))?;
+                            let comment = comments.say(&mut vfs, &thread, &body, now_ms())?;
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::json!({
+                                        "thread": thread,
+                                        "comment": comment,
+                                        "author": actor,
+                                    })
+                                );
+                            } else {
+                                println!("{thread}\t{comment}\t@{actor}");
+                            }
+                        }
+                    }
+                    (None, None) => anyhow::bail!(
+                        "doc comment needs --block (open a thread on a block) or --thread \
+                         (reply to one)"
+                    ),
+                }
+            }
+            "comments" => {
+                let id = id.ok_or_else(|| anyhow::anyhow!("doc comments needs --id"))?;
+                let actor = actor.unwrap_or_else(|| vfs.writer().actor.clone());
+                let comments = CommentFile::open(&vfs, &id, &actor)?;
+                // Resolution is against the document. The file is preferred when
+                // it is here because it may hold edits the root has not seen yet.
+                let doc = match &path {
+                    Some(path) => DocFile::open(&vfs, &id, &actor, path)?.doc().clone(),
+                    None => load_doc(&vfs, &id, &actor)?,
+                };
+                let rows: Vec<serde_json::Value> = comments
+                    .threads(&doc)
+                    .into_iter()
+                    .map(|(thread, resolution)| {
+                        serde_json::json!({
+                            "document": id,
+                            "thread": thread.id,
+                            "state": resolution.state(),
+                            "at": resolution.block(),
+                            "resolved": thread.resolved(),
+                            "anchor": anchor_label(&thread.anchor),
+                            "comments": thread.comments.iter().map(|comment| {
+                                serde_json::json!({
+                                    "id": comment.id,
+                                    "author": comment.author,
+                                    "body": comment.body,
+                                })
+                            }).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                } else if rows.is_empty() {
+                    println!("{id}\tno threads");
+                } else {
+                    for row in &rows {
+                        println!(
+                            "{}\t{}\t{}\t{}",
+                            row["thread"].as_str().unwrap_or_default(),
+                            if row["resolved"].as_bool().unwrap_or(false) {
+                                "resolved"
+                            } else {
+                                "open"
+                            },
+                            row["state"].as_str().unwrap_or_default(),
+                            row["anchor"].as_str().unwrap_or_default(),
+                        );
+                        for comment in row["comments"].as_array().into_iter().flatten() {
+                            println!(
+                                "  @{}: {}",
+                                comment["author"].as_str().unwrap_or_default(),
+                                comment["body"].as_str().unwrap_or_default()
+                            );
+                        }
+                    }
+                }
+            }
+            "import" => {
+                let id = id.ok_or_else(|| anyhow::anyhow!("doc import needs --id"))?;
+                let source = path.ok_or_else(|| anyhow::anyhow!("doc import needs --path"))?;
+                let actor = actor.unwrap_or_else(|| vfs.writer().actor.clone());
+                // The markdown view is what a person and an agent edit; the
+                // container stays where it is and stays the authority for the parts
+                // this reader does not model.
+                let view = out.unwrap_or_else(|| source.with_extension("md"));
+                let bytes = fs::read(&source)?;
+                if !fungos_vfs::docx::is_docx(&bytes) {
+                    anyhow::bail!(
+                        "{} is not a .docx container: a Word file starts with a zip header",
+                        source.display()
+                    );
+                }
+                let docx = Docx::read(&bytes, &id)?;
+                let document = load_doc(&vfs, &id, &actor)?;
+                let (ops, imported) = docx.ops(&document, &actor);
+                let mut file = DocFile::open(&vfs, &id, &actor, &view)?;
+                let reconciled = file.extend(&mut vfs, ops)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "document": id,
+                            "source": source,
+                            "view": view,
+                            "paragraphs": docx.report.paragraphs,
+                            "identified": docx.report.identified,
+                            "synthetic": docx.report.synthetic,
+                            "inserted": imported.inserted,
+                            "updated": imported.updated,
+                            "deleted": imported.deleted,
+                            "reordered": imported.reordered,
+                            "unmodeled": docx.report.unmodeled,
+                            "parts": docx.report.parts,
+                            "wrote_view": reconciled.wrote_file,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "{}\t{} paragraphs ({} by id, {} by position), {} new blocks, {} rewritten, {} deleted{}",
+                        view.display(),
+                        docx.report.paragraphs,
+                        docx.report.identified,
+                        docx.report.synthetic,
+                        imported.inserted,
+                        imported.updated,
+                        imported.deleted,
+                        if imported.reordered > 0 {
+                            format!(", {} moved", imported.reordered)
+                        } else {
+                            String::new()
+                        },
+                    );
+                    for (name, count) in &docx.report.unmodeled {
+                        println!("  not modelled: {name} × {count}");
+                    }
+                }
+            }
+            // The read model a view renders: every block with the identity that
+            // survives editing, and the threads hanging on it.
+            "view" => {
+                let id = id.ok_or_else(|| anyhow::anyhow!("doc view needs --id"))?;
+                let actor = actor.unwrap_or_else(|| vfs.writer().actor.clone());
+                let doc = match path.as_ref().or(out.as_ref()) {
+                    Some(view) => DocFile::open(&vfs, &id, &actor, view)?.doc().clone(),
+                    None => load_doc(&vfs, &id, &actor)?,
+                };
+                let comments = CommentFile::open(&vfs, &id, &actor)?;
+                let threads = comments.threads(&doc);
+                if json {
+                    let blocks: Vec<serde_json::Value> = doc
+                        .live()
+                        .iter()
+                        .map(|block| {
+                            serde_json::json!({
+                                "id": block.id,
+                                "text": block.text,
+                                "threads": threads
+                                    .iter()
+                                    .filter(|(_, resolution)| resolution
+                                        .block()
+                                        .is_some_and(|at| at == &block.id))
+                                    .map(|(thread, resolution)| serde_json::json!({
+                                        "id": thread.id,
+                                        "state": resolution.state(),
+                                        "resolved": thread.resolved(),
+                                        "comments": thread
+                                            .comments
+                                            .iter()
+                                            .map(|comment| serde_json::json!({
+                                                "author": comment.author,
+                                                "body": comment.body,
+                                            }))
+                                            .collect::<Vec<_>>(),
+                                    }))
+                                    .collect::<Vec<_>>(),
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&blocks)?);
+                } else {
+                    let live = doc.live();
+                    if live.is_empty() {
+                        println!("{id}\tno blocks yet");
+                    }
+                    for block in live {
+                        println!("{}\t{}", block.id, one_line(&block.text));
+                        for (thread, resolution) in &threads {
+                            if resolution.block().is_some_and(|at| at == &block.id) {
+                                println!(
+                                    "  [{}] {} {}",
+                                    thread.id,
+                                    if thread.resolved() {
+                                        "resolved"
+                                    } else {
+                                        "open"
+                                    },
+                                    resolution.state()
+                                );
+                                for comment in &thread.comments {
+                                    println!(
+                                        "    @{}: {}",
+                                        comment.author,
+                                        one_line(&comment.body)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    for (thread, resolution) in &threads {
+                        if resolution.block().is_none() {
+                            println!(
+                                "[{}] {} {} — nothing left to point at",
+                                thread.id,
+                                if thread.resolved() {
+                                    "resolved"
+                                } else {
+                                    "open"
+                                },
+                                resolution.state()
+                            );
+                        }
+                    }
+                }
+            }
+            other => anyhow::bail!("doc mode must be sync, comment or comments, not {other}"),
+        },
         Command::Fetch {
             path,
             prefix,
@@ -982,6 +1700,53 @@ fn run() -> anyhow::Result<()> {
         }
         // Handled before the store is opened, above.
         Command::Migrate => unreachable!(),
+    }
+    Ok(())
+}
+
+/// One session as a readable transcript.
+///
+/// This is the CLI's own rendering, not a projector: it exists so `session show`
+/// answers "what was said" without a second command, and it deliberately shows
+/// payload ids rather than an opinion about formatting.
+fn print_session(vfs: &fungos_vfs::Vfs, session: &fungos_vfs::Session) -> anyhow::Result<()> {
+    println!(
+        "{} {}{}{}",
+        session.harness,
+        session.native_id,
+        session
+            .name
+            .as_deref()
+            .map(|name| format!(" ({name})"))
+            .unwrap_or_default(),
+        session
+            .cwd
+            .as_deref()
+            .map(|cwd| format!(" in {cwd}"))
+            .unwrap_or_default(),
+    );
+    if !session.models.is_empty() {
+        println!("models: {}", session.models.join(", "));
+    }
+    for turn in &session.turns {
+        println!("\n#{} {:?}", turn.index, turn.role);
+        if let Some(text) = vfs.turn_text(turn)? {
+            println!("{text}");
+        }
+        if let Some(thinking) = &turn.thinking {
+            println!("  (thinking {thinking})");
+        }
+        for tool in &turn.tools {
+            println!(
+                "  tool {} args {}{}",
+                tool.name,
+                tool.arguments,
+                if tool.failed { " (failed)" } else { "" }
+            );
+        }
+    }
+    for (kind, count) in &session.unnormalized {
+        println!("\nunnormalized {kind}: {count}");
     }
     Ok(())
 }

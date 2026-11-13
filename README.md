@@ -575,6 +575,183 @@ The wire already carried ranges (`unibus.content.fetch.v1`, bounded by
 independently checkable, which is what lets the ranges come from different peers
 instead of being concatenated from one.
 
+## Documents
+
+A file is a **view** of a document. The document is blocks with identities; the file is
+one rendering of them, and a save is a batch of ops from whoever touched it. Three
+layers, three jobs:
+
+- `crdt.rs` decides what two replicas agree on. Position is identity (`counter@actor`),
+  order comes from `(after, id)` and never from arrival order, a rewrite is an update
+  rather than a delete and an insert, and a deletion leaves a tombstone so anything
+  anchored to the block still resolves.
+- `doc.rs` binds that to a file: per-actor op streams at `docs/<id>/ops/<actor>.json`,
+  a `seen` record so a worktree can tell its own unsaved edits from a view that
+  predates a pull, and a snapshot at `docs/<id>/snapshot.md`. Each replica writes only
+  its own stream — one shared state blob would be last-writer-wins at the storage
+  layer, which is the thing the merge exists to avoid.
+- `anchor.rs` and `comments.rs` put annotations on blocks instead of positions, so a
+  thread survives the paragraph it is on being rewritten, and moves to the neighbour
+  when the paragraph is deleted.
+
+```sh
+cargo run -- --root ~/.local/share/fungos-vfs/notes doc sync --id notes --path NOTES.md
+cargo run -- --root ~/.local/share/fungos-vfs/notes doc comment --id notes \
+  --block '#2' --body "this section contradicts the intro"
+cargo run -- --root ~/.local/share/fungos-vfs/notes doc comment --id notes \
+  --thread 1@studio --body "agreed"
+cargo run -- --root ~/.local/share/fungos-vfs/notes doc comments --id notes --path NOTES.md
+```
+
+`--block` takes `#N` (the Nth live block) or `counter@actor`; anything recorded should
+use the identity, because a number moves when somebody inserts above it. `doc comments`
+prints each thread with its state — `exact`, `clamped`, `neighbour` or `orphan` — because
+a range that no longer fits is reported rather than silently presented as exact.
+
+Comments are stored the way edits are: one file per commenter at
+`docs/<id>/comments/<actor>.json`, merged on read. A reply is ordered by when it was
+said (`at_ms`), not by its identity: every commenter numbers their own stream from one,
+so a counter alone would sort an answer before the question. Settling a thread carries
+the same kind of stamp, which is what lets a later reopen win over an earlier settle
+without either replica guessing.
+
+### A transcript is a document
+
+`session project --to markdown` writes a whole record. Adding `--doc` grows an existing
+document instead: it appends only the turns the document does not already hold, so a
+running session can be projected on a timer without rewriting the file each time.
+
+```sh
+cargo run -- --root ~/.local/share/fungos-vfs/sessions session project --harness pi \
+  --id 01a1bdea-6672-706b-9cbb-d66eb9eb6c69 --to markdown \
+  --doc transcript --out transcript.md
+```
+
+The block identities belong to the record (`pi:1a2b3c4d`), not to the machine, so two
+replicas that absorb each other's ops before projecting extend one transcript rather
+than each building its own. One honest limit: a harness appends its record and does not
+rewrite turns it already wrote, so only the last turn is re-projected on each pass. A
+record rewritten in the middle is a full `session project --to markdown` plus
+`doc sync`, and this path does not pretend to notice it.
+
+### A Word file is a container view
+
+A `.docx` is a zip of XML parts, so it enters the same way a transcript does — as
+blocks with identities — and `word/document.xml` already numbers its paragraphs:
+`w14:paraId` is a stable 32-bit id, which is the same thing a block id is for.
+Adopting it means re-reading an edited document is an identity match rather than a
+text diff, so a paragraph keeps its thread and its place while everything around it
+changes.
+
+```sh
+cargo run -- --root ~/.local/share/fungos-vfs/notes doc import \
+  --id nda --path ~/Downloads/nda.docx --out ~/notes/nda.md
+doc view --id nda --out ~/notes/nda.md
+```
+
+What it reads: paragraphs, their text, heading levels from `w:pStyle`, tabs and
+breaks. What it does not read, it **counts and leaves alone** — tables, drawings,
+fields, footnotes, nested text boxes, plus every part that is not the body
+(`styles.xml`, `numbering.xml`, the theme, `customXml`). A save is never treated as a
+change because the bytes differ: every save rewrites the archive and stamps every
+entry with the same 1980 date, so the comparison is between two block lists.
+
+Measured on a real NDA (35 KB, 30 parts): 31 paragraphs, **31 by id, 0 by position**,
+27 blocks (four paragraphs held only spacing), one table counted and not modelled, and
+a second import wrote nothing. On five Word files on this machine, paragraph ids were
+present in every one, 33 to 112 per document.
+
+The honest gap: a block does not carry a style yet, so a heading's level is written
+into its text (`## …`) by this reader. That is the next thing to fix — it is the same
+`Kind` work a sheet or a slide needs — and it is why the report names how many
+paragraphs were styled and how many were not.
+
+## Sessions
+
+A conversation is evidence: what was asked, what ran, what came back, and which
+model was standing at the time. Every harness keeps that in its own shape, in its own
+place, on one machine. The point of this section is that the shape stops being the
+harness's business — an **importer** reads a native store and writes one record, and a
+**projector** renders a record into whatever the reader wants.
+
+```sh
+# Pi, from its own JSONL store, into one root
+time cargo run -- --root ~/.local/share/fungos-vfs/sessions \
+  session import --harness pi --path ~/.pi/agent/sessions
+
+cargo run -- --root ~/.local/share/fungos-vfs/sessions session list
+cargo run -- --root ~/.local/share/fungos-vfs/sessions \
+  session show --harness pi --id 01a1bdea-6672-706b-9cbb-d66eb9eb6c69
+```
+
+One record per conversation, at `sessions/<harness>/<native-id>/session.json`, and it
+holds pointers rather than prose:
+
+- **Turns reference content, they do not contain it.** Every text, thinking block,
+tool argument and tool result is filed in the content store under its own digest. The
+same prompt pasted into two sessions is stored once, a record stays tens of kilobytes
+however long the conversation was, and a turn's text is fetched with `turn_text`.
+- **`extras` is opaque, and load-bearing.** Whatever the harness has that this schema
+has no field for is carried as JSON rather than dropped, so importing never loses a
+fact and never invents one. From Pi that is the session's format version, every image
+the user pasted (the bytes, not the base64), and — per turn — the error a model
+returned and the stop reason when it was not `stop` or `toolUse`.
+- **Unnormalized is counted, not swallowed.** Pi's `custom`, `custom_message`,
+`context_edit`, `compaction` and `thinking_level_change` records have no home here.
+They are counted per kind (and per `customType`, so an autopilot state blob is not
+merged with a message shown to the user) and reported by the import. A malformed line
+is counted too, and the session around it still imports.
+- **A re-import is free.** A session is keyed by the id the harness gave it, so a
+conversation copied to a second machine or a second directory is one record, and
+payloads already in the store are not written again. A record whose bytes did not
+change is not rewritten, so it gains no version.
+
+Measured on this machine's Pi corpus: 140 sessions, 83,430 turns, 107,692 payloads,
+281.6 MiB, 11 minutes cold (I/O-bound: 108k small objects against a `synchronous=FULL`
+WAL). The second run added **no** payloads and changed nothing it did not have to.
+
+What it deliberately does not do: no ranking, no search, no transcript format. This is
+the record; rendering is somebody else's function — which is why an `operator`
+projector can read this and a Delta importer can write it without either knowing about
+the other.
+
+### Projecting a record into `operator`
+
+A **projector** reads a record and writes a target's format. It never mutates the
+record and never reads a harness's native store, so the converters stay linear — N
+harnesses plus M targets — instead of quadratic.
+
+```sh
+# one session, into a workspace operator already reads
+cargo run -- --root ~/.local/share/fungos-vfs/sessions session project \
+  --harness pi --id 01a1bdea-6672-706b-9cbb-d66eb9eb6c69 \
+  --to operator --out ~/work/repo/.operator/runs
+```
+
+Omit `--id` to project every session the harness has. The output is `operator`'s run
+bundle — NDJSON, a `meta` line then one line per message — which is what its resume
+path reads back into a live transcript. Three things the mapping decides on purpose:
+
+- **`session_key` is the digest of the record, not operator's head hash.** Operator
+derives that key from the first messages it can see, and a projected bundle has no
+such history. It only affects sticky cache routing, and operator recomputes its own
+hint on every resumed turn; a guess at a hash we cannot compute would be worse than a
+key that says which record this is.
+- **`stop_reason` is `end_turn`, `status` is `done`.** A projection is a transcript
+import, not a terminal contract — reporting `incomplete` for a conversation that ended
+on another machine would let `--strict` exit codes describe an event this build never
+saw.
+- **Tool results name their call.** Operator needs a result line to say which call it
+answers, and the record stores the result on the call, so ids are synthesized
+(`call-<turn>`) and matched back by payload digest. A result nothing called is counted,
+not given an invented caller.
+
+Images become `operator-content` attachments — the bytes, base64, under a 10 MiB cap
+and a mime list the target accepts. Anything the target cannot take (an unsupported
+image type, an oversized one, unparseable tool arguments) is counted per reason, the
+same way `unnormalized` works on the import side. Projecting the same record twice
+writes the same file, so a re-run replaces rather than duplicates.
+
 ## Next
 
 1. File Provider / Cloud Files adapter for a signed macOS app.
