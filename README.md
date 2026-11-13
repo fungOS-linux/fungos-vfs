@@ -634,6 +634,38 @@ rewrite turns it already wrote, so only the last turn is re-projected on each pa
 record rewritten in the middle is a full `session project --to markdown` plus
 `doc sync`, and this path does not pretend to notice it.
 
+### A Word file is a container view
+
+A `.docx` is a zip of XML parts, so it enters the same way a transcript does — as
+blocks with identities — and `word/document.xml` already numbers its paragraphs:
+`w14:paraId` is a stable 32-bit id, which is the same thing a block id is for.
+Adopting it means re-reading an edited document is an identity match rather than a
+text diff, so a paragraph keeps its thread and its place while everything around it
+changes.
+
+```sh
+cargo run -- --root ~/.local/share/fungos-vfs/notes doc import \
+  --id nda --path ~/Downloads/nda.docx --out ~/notes/nda.md
+doc view --id nda --out ~/notes/nda.md
+```
+
+What it reads: paragraphs, their text, heading levels from `w:pStyle`, tabs and
+breaks. What it does not read, it **counts and leaves alone** — tables, drawings,
+fields, footnotes, nested text boxes, plus every part that is not the body
+(`styles.xml`, `numbering.xml`, the theme, `customXml`). A save is never treated as a
+change because the bytes differ: every save rewrites the archive and stamps every
+entry with the same 1980 date, so the comparison is between two block lists.
+
+Measured on a real NDA (35 KB, 30 parts): 31 paragraphs, **31 by id, 0 by position**,
+27 blocks (four paragraphs held only spacing), one table counted and not modelled, and
+a second import wrote nothing. On five Word files on this machine, paragraph ids were
+present in every one, 33 to 112 per document.
+
+The honest gap: a block does not carry a style yet, so a heading's level is written
+into its text (`## …`) by this reader. That is the next thing to fix — it is the same
+`Kind` work a sheet or a slide needs — and it is why the report names how many
+paragraphs were styled and how many were not.
+
 ## Sessions
 
 A conversation is evidence: what was asked, what ran, what came back, and which

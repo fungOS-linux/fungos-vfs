@@ -7,8 +7,8 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use fungos_vfs::{
-    Anchor, ApplyOutcome, BlockId, CheckoutOptions, CommentFile, ContentId, Doc, DocFile, Expect,
-    Hydration, NodeRole, PathPolicy, RecordOptions, ReplicaConfig, ReplicaSpec, SourceMode,
+    Anchor, ApplyOutcome, BlockId, CheckoutOptions, CommentFile, ContentId, Doc, DocFile, Docx,
+    Expect, Hydration, NodeRole, PathPolicy, RecordOptions, ReplicaConfig, ReplicaSpec, SourceMode,
     SyncServer, Transcript, Vfs, attach_project, checkout, export_dir, import_pi,
     import_pi_incremental, ingest_dir_with_policy, list_projects, load_doc, materialize,
     migrate_storage_with_cas, pull_over_quic, pull_over_ssh, record, to_markdown, to_operator,
@@ -361,6 +361,9 @@ enum Command {
         /// The file to reconcile.
         #[arg(long)]
         path: Option<PathBuf>,
+        /// The markdown view to write for `import`, and to read for `view`.
+        #[arg(long)]
+        out: Option<PathBuf>,
         /// Who the edits, and the comments, are attributed to. Defaults to this
         /// store's actor, which has to be stable or every run starts a new stream.
         #[arg(long)]
@@ -429,6 +432,16 @@ fn anchor_spec(doc: &Doc, spec: &str) -> anyhow::Result<Anchor> {
     Ok(Anchor::Block {
         block: spec.parse().map_err(anyhow::Error::msg)?,
     })
+}
+
+/// The first line of a block, short enough to scan in a listing.
+fn one_line(text: &str) -> String {
+    let first = text.lines().next().unwrap_or_default().trim();
+    if first.chars().count() > 96 {
+        format!("{}…", first.chars().take(96).collect::<String>())
+    } else {
+        first.to_owned()
+    }
 }
 
 fn anchor_label(anchor: &Anchor) -> String {
@@ -1299,6 +1312,7 @@ fn run() -> anyhow::Result<()> {
             mode,
             id,
             path,
+            out,
             actor,
             block,
             body,
@@ -1477,6 +1491,153 @@ fn run() -> anyhow::Result<()> {
                                 "  @{}: {}",
                                 comment["author"].as_str().unwrap_or_default(),
                                 comment["body"].as_str().unwrap_or_default()
+                            );
+                        }
+                    }
+                }
+            }
+            "import" => {
+                let id = id.ok_or_else(|| anyhow::anyhow!("doc import needs --id"))?;
+                let source = path.ok_or_else(|| anyhow::anyhow!("doc import needs --path"))?;
+                let actor = actor.unwrap_or_else(|| vfs.writer().actor.clone());
+                // The markdown view is what a person and an agent edit; the
+                // container stays where it is and stays the authority for the parts
+                // this reader does not model.
+                let view = out.unwrap_or_else(|| source.with_extension("md"));
+                let bytes = fs::read(&source)?;
+                if !fungos_vfs::docx::is_docx(&bytes) {
+                    anyhow::bail!(
+                        "{} is not a .docx container: a Word file starts with a zip header",
+                        source.display()
+                    );
+                }
+                let docx = Docx::read(&bytes, &id)?;
+                let document = load_doc(&vfs, &id, &actor)?;
+                let (ops, imported) = docx.ops(&document, &actor);
+                let mut file = DocFile::open(&vfs, &id, &actor, &view)?;
+                let reconciled = file.extend(&mut vfs, ops)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "document": id,
+                            "source": source,
+                            "view": view,
+                            "paragraphs": docx.report.paragraphs,
+                            "identified": docx.report.identified,
+                            "synthetic": docx.report.synthetic,
+                            "inserted": imported.inserted,
+                            "updated": imported.updated,
+                            "deleted": imported.deleted,
+                            "reordered": imported.reordered,
+                            "unmodeled": docx.report.unmodeled,
+                            "parts": docx.report.parts,
+                            "wrote_view": reconciled.wrote_file,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "{}\t{} paragraphs ({} by id, {} by position), {} new blocks, {} rewritten, {} deleted{}",
+                        view.display(),
+                        docx.report.paragraphs,
+                        docx.report.identified,
+                        docx.report.synthetic,
+                        imported.inserted,
+                        imported.updated,
+                        imported.deleted,
+                        if imported.reordered > 0 {
+                            format!(", {} moved", imported.reordered)
+                        } else {
+                            String::new()
+                        },
+                    );
+                    for (name, count) in &docx.report.unmodeled {
+                        println!("  not modelled: {name} × {count}");
+                    }
+                }
+            }
+            // The read model a view renders: every block with the identity that
+            // survives editing, and the threads hanging on it.
+            "view" => {
+                let id = id.ok_or_else(|| anyhow::anyhow!("doc view needs --id"))?;
+                let actor = actor.unwrap_or_else(|| vfs.writer().actor.clone());
+                let doc = match path.as_ref().or(out.as_ref()) {
+                    Some(view) => DocFile::open(&vfs, &id, &actor, view)?.doc().clone(),
+                    None => load_doc(&vfs, &id, &actor)?,
+                };
+                let comments = CommentFile::open(&vfs, &id, &actor)?;
+                let threads = comments.threads(&doc);
+                if json {
+                    let blocks: Vec<serde_json::Value> = doc
+                        .live()
+                        .iter()
+                        .map(|block| {
+                            serde_json::json!({
+                                "id": block.id,
+                                "text": block.text,
+                                "threads": threads
+                                    .iter()
+                                    .filter(|(_, resolution)| resolution
+                                        .block()
+                                        .is_some_and(|at| at == &block.id))
+                                    .map(|(thread, resolution)| serde_json::json!({
+                                        "id": thread.id,
+                                        "state": resolution.state(),
+                                        "resolved": thread.resolved(),
+                                        "comments": thread
+                                            .comments
+                                            .iter()
+                                            .map(|comment| serde_json::json!({
+                                                "author": comment.author,
+                                                "body": comment.body,
+                                            }))
+                                            .collect::<Vec<_>>(),
+                                    }))
+                                    .collect::<Vec<_>>(),
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&blocks)?);
+                } else {
+                    let live = doc.live();
+                    if live.is_empty() {
+                        println!("{id}\tno blocks yet");
+                    }
+                    for block in live {
+                        println!("{}\t{}", block.id, one_line(&block.text));
+                        for (thread, resolution) in &threads {
+                            if resolution.block().is_some_and(|at| at == &block.id) {
+                                println!(
+                                    "  [{}] {} {}",
+                                    thread.id,
+                                    if thread.resolved() {
+                                        "resolved"
+                                    } else {
+                                        "open"
+                                    },
+                                    resolution.state()
+                                );
+                                for comment in &thread.comments {
+                                    println!(
+                                        "    @{}: {}",
+                                        comment.author,
+                                        one_line(&comment.body)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    for (thread, resolution) in &threads {
+                        if resolution.block().is_none() {
+                            println!(
+                                "[{}] {} {} — nothing left to point at",
+                                thread.id,
+                                if thread.resolved() {
+                                    "resolved"
+                                } else {
+                                    "open"
+                                },
+                                resolution.state()
                             );
                         }
                     }

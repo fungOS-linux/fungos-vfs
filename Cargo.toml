@@ -25,9 +25,15 @@ base64 = "0.22"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.41", default-features = false, features = ["bundled", "cache"] }
+# A `.docx` is a zip of XML parts, and reading one is the first step to treating
+# an office file as a document rather than an opaque blob.
+quick-xml = "0.42"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# The container. Only the deflate codec is wanted: an OOXML part is never stored
+# with anything else, and pulling in zopfli would buy nothing but compile time.
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
 
 # The QUIC carrier (`src/quic.rs`). `quinn` brings its own rustls, and it is
 # re-exported as `quinn::rustls`, so there is no second rustls to keep in step.

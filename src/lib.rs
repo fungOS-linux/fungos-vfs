@@ -12,6 +12,7 @@ mod comments;
 mod content;
 mod crdt;
 mod doc;
+pub mod docx;
 mod hydrate;
 mod path;
 mod pi;
@@ -43,6 +44,7 @@ pub use crdt::{Applied, Block, BlockId, Doc, Op, match_blocks, split_blocks};
 pub use doc::{
     DocFile, Reconciled, load as load_doc, ops_key as doc_ops_key, snapshot_key as doc_snapshot_key,
 };
+pub use docx::{Docx, ImportReport as DocxImportReport, ReadReport as DocxReadReport};
 pub use hydrate::Hydrator;
 pub use path::normalize_path;
 pub use pi::{ImportReport, import as import_pi, import_incremental as import_pi_incremental};
