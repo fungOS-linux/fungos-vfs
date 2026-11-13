@@ -10,8 +10,8 @@ use fungos_vfs::{
     ApplyOutcome, CheckoutOptions, ContentId, DocFile, Expect, Hydration, NodeRole, PathPolicy,
     RecordOptions, ReplicaConfig, ReplicaSpec, SourceMode, SyncServer, Vfs, attach_project,
     checkout, export_dir, import_pi, import_pi_incremental, ingest_dir_with_policy, list_projects,
-    materialize, migrate_storage_with_cas, pull_over_quic, pull_over_ssh, record, to_operator,
-    worktree_changes, worktrees,
+    materialize, migrate_storage_with_cas, pull_over_quic, pull_over_ssh, record, to_markdown,
+    to_operator, worktree_changes, worktrees,
 };
 
 #[derive(Parser)]
@@ -1109,9 +1109,14 @@ fn run() -> anyhow::Result<()> {
                 let harness =
                     harness.ok_or_else(|| anyhow::anyhow!("session project needs --harness"))?;
                 let out = out.ok_or_else(|| anyhow::anyhow!("session project needs --out"))?;
-                match to.as_deref().unwrap_or("operator") {
-                    "operator" => {}
-                    other => anyhow::bail!("no projector for {other}; this build writes operator"),
+                let target = to.as_deref().unwrap_or("operator").to_owned();
+                match target.as_str() {
+                    "operator" | "markdown" => {}
+                    other => {
+                        anyhow::bail!(
+                            "no projector for {other}; this build writes operator and markdown"
+                        )
+                    }
                 }
                 // One session by id, or every session the harness has: the point
                 // of a runs directory is a shelf of them, not a single file.
@@ -1130,6 +1135,17 @@ fn run() -> anyhow::Result<()> {
                         sessions
                     }
                 };
+                if target == "markdown" {
+                    // A transcript is a document: one file, which `doc sync` then
+                    // merges and snapshots like any other markdown.
+                    let session = sessions
+                        .first()
+                        .ok_or_else(|| anyhow::anyhow!("markdown projection needs one session"))?;
+                    let text = to_markdown(&vfs, session)?;
+                    fs::write(&out, &text)?;
+                    println!("{}\t{} bytes", out.display(), text.len());
+                    return Ok(());
+                }
                 let mut projected = Vec::new();
                 for session in &sessions {
                     let projection =

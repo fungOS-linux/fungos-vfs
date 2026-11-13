@@ -256,6 +256,79 @@ pub fn to_operator(
     Ok(Projection { path, report })
 }
 
+/// Render a session as a markdown transcript.
+///
+/// This is the target that needs no target: a transcript is a document, so the
+/// merge layer, the snapshots and git all apply without a line of new machinery.
+/// Each turn is one block — a heading and what happened under it — which is what
+/// makes appending a turn a single insert and re-projecting an unchanged session
+/// produce nothing at all.
+pub fn to_markdown(vfs: &Vfs, session: &Session) -> Result<String> {
+    let title = session
+        .name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("{} {}", session.harness, session.native_id));
+    let mut out = format!("# {title}\n\n");
+    if let Some(cwd) = &session.cwd {
+        out.push_str(&format!("`{cwd}`"));
+        if !session.models.is_empty() {
+            out.push_str(" · ");
+        }
+    }
+    if !session.models.is_empty() {
+        out.push_str(&session.models.join(", "));
+    }
+    out.push('\n');
+
+    for turn in &session.turns {
+        let role = match turn.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+        };
+        out.push_str(&format!("\n## {role}\n\n"));
+        if let Some(text) = vfs.turn_text(turn)? {
+            out.push_str(text.trim_end());
+            out.push('\n');
+        }
+        for tool in &turn.tools {
+            let bytes = vfs.content(&tool.arguments)?;
+            let args = String::from_utf8_lossy(&bytes);
+            let args = args.trim();
+            let args = if args.len() > 120 {
+                format!("{}…", &args[..120])
+            } else {
+                args.to_owned()
+            };
+            out.push_str(&format!(
+                "\n- `{}` {}{}\n",
+                tool.name,
+                args,
+                if tool.failed { " (failed)" } else { "" }
+            ));
+        }
+        if let Some(thinking) = &turn.thinking {
+            let bytes = vfs.content(thinking)?;
+            let text = String::from_utf8_lossy(&bytes);
+            // Folded into one line so a turn stays one block: the point of the
+            // markdown is that a re-projection of an unchanged session is free.
+            out.push_str(&format!(
+                "\n<sub>thought: {}</sub>\n",
+                text.replace('\n', " ").trim()
+            ));
+        }
+    }
+    // Emit the layout the document layer would write back, so projecting a
+    // transcript and then syncing it does not count as a change: one blank line
+    // between blocks, none inside them.
+    let mut canonical = crate::split_blocks(&out).join("\n\n");
+    canonical.push('\n');
+    Ok(canonical)
+}
+
 /// A bundle is one file named after the session; the same record projects to the
 /// same name, so a second projection replaces rather than duplicates.
 ///
@@ -644,6 +717,30 @@ mod tests {
         );
         let lines = lines(&projection.path);
         assert!(lines[2].get("attachments").is_none());
+    }
+
+    #[test]
+    fn a_projected_transcript_is_already_the_document_layout() {
+        // Projecting and then syncing must not count as a change: the file a
+        // projector writes is the file the document layer would have written.
+        let (temp, mut vfs) = store();
+        let session = session(&mut vfs);
+        let text = to_markdown(&vfs, &session).unwrap();
+        let file = temp.path().join("transcript.md");
+        fs::write(&file, &text).unwrap();
+
+        let mut doc = crate::DocFile::open(&vfs, "transcript", "neo", &file).unwrap();
+        let first = doc.reconcile(&mut vfs).unwrap();
+        assert!(
+            first.ops > 0,
+            "a transcript is where the document comes from"
+        );
+        assert!(!first.wrote_file, "the layout was already canonical");
+        assert_eq!(fs::read_to_string(&file).unwrap(), text);
+
+        let second = doc.reconcile(&mut vfs).unwrap();
+        assert_eq!(second.ops, 0);
+        assert!(!second.wrote_file, "and a second pass is free");
     }
 
     #[test]
